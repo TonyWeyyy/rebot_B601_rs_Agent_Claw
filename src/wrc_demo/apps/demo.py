@@ -93,17 +93,36 @@ def build_runtime(
             rate_hz=float(ccfg.get("fps", 30.0)),
         )
         streams.append(stream)
+        # requires_calibration + no on-disk extrinsics -> force fuse=False.
+        # The strict loader above already returns identity T for missing
+        # files; this branch fails closed *before* WatchedCamera ever sees
+        # the camera, so 3D beliefs stay clean during bring-up.
+        requires_calib = bool(ccfg.get("requires_calibration", False))
+        extr_cfg = ccfg.get("extrinsics", _empty_cfg())
+        if requires_calib:
+            src_path = str(extr_cfg.get("source") or extr_cfg.get("hand_eye_npz") or "")
+            have_src = bool(src_path) and Path(str(src_path)).exists()
+            if not have_src:
+                print(
+                    f"[wrc-demo] {ccfg.get('name', f'cam{i}')}: "
+                    "requires_calibration=true but no extrinsics source "
+                    f"({src_path!r}); fusing beliefs is disabled for this camera",
+                    file=sys.stderr,
+                )
+                fuse = False
+            else:
+                fuse = bool(ccfg.get("fuse_beliefs", "extrinsics" in ccfg))
+        else:
+            fuse = bool(ccfg.get("fuse_beliefs", "extrinsics" in ccfg))
         watched.append(
             WatchedCamera(
                 stream=stream,
                 depth=DepthProvider(ccfg),
-                extrinsics=Extrinsics.from_config(
-                    ccfg.get("extrinsics", _empty_cfg()), fk_tcp2base=fk
-                ),
+                extrinsics=Extrinsics.from_config(extr_cfg, fk_tcp2base=fk),
                 # A camera without calibrated extrinsics must not fuse 3D
                 # beliefs (garbage base-frame positions); it still streams
                 # video + overlays + heartbeats.
-                fuse=bool(ccfg.get("fuse_beliefs", "extrinsics" in ccfg)),
+                fuse=fuse,
             )
         )
     rig = CameraRig(streams)

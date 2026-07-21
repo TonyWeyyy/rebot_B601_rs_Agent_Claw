@@ -7,11 +7,19 @@ center (more robust than the mean for elongated/partially occluded objects).
 Extrinsics supports both mounting styles:
 - eye_to_hand: static T_cam2base (camera on a tripod/frame looking at the arm)
 - eye_in_hand: T_cam2gripper composed with FK at capture time
-It can read the baseline repo's hand_eye.npz files (key T_result) unchanged.
+
+The loader recognises three on-disk schemas:
+
+- new JSON  (wrcdemo): ``<base>.json`` from
+  ``wrc_demo.calibration.calib_dataset.save_calibration`` (preferred).
+- cuRobo NPZ: ``T_cam2base`` (+ optional ``T_cam2gripper``); ``camera_serial``
+  is required to match the profile, otherwise the loader warns.
+- legacy NPZ: ``T_result`` (the old baseline repo's hand_eye.npz shape).
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Callable
 
@@ -26,30 +34,129 @@ class Extrinsics:
         mode: str = "eye_to_hand",
         T: np.ndarray | None = None,
         fk_tcp2base: Callable[[], np.ndarray] | None = None,
+        *,
+        source: str = "inline",
+        frame_convention: str = "wrc_demo",
+        schema_version: int | None = None,
     ):
-        """`T` is T_cam2base (eye_to_hand) or T_cam2gripper (eye_in_hand)."""
+        """`T` is T_cam2base (eye_to_hand) or T_cam2gripper (eye_in_hand).
+
+        ``source`` / ``frame_convention`` / ``schema_version`` are advisory
+        metadata exposed so the loader can report the origin of the matrix
+        and tests can assert which schema was used.
+        """
         if mode not in ("eye_to_hand", "eye_in_hand"):
             raise ValueError(f"bad extrinsics mode {mode!r}")
         self.mode = mode
         self.T = np.eye(4) if T is None else np.asarray(T, dtype=float)
         self._fk = fk_tcp2base
+        self.source = source
+        self.frame_convention = frame_convention
+        self.schema_version = schema_version
 
     @classmethod
     def from_config(cls, cfg, fk_tcp2base=None) -> "Extrinsics":
         mode = cfg.get("mode", "eye_to_hand")
+        # Schema priority: explicit `source` JSON > `hand_eye_npz` (any) >
+        # inline `T` block.
+        json_path = cfg.get("source")
         npz_path = cfg.get("hand_eye_npz")
+        profile_serial = cfg.get("camera_serial") or cfg.get("serial")
+
+        if json_path:
+            jp = Path(str(json_path))
+            if jp.exists():
+                return cls._load_new_json(jp, mode=mode, fk_tcp2base=fk_tcp2base,
+                                          profile_serial=profile_serial)
+
         if npz_path and Path(npz_path).exists():
-            data = np.load(npz_path, allow_pickle=True)
-            T = np.asarray(data["T_result"], dtype=float)
-            if "mode" in data:
-                # The baseline saves mode as a 1-element string array.
-                saved_mode = str(np.asarray(data["mode"]).ravel()[0])
-            else:
-                saved_mode = mode
-            return cls(mode=saved_mode, T=T, fk_tcp2base=fk_tcp2base)
+            return cls._load_npz(Path(npz_path), mode=mode, fk_tcp2base=fk_tcp2base,
+                                 profile_serial=profile_serial)
+
         mat = cfg.get("T")
         T = np.asarray(mat, dtype=float).reshape(4, 4) if mat is not None else None
-        return cls(mode=mode, T=T, fk_tcp2base=fk_tcp2base)
+        return cls(mode=mode, T=T, fk_tcp2base=fk_tcp2base, source="inline")
+
+    @classmethod
+    def _load_new_json(cls, jp: Path, *, mode: str, fk_tcp2base, profile_serial) -> "Extrinsics":
+        with open(jp) as f:
+            data = json.load(f)
+        schema_version = int(data.get("schema_version", 1))
+        fc = str(data.get("frame_convention", "wrc_demo"))
+        cam_serial = str(data.get("camera_serial", ""))
+        if profile_serial and cam_serial and str(profile_serial) != cam_serial:
+            import sys
+            print(
+                f"[wrc-demo] WARNING: profile serial {profile_serial!r} != "
+                f"calibration serial {cam_serial!r} in {jp}; "
+                "using the calibration value anyway (override is the "
+                "intentional escape hatch after swapping a camera)",
+                file=sys.stderr,
+            )
+        T = np.asarray(data["T_cam2base"], dtype=float)
+        T_marker = np.asarray(data["T_marker2gripper"], dtype=float)
+        # For eye_in_hand profiles, the JSON's T_cam2base is actually the
+        # static cam->gripper matrix (we don't yet produce eye_in_hand JSONs;
+        # keep the data dict for future use).
+        if mode == "eye_in_hand":
+            return cls(
+                mode=mode, T=T_marker, fk_tcp2base=fk_tcp2base,
+                source=f"new-json:{jp.name}", frame_convention=fc,
+                schema_version=schema_version,
+            )
+        return cls(
+            mode=mode, T=T, fk_tcp2base=fk_tcp2base,
+            source=f"new-json:{jp.name}", frame_convention=fc,
+            schema_version=schema_version,
+        )
+
+    @classmethod
+    def _load_npz(cls, npz_path: Path, *, mode: str, fk_tcp2base, profile_serial) -> "Extrinsics":
+        data = np.load(npz_path, allow_pickle=True)
+        keys = set(data.files)
+        cam_serial = ""
+        if "camera_serial" in keys:
+            try:
+                cam_serial = str(np.asarray(data["camera_serial"]).ravel()[0])
+            except Exception:
+                cam_serial = ""
+        if profile_serial and cam_serial and str(profile_serial) != cam_serial:
+            import sys
+            print(
+                f"[wrc-demo] WARNING: profile serial {profile_serial!r} != "
+                f"npz serial {cam_serial!r} in {npz_path}; "
+                "using the npz value anyway",
+                file=sys.stderr,
+            )
+        fc = "curobo"
+        schema_version = None
+        if "T_cam2base" in keys:
+            T = np.asarray(data["T_cam2base"], dtype=float)
+            if "T_cam2gripper" in keys:
+                fc = "curobo"
+            if mode == "eye_in_hand" and "T_cam2gripper" in keys:
+                T_use = np.asarray(data["T_cam2gripper"], dtype=float)
+            else:
+                T_use = T
+            return cls(
+                mode=mode, T=T_use, fk_tcp2base=fk_tcp2base,
+                source=f"curobo-npz:{npz_path.name}", frame_convention=fc,
+                schema_version=schema_version,
+            )
+        if "T_result" in keys:
+            T = np.asarray(data["T_result"], dtype=float)
+            saved_mode = mode
+            if "mode" in keys:
+                saved_mode = str(np.asarray(data["mode"]).ravel()[0])
+            return cls(
+                mode=saved_mode, T=T, fk_tcp2base=fk_tcp2base,
+                source=f"legacy-npz:{npz_path.name}", frame_convention=fc,
+                schema_version=schema_version,
+            )
+        raise ValueError(
+            f"{npz_path}: NPZ has neither T_cam2base nor T_result; "
+            "cannot infer extrinsics"
+        )
 
     def cam_to_base(self) -> np.ndarray:
         """T_cam2base at this instant (uses live FK for eye-in-hand)."""

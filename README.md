@@ -179,11 +179,42 @@ escape hatch for GPU-PhysX boot NaNs —, `WRC_BRIDGE_BIND`,
 - Do not run `motorbridge-gateway` / MotorBridge Studio while the demo runs
   (host-id 0xFD conflict on the CAN bus).
 - Hand-eye extrinsics in the camera profiles are placeholders — calibrate
-  on-site (the baseline repo's `collect_handeye_eih.py` output loads
-  directly via `hand_eye_npz`).
+  on-site with `python -m wrc_demo.scripts.calib_top_orbbec` (the legacy
+  baseline repo's `hand_eye.npz` still loads via `hand_eye_npz:` in the
+  extrinsics block; the new JSON schema from the calibration tool loads
+  via `source:` and is the preferred path on the reBot + Orbbec rig).
 - Strict top-down tool poses are only IK-reachable below z ≈ 0.15 m on the
   B601-RS (wrist limits); grasp heights + hover offsets are configured
   accordingly.
+
+### Hand-eye calibration on-site (Orbbec rig)
+
+```bash
+# 1. enumerate devices, pick the top camera and the wrist camera
+python -m wrc_demo.scripts.calib_top_orbbec --list
+python -m wrc_demo.scripts.calib_top_orbbec --bind top   --index 0
+python -m wrc_demo.scripts.calib_top_orbbec --bind wrist --index 1
+
+# 2. collect the calibration dataset (>= 30 samples, two-stage press-enter)
+sudo ip link set can0 up type can bitrate 1000000
+python -m wrc_demo.scripts.calib_top_orbbec \
+    --marker-size 0.10 --n 30 --out data/calibration/hand_eye_top.json
+
+# 3. cross-check against known base-frame points (rig-measured, <10 mm RMSE)
+python -m wrc_demo.scripts.calib_top_orbbec --verify \
+    --npz data/calibration/hand_eye_top.json \
+    --known-points "0.30,0.00,0.02;0.25,-0.05,0.02;0.35,0.05,0.02"
+
+# 4. run the demo with the new calibration
+python -m wrc_demo.apps.demo --interactive \
+    --cameras orbbec_overhead --arm rebot_rs --llm anthropic
+```
+
+The tool runs `joint_solve` (SE(3) LM + Huber + 3*MAD outlier rejection)
+on FK from `wrc_demo.control.kinematics.Kinematics` (Pinocchio on the RS
+URDF with `joint_signs=[-1]*6` and `ee_frame='gripper_end'`) and ArUco
+PnP against the SDK intrinsics. Result: `data/calibration/hand_eye_top.json`
+(+ `.npz` with K, D) and `data/calibration/cameras.json` (serial binding).
 
 ## Docs
 

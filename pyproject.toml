@@ -21,7 +21,7 @@ llm = ["openai>=1.50", "anthropic>=0.40"]
 kinematics = ["pin>=3.0"]
 # Real arm transport (RobStride over SocketCAN).
 arm = ["motorbridge>=0.4.9"]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "pytest-cov>=4.0"]
 
 [project.scripts]
 wrc-demo = "wrc_demo.apps.demo:main"

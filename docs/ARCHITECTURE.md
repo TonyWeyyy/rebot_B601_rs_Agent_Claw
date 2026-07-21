@@ -87,19 +87,26 @@ alternative *executor* behind the same skill API (see ROADMAP).
 src/wrc_demo/
 ├── types.py            Frame / Detection / ObjectFix / Grasp / RobotState
 ├── config.py           YAML profiles (cameras/, arms/, llm/) merged into one Cfg
-├── perception/
+ ├── perception/
 │   ├── camera_base.py  CameraBase ABC + factory; Frames carry METRIC depth
 │   ├── realsense_camera.py   D4xx + L515 (local fork's pyrealsense2)
 │   ├── opencv_camera.py      RGB-only UVC
+│   ├── orbbec_camera.py      Orbbec Gemini 2 (pyorbbecsdk, lazy import)
 │   ├── mock_camera.py        synthetic tabletop + npz replay (wrc-record)
 │   ├── isaac_camera.py       Isaac Sim bridge frames (RGB-D + per-frame T_base_cam)
 │   ├── depth_provider.py     sensor → mono plugin → table-plane ray-cast
 │   ├── detector.py           open-vocab YOLOE/YOLO-World + MockDetector
-│   ├── grounding.py          Extrinsics + localize_object (color/near-aware)
+│   ├── grounding.py          Extrinsics + localize_object (color/near-aware);
+│   │                          multi-schema loader (new JSON / cuRobo NPZ / legacy NPZ)
 │   ├── vlm_ground.py         second-chance VLM grounder (detector-miss path)
 │   ├── colors.py             mask HSV → color name; color-query parsing
 │   ├── stream.py             CameraStream (pump thread) + CameraRig (N cams)
 │   └── world.py              WorldWatcher: always-on detection → beliefs
+ ├── calibration/      top-camera hand-eye bring-up (see PLAN.md §4)
+ │   ├── calib_dataset.py     CalibrationSample / Result dataclasses + JSON I/O
+ │   ├── handeye_solver.py     joint SE(3) solve (LM + Huber + 3*MAD outliers)
+ │   ├── aruco_session.py      cv2.aruco wrapper (detect + PnP + reprojection)
+ │   └── frame_convention.py   SE(3) helpers + cuRobo/wrc_demo FK offset
 ├── memory/
 │   ├── turboquant.py   TurboQuant-style rotation+scalar quantizer (numpy)
 │   ├── vector_index.py asymmetric top-k cosine over 4-bit codes
@@ -251,6 +258,19 @@ warnings).
 - NOT yet exercised: real-arm motion (needs onsite gripper re-verification
   and hand-eye calibration), local Qwen serving (scripts provided; note the
   `local_qwen.yaml` model-name mismatch flagged in the README and ROADMAP).
+- Orbbec Gemini 2 backend (`perception/orbbec_camera.py`, lazy `pyorbbecsdk`
+  import) + hand-eye calibration pipeline (`calibration/` module +
+  `scripts/calib_top_orbbec.py` CLI) shipped but NOT yet exercised against
+  real hardware. The CLI collects calibration samples using FK from
+  `wrc_demo.control.kinematics.Kinematics` (Pinocchio on the RS URDF with
+  `joint_signs=[-1]*6` and `ee_frame='gripper_end'`) and ArUco PnP against
+  the SDK intrinsics, then runs a joint SE(3) LM fit with Huber loss and
+  3*MAD outlier rejection. Calibration product is
+  `data/calibration/hand_eye_top.json` (+ `.npz` with K, D); binding is
+  `data/calibration/cameras.json`. The build_runtime path's
+  `requires_calibration` guard fails closed (fuse=False) when the source
+  file is absent — see `apps/demo.py:build_runtime` and the
+  `orbbec_overhead` / `orbbec_wrist` profiles in `configs/cameras/`.
 
 ## Known limitations (accepted for the baseline)
 
