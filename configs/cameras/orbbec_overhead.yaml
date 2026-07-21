@@ -14,7 +14,7 @@ warmup_frames: 15
 align_depth_to_color: true
 
 extrinsics:
-  source: "data/calibration/hand_eye_top.json"   # 找不到时仅 warn, 不参与融合
+  source: "${repo}/data/calibration/hand_eye_top.json"   # 找不到时仅 warn, 不参与融合
   mode: eye_to_hand
   # T 字段在 JSON loader 中读取后覆盖; 此处仅占位避免 schema 漂移
   T:

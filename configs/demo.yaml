@@ -106,8 +106,8 @@ detector:
   type: yoloe
   model: ${repo}/models/yoloe-11s-seg.pt
   device: cuda:0
-  conf: 0.25
+  conf: 0.10
 
 # Default vocabulary scanned during get_observation (the agent can localize
 # anything by name on top of this).
-detect_classes: ["cup", "mug", "bottle", "bowl", "box", "cube", "fruit", "toy"]
+detect_classes: ["cup", "mug", "bottle", "bowl", "box", "cube", "fruit", "toy", "cylinder", "tube", "glass", "container", "object"]

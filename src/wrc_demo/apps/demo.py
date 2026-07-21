@@ -73,7 +73,7 @@ def build_runtime(
     # ── the camera rig: N continuous streams, first = manipulation ──────
     cam_cfgs = _camera_cfgs(cfg)
     streams, watched = [], []
-    detector = LockedDetector(_make_detector(cfg))
+    # detector init moved AFTER rig.open() to avoid USB reset during YOLO load
 
     def fk():
         # Eye-in-hand extrinsics need live FK -- but the 3 Hz watcher must
@@ -127,6 +127,8 @@ def build_runtime(
         )
     rig = CameraRig(streams)
     rig.open()
+    # Detector init AFTER camera open to avoid USB reset during YOLO/GPU load
+    detector = LockedDetector(_make_detector(cfg))
     try:
         rig.primary.warm_up(int(cam_cfgs[0].get("warmup_frames", 5)))
     except Exception:
