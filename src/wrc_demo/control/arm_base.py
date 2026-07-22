@@ -59,7 +59,7 @@ class ArmBase(abc.ABC):
         rate_hz: float = 50.0,
         approve=None,
         settle_tol: float | None = None,
-        settle_timeout_s: float = 4.0,
+        settle_timeout_s: float = 6.0,
     ) -> bool:
         """Min-jerk interpolate current->target, vetting each waypoint.
 
