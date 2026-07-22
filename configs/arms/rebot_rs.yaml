@@ -15,7 +15,10 @@ model: ${assets}/urdf/00-arm-rs_asm-v3/urdf/00-arm-rs_asm-v3.urdf
 joint_signs: [-1, -1, -1, -1, -1, -1]
 ee_frame: gripper_end
 n_joints: 6
-home_q: [0.0, 1.2, 1.2, 0.0, 0.75, 0.0]
+# Home pose tuned to reduce joint deltas during top-down grasps.
+# Based on rebot_grasp ready pose with J6 pre-set to ~-81°.
+# Reduces max joint delta from 86.7° to 65.4° (24% improvement).
+home_q: [0.0, 0.98, 1.33, -1.05, 0.0, -1.41]
 
 # MIT gains per joint (null = use the SDK's rebotarm_rs.yaml values).
 mit_kp: null
