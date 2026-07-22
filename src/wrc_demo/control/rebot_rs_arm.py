@@ -55,6 +55,11 @@ class RebotRSArm(ArmBase):
         self._grip_closed = float(g.get("closed_pos", 0.0))
         self._grip_kp = float(g.get("kp", 6.0))
         self._grip_kd = float(g.get("kd", 0.4))
+        
+        # Gripper control loop state
+        self._gripper_target = self._grip_closed  # target position for smooth tracking
+        self._gripper_loop_running = False
+        self._gripper_loop_thread = None
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -86,8 +91,18 @@ class RebotRSArm(ArmBase):
         self._read_failures = 0
         self._last_q = self._read_positions()
         self._last_cmd_q: np.ndarray | None = None
+        
+        # Start gripper control loop
+        self._gripper_loop_running = True
+        self._gripper_loop_thread = threading.Thread(
+            target=self._gripper_control_loop, daemon=True
+        )
+        self._gripper_loop_thread.start()
 
     def disconnect(self) -> None:
+        self._gripper_loop_running = False
+        if self._gripper_loop_thread is not None:
+            self._gripper_loop_thread.join(timeout=1.0)
         if self._arm is not None:
             try:
                 self._arm.disconnect()
@@ -159,13 +174,25 @@ class RebotRSArm(ArmBase):
         self._last_cmd_q = q.copy()
 
     def set_gripper(self, pos: float, effort: float = 1.0) -> None:
+        """Set gripper target position for smooth tracking by control loop."""
         if self._arm is None or not self._arm.has_gripper or self._stopped:
             return
-        kp = self._grip_kp * float(np.clip(effort, 0.05, 1.0))
-        with self._lock:
-            self._arm.gripper.send_mit(
-                np.array([pos]), kp=np.array([kp]), kd=np.array([self._grip_kd])
-            )
+        self._gripper_target = float(pos)
+    
+    def _gripper_control_loop(self) -> None:
+        """Continuously send MIT commands to track gripper_target (10ms period)."""
+        while self._gripper_loop_running:
+            if self._arm is not None and self._arm.has_gripper and not self._stopped:
+                try:
+                    with self._lock:
+                        self._arm.gripper.send_mit(
+                            np.array([self._gripper_target]),
+                            kp=np.array([self._grip_kp]),
+                            kd=np.array([self._grip_kd])
+                        )
+                except Exception:
+                    pass
+            time.sleep(0.01)  # 10ms control loop
 
     def close_gripper_two_stage(
         self,
@@ -217,8 +244,23 @@ class RebotRSArm(ArmBase):
         except Exception:
             return None
 
-    def open_gripper(self) -> None:
-        self.set_gripper(self._grip_open, effort=0.8)
+    def open_gripper(self, distance_m: float | None = None) -> None:
+        """Open gripper, optionally to a specific distance (adaptive opening).
+        
+        Args:
+            distance_m: Target opening distance in meters (0.0 to max_width_m).
+                       If None, opens fully to _grip_open.
+        """
+        if distance_m is not None:
+            # Calculate target position based on distance
+            max_width = float(self._cfg.get("gripper", {}).get("max_width_m", 0.09))
+            distance_m = float(np.clip(distance_m, 0.0, max_width))
+            # Linear interpolation: 0m -> _grip_closed, max_width -> _grip_open
+            span = self._grip_open - self._grip_closed
+            target = self._grip_closed + span * (distance_m / max_width)
+            self.set_gripper(target, effort=0.8)
+        else:
+            self.set_gripper(self._grip_open, effort=0.8)
 
     def stop(self) -> None:
         """Soft stop: freeze at the last commanded pose and refuse new

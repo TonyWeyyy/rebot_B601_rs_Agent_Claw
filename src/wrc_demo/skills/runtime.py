@@ -797,7 +797,14 @@ class SkillRuntime:
         # solution whose approach path dips a link below the table near the
         # base (observed: link7 at xy~(0.05,0.04) z=-0.023, far from the
         # target so no grasp-exemption cylinder can cover it).
-        self.arm.set_gripper(self._grip_open, effort=0.8)
+        # Adaptive opening: open slightly wider than the object width
+        grasp_width_m = float(grasp.width_m)
+        margin_m = 0.01  # 10mm margin for easier approach
+        open_distance_m = min(grasp_width_m + margin_m, self._max_width)
+        if hasattr(self.arm, 'open_gripper'):
+            self.arm.open_gripper(distance_m=open_distance_m)
+        else:
+            self.arm.set_gripper(self._grip_open, effort=0.8)
         _home = self.cfg.arm.get("home_q")
         if _home is not None:
             try:
