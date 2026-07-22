@@ -15,24 +15,23 @@ model: ${assets}/urdf/00-arm-rs_asm-v3/urdf/00-arm-rs_asm-v3.urdf
 joint_signs: [-1, -1, -1, -1, -1, -1]
 ee_frame: gripper_end
 n_joints: 6
-# Home pose tuned to reduce joint deltas during top-down grasps.
-# Based on rebot_grasp ready pose with J6 pre-set to ~-81°.
-# Reduces max joint delta from 86.7° to 65.4° (24% improvement).
-home_q: [0.0, 0.98, 1.33, -1.05, 0.0, -1.41]
+# Home pose: TCP at [0.25, 0, 0.35] with pitch=50° and J6 pre-set to -81°.
+# Pre-positions wrist for top-down grasps; max joint delta to pregrasp: 51.4°.
+home_q: [0.0, 1.2251, 1.9437, -1.5912, 0.0, -1.41]
 
 # MIT gains per joint (null = use the SDK's rebotarm_rs.yaml values).
 mit_kp: null
 mit_kd: null
 
 gripper:
-  # !!! Characterized on the DM build (open -6.8 rad / close 0.0). The RS
-  # gripper (rs-00 + rack-pinion) travel and stall torque MUST be re-verified
-  # onsite before the first grasp; adjust these and max_width_m accordingly.
-  open_pos: -6.8
-  closed_pos: 0.0
+  # RS gripper (rs-00 + rack-pinion): counterclockwise=false means
+  # positive angle = open, negative = close direction.
+  # Based on rebot_grasp/config/default.yaml RS config.
+  open_pos: 5.0    # rad (fully open)
+  closed_pos: 0.0  # rad (fully closed)
   max_width_m: 0.09
   kp: 6.0
   kd: 0.4
 
-# Settling parameters (tuned for large joint movements)
+# Settling
 settle_tol: 0.08  # rad (4.6 deg) - increased from 0.05 to handle oscillation
