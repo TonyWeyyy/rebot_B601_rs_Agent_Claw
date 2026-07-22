@@ -127,6 +127,7 @@ _RULES: list[tuple[re.Pattern, str]] = [
         "move_relative",
     ),
     (re.compile(r"^(?:go\s+home|move\s+home|home|park(?:\s+the\s+arm)?|back\s+to\s+(?:zero|home|start)|return\s+to\s+(?:zero|home|start)|reset(?:\s+position)?|zero(?:\s+position)?)$"), "home"),
+    (re.compile(r"^(?:zero\s+joints?|joints?\s+to\s+zero|all\s+joints?\s+zero|go\s+to\s+(?:joint\s+)?zero|reset\s+joints?|mechanical\s+zero)$"), "zero_joints"),
     (
         re.compile(
             r"^(?:look(?:\s+around)?|observe|scan|"
@@ -247,6 +248,8 @@ def parse_command(text: str) -> ReflexPlan | None:
             return ReflexPlan(intent, [("move_relative", {"direction": g["dir"]})])
         if intent == "home":
             return ReflexPlan(intent, [("move_home", {})])
+        if intent == "zero_joints":
+            return ReflexPlan(intent, [("move_to_joint_zero", {})])
         if intent == "look":
             return ReflexPlan(intent, [("get_observation", {})])
         if intent == "open_gripper":

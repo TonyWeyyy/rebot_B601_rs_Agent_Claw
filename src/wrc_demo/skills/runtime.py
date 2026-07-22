@@ -1629,6 +1629,13 @@ class SkillRuntime:
             raise SkillError("did not settle at home")
         return {"at": "home"}
 
+    def skill_move_to_joint_zero(self) -> dict:
+        """Move all joints to zero position (机械臂零点)."""
+        zero_q = np.zeros(6, dtype=float)
+        if not self.arm.move_joints(zero_q, duration_s=4.0):
+            raise SkillError("did not settle at joint zero")
+        return {"at": "joint_zero", "q_deg": [0.0] * 6}
+
     def skill_recall_memory(self, query: str = "") -> dict:
         out: dict = {"recent_events": self.memory.digest(max_lines=15)}
         if query:
@@ -1860,6 +1867,11 @@ TOOL_SPECS: list[dict] = [
     {
         "name": "move_home",
         "description": "Return the arm to its home configuration (also clears the camera view).",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "move_to_joint_zero",
+        "description": "Move all joints to zero position (机械臂零点). All joint angles become 0.",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     {
