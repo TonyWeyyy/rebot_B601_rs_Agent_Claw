@@ -213,7 +213,7 @@ def shutdown_runtime(runtime, arm) -> None:
         lambda: runtime.rig.close() if getattr(runtime, "rig", None) else runtime.camera.close(),
         arm.disconnect,
     ):
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(Exception, KeyboardInterrupt):
             step()
 
 
@@ -319,6 +319,10 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 if not task:
                     break
+                # Clear e-stop before each task so a previous Ctrl+C
+                # does not permanently block motion.
+                if hasattr(runtime, "arm") and hasattr(runtime.arm, "harness"):
+                    runtime.arm.harness.reset_estop()
                 _print_report(_run(task))
         else:
             task = args.task or "look at the table and report what objects you see"

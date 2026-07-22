@@ -126,7 +126,7 @@ _RULES: list[tuple[re.Pattern, str]] = [
                    r"(?P<dir>forward|back|left|right|up|down)(?:\s+a\s+(?:bit|little))?$"),
         "move_relative",
     ),
-    (re.compile(r"^(?:go\s+home|move\s+home|home|park(?:\s+the\s+arm)?)$"), "home"),
+    (re.compile(r"^(?:go\s+home|move\s+home|home|park(?:\s+the\s+arm)?|back\s+to\s+(?:zero|home|start)|return\s+to\s+(?:zero|home|start)|reset(?:\s+position)?|zero(?:\s+position)?)$"), "home"),
     (
         re.compile(
             r"^(?:look(?:\s+around)?|observe|scan|"

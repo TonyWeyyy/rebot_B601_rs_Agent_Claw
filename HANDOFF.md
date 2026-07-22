@@ -161,3 +161,54 @@ feat: cartesian trajectory planning + IK settle fix
 - Fix IK settle: increase tol to 0.08 rad, timeout to 4.0 s
 - Add diagnostic scripts for IK and grasp planning
 ```
+
+---
+
+## 2026-07-22 (下午) — Home pose 优化
+
+### 问题诊断
+
+IK settle 振荡根因分析：
+
+```
+旧 home: [0, 68.8, 68.8, 0, 43, 0]°
+Pregrasp IK 唯一解: [8.9, 121.6, 118.3, -86.7, 0, -81.1]°
+
+J4: 0° → -86.7° (86.7° delta) ← 振荡主因
+J6: 0° → -81.1° (81.1° delta)
+```
+
+Pregrasp IK 对该旋转矩阵只有唯一解，轨迹规划无法改变目标关节角。
+
+### 解决方案
+
+采用 rebot_grasp 的 ready pose 并预置 J4/J6：
+
+```
+新 home: [0, 56.1, 76.2, -60.2, 0, -80.8]°
+  - 基于 rebot_grasp ready (x=0.3, y=0, z=0.3, pitch=0.7)
+  - J4 预置到 -60° (接近 grasping 的 -87°)
+  - J6 预置到 -81° (接近 grasping 的 -81°)
+```
+
+### 效果
+
+| 场景 | 旧 home max delta | 新 home max delta | 改善 |
+|------|-------------------|-------------------|------|
+| Toy [0.37, -0.06, 0.08] | 86.7° (J4) | 65.4° (J2) | **24%** |
+| Cup [0.3, 0, 0.05] | 90.0° (J6) | 43.8° (J2) | **51%** |
+
+### 提交
+
+```
+f6fca0d fix: tune home_q to reduce joint deltas during grasps
+```
+
+修改文件：`configs/arms/rebot_rs.yaml`
+
+### 下一步
+
+1. 真实硬件测试新 home pose
+2. 验证 settle 振荡是否解决
+3. 观察笛卡尔轨迹规划效果
+
