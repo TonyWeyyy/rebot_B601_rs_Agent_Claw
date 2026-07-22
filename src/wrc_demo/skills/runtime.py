@@ -98,8 +98,27 @@ class SkillRuntime:
         self._grip_closed = float(g.get("closed_pos", 1.0))
         self._max_width = float(g.get("max_width_m", 0.09))
         self._default_classes = list(cfg.get("detect_classes", ["cup", "bottle", "box", "fruit", "toy"]))
+        self._cartesian_planner = None  # lazy CartesianPlanner (planning module)
 
     # ── plumbing ─────────────────────────────────────────────────────────
+
+    @property
+    def cartesian_planner(self):
+        """Lazy CartesianPlanner; None if reBotArm_control_py unavailable."""
+        if self._cartesian_planner is None:
+            try:
+                # Ensure the arm SDK is on sys.path (reBotRSArm.connect()
+                # does this too, but the planner may be needed before the
+                # first motor command materialises the LazyArm).
+                import sys as _sys
+                _sdk = self.cfg.arm.get("sdk_path")
+                if _sdk and _sdk not in _sys.path:
+                    _sys.path.insert(0, _sdk)
+                from ..planning.cartesian_planner import CartesianPlanner
+                self._cartesian_planner = CartesianPlanner(self.kin)
+            except (RuntimeError, ImportError):
+                return None
+        return self._cartesian_planner
 
     def _show_status(self, text: str) -> None:
         """Push agent state to EVERY live view (all rig cameras show the
@@ -796,7 +815,12 @@ class SkillRuntime:
             z_min=float(self.arm.harness.limits.table_z) - 0.06,
         )
         try:
-            if not self.arm.move_joints(q_grasp, duration_s=float(gcfg.get("descend_duration_s", 2.0))):
+            descend_dur = float(gcfg.get("descend_duration_s", 2.0))
+            if not self.arm.move_cartesian(
+                self.kin.fk(q_grasp), self.kin,
+                duration_s=descend_dur,
+                planner=self.cartesian_planner,
+            ):
                 raise SkillError("did not settle at grasp pose")
 
             # 3. close with the material profile (two-stage, stall-aware)
@@ -804,7 +828,11 @@ class SkillRuntime:
 
             # 4. lift back to pregrasp (speed scaled by profile)
             lift_dur = float(gcfg.get("descend_duration_s", 2.0)) / max(profile.lift_speed_scale, 0.2)
-            self.arm.move_joints(q_pre, duration_s=lift_dur)
+            self.arm.move_cartesian(
+                self.kin.fk(q_pre), self.kin,
+                duration_s=lift_dur,
+                planner=self.cartesian_planner,
+            )
         finally:
             self.arm.harness.clear_grasp_exemption()
 
@@ -941,7 +969,12 @@ class SkillRuntime:
             raise SkillError("did not settle above the place target")
         self.arm.harness.allow_grasp_descent(target[:2], z_min=release_z - 0.02)
         try:
-            if not self.arm.move_joints(low.q, duration_s=float(gcfg.get("descend_duration_s", 2.0))):
+            descend_dur = float(gcfg.get("descend_duration_s", 2.0))
+            if not self.arm.move_cartesian(
+                self.kin.fk(low.q), self.kin,
+                duration_s=descend_dur,
+                planner=self.cartesian_planner,
+            ):
                 raise SkillError("did not settle at place pose")
             self.arm.set_gripper(self._grip_open, effort=0.6)
             time.sleep(float(self.cfg.grasp.get("close_settle_s", 0.0)))
@@ -959,7 +992,11 @@ class SkillRuntime:
             self._held_color = None
             self.memory.add("action", f"placed {placed!r} at {target.round(3).tolist()}")
             try:
-                self.arm.move_joints(pre.q, duration_s=float(gcfg.get("descend_duration_s", 2.0)))
+                self.arm.move_cartesian(
+                    self.kin.fk(pre.q), self.kin,
+                    duration_s=float(gcfg.get("descend_duration_s", 2.0)),
+                    planner=self.cartesian_planner,
+                )
             except (SkillError, SafetyViolation) as e:
                 # The place already happened; report success and let the
                 # caller's move_home park the arm.
@@ -1029,9 +1066,18 @@ class SkillRuntime:
         radius = float(np.linalg.norm(end[:2] - start[:2]) / 2 + 0.10)
         self.arm.harness.allow_grasp_descent(center, radius_m=radius, z_min=push_z - 0.02)
         try:
-            self.arm.move_joints(ik_start.q, duration_s=1.5)
-            self.arm.move_joints(ik_end.q, duration_s=2.0)
-            self.arm.move_joints(ik_hover.q, duration_s=1.5)
+            self.arm.move_cartesian(
+                self.kin.fk(ik_start.q), self.kin,
+                duration_s=1.5, planner=self.cartesian_planner,
+            )
+            self.arm.move_cartesian(
+                self.kin.fk(ik_end.q), self.kin,
+                duration_s=2.0, planner=self.cartesian_planner,
+            )
+            self.arm.move_cartesian(
+                self.kin.fk(ik_hover.q), self.kin,
+                duration_s=1.5, planner=self.cartesian_planner,
+            )
         finally:
             self.arm.harness.clear_grasp_exemption()
         self.beliefs.update(label, end, 0.6)
@@ -1487,11 +1533,14 @@ class SkillRuntime:
         T = self.kin.fk(q_now)
         target = T.copy()
         target[:3, 3] += np.asarray(dirs[direction], dtype=float) * distance_m
-        ik = self.kin.ik(target, q_now)
-        if not ik.success:
-            raise SkillError(f"cannot move {distance_m:.2f} m {direction} from here")
-        if not self.arm.move_joints(ik.q, duration_s=1.0):
-            raise SkillError("did not settle after the nudge")
+        if not self.arm.move_cartesian(
+            target, self.kin,
+            duration_s=1.0,
+            planner=self.cartesian_planner,
+        ):
+            raise SkillError(
+                f"cannot move {distance_m:.2f} m {direction} from here"
+            )
         tcp = self.kin.fk(self.arm.get_state().q)[:3, 3]
         return {"moved": direction, "distance_m": distance_m,
                 "tcp_xyz": [round(float(x), 3) for x in tcp]}
@@ -1508,6 +1557,64 @@ class SkillRuntime:
         self._close_two_stage(select_profile("", "rigid"))
         wf = self._gripper_width_frac()
         return {"gripper": "closed", "open_frac": round(wf, 2) if wf is not None else "unknown"}
+
+    def skill_move_to_pose(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        roll: float = 0.0,
+        pitch: float = 0.0,
+        yaw: float = 0.0,
+        duration: float = 2.0,
+    ) -> dict:
+        """Move end-effector to an absolute Cartesian pose along an SE(3)
+        geodesic with CLIK-tracked joint trajectory.  Every intermediate
+        waypoint is safety-vetted.  Falls back to joint-space PTP when
+        the trajectory planner is unavailable or CLIK fails."""
+        T_target = make_transform(x, y, z, roll, pitch, yaw)
+        q_start = self.arm.get_state().q
+
+        if self.cartesian_planner is not None:
+            try:
+                T_start = self.kin.fk(q_start)
+                waypoints = self.cartesian_planner.plan(
+                    q_start, T_start, T_target, duration,
+                )
+                n = len(waypoints)
+                seg = max(duration / n, 0.01) if n else duration
+                ok = self.arm.move_joints_path(waypoints, segment_duration_s=seg)
+                self.memory.add(
+                    "action",
+                    f"move_to_pose ({x:.3f}, {y:.3f}, {z:.3f}) "
+                    f"via cartesian trajectory ({n} waypoints)",
+                )
+                return {
+                    "ok": ok,
+                    "method": "cartesian_trajectory",
+                    "waypoints": n,
+                }
+            except RuntimeError as e:
+                self.memory.add(
+                    "note",
+                    f"cartesian planning failed: {e}; falling back to PTP",
+                )
+
+        # PTP fallback
+        ik = self.kin.ik(T_target, q_start)
+        if not ik.success:
+            raise SkillError(
+                f"IK failed for pose ({x:.3f}, {y:.3f}, {z:.3f}); "
+                f"err={ik.error:.4f}"
+            )
+        ok = self.arm.move_joints(ik.q, duration_s=duration)
+        if not ok:
+            raise SkillError("did not settle at target pose")
+        self.memory.add(
+            "action",
+            f"move_to_pose ({x:.3f}, {y:.3f}, {z:.3f}) via PTP fallback",
+        )
+        return {"ok": True, "method": "ptp_fallback"}
 
     def skill_move_home(self) -> dict:
         home = np.asarray(self.cfg.arm.get("home_q", [0.0, -0.5, -0.9, 0.0, 0.6, 0.0]), dtype=float)
@@ -1725,6 +1832,23 @@ TOOL_SPECS: list[dict] = [
         "name": "close_gripper",
         "description": "Close the gripper with the default profile.",
         "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "move_to_pose",
+        "description": "Move the end-effector to an absolute Cartesian pose (x,y,z in metres, roll/pitch/yaw in radians) along a smooth SE(3) geodesic trajectory. Every intermediate waypoint is safety-vetted. Use for precise Cartesian moves, e.g. 'move to x=0.3 y=0.0 z=0.2'. Falls back to joint-space PTP if trajectory planning is unavailable.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
+                "roll": {"type": "number"},
+                "pitch": {"type": "number"},
+                "yaw": {"type": "number"},
+                "duration": {"type": "number"},
+            },
+            "required": ["x", "y", "z"],
+        },
     },
     {
         "name": "move_home",

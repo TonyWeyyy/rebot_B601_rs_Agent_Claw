@@ -30,3 +30,6 @@ gripper:
   max_width_m: 0.09
   kp: 6.0
   kd: 0.4
+
+# Settling parameters (tuned for large joint movements)
+settle_tol: 0.08  # rad (4.6 deg) - increased from 0.05 to handle oscillation

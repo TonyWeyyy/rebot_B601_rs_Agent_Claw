@@ -331,6 +331,73 @@ class SafeArm:
         finally:
             self.harness.end_motion()
 
+    def move_joints_path(
+        self,
+        waypoints: list,
+        segment_duration_s: float = 0.5,
+    ) -> bool:
+        """Stream along pre-computed joint waypoints, each segment
+        min-jerk interpolated with per-waypoint harness approval.
+
+        Designed for CartesianPlanner output: every waypoint was already
+        IK-solved and the whole list represents a smooth Cartesian path.
+        Each segment is independently safety-gated so a harness violation
+        mid-trajectory aborts cleanly.
+
+        Returns True when the arm settles at the final waypoint.
+        """
+        if not waypoints:
+            return True
+        self.harness.begin_motion()
+        try:
+            for wp in waypoints:
+                if not self._arm.stream_to(
+                    np.asarray(wp, dtype=float),
+                    segment_duration_s,
+                    approve=self.harness.approve,
+                ):
+                    return False
+            return True
+        finally:
+            self.harness.end_motion()
+
+    def move_cartesian(
+        self,
+        T_target,
+        kin,
+        duration_s: float = 2.0,
+        planner=None,
+    ) -> bool:
+        """Cartesian trajectory motion: SE(3) geodesic -> CLIK tracking ->
+        per-waypoint harness approval -> motor.
+
+        When *planner* is a CartesianPlanner, the end-effector follows a
+        smooth Cartesian path.  When planner is None or planning fails,
+        falls back to joint-space PTP (current behaviour).
+
+        Returns True when the arm settles at the target.
+        """
+        q_start = self.get_state().q
+        T_start = kin.fk(q_start)
+
+        if planner is not None:
+            try:
+                waypoints = planner.plan(
+                    q_start, T_start, np.asarray(T_target, dtype=float),
+                    duration_s,
+                )
+                n = len(waypoints)
+                seg_dur = max(duration_s / n, 0.01) if n else duration_s
+                return self.move_joints_path(waypoints, segment_duration_s=seg_dur)
+            except RuntimeError:
+                pass  # fall through to PTP
+
+        # PTP fallback: IK + single-segment min-jerk
+        ik = kin.ik(np.asarray(T_target, dtype=float), q_start)
+        if not ik.success:
+            return False
+        return self.move_joints(ik.q, duration_s=duration_s)
+
     def set_gripper(self, pos: float, effort: float = 1.0) -> None:
         if self.harness.estopped:
             raise SafetyViolation("e-stop latched")
