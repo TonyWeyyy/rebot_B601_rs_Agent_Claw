@@ -1,214 +1,110 @@
-# WRC Demo 交接文档
+# WRC Demo Handoff
 
-## 2026-07-22 工作摘要
+## Today's Work (2026-07-22)
 
-### 完成的任务
+### 1. Cartesian Trajectory Planning (e97998c)
+- Added `planning/cartesian_planner.py` wrapping `reBotArm_control_py.trajectory`
+- SE(3) geodesic interpolation + CLIK tracking for smooth Cartesian paths
+- `SafeArm` gained `move_joints_path()` and `move_cartesian()` methods
+- Upgraded 4 skills to use Cartesian trajectories:
+  - `grasp_object`: descend/lift now follow straight vertical paths
+  - `place_at`: descend/lift now follow straight vertical paths  
+  - `push_object`: all 3 segments use Cartesian motion
+  - `move_relative`: now moves in straight Cartesian lines
+- Added new `move_to_pose` skill (22nd skill total)
+- All changes have automatic PTP fallback if trajectory planning unavailable
 
-1. **添加笛卡尔轨迹规划能力**
-   - 新增 `src/wrc_demo/planning/cartesian_planner.py`
-   - 封装 `reBotArm_control_py.trajectory` 模块
-   - SE(3) 测地线插值 + CLIK 跟踪
-   - 末端走笛卡尔直线而非关节空间弧线
+### 2. Home Pose Optimization (f6fca0d)
+- **Root cause**: Top-down grasp IK has unique solution requiring J4≈-87°, J6≈-81°
+- Old home `[0, 68.8, 68.8, 0, 43, 0]°` had J4=0°, J6=0° → 86.7° max delta → oscillation
+- New home `[0, 56.1, 76.2, -60.2, 0, -80.8]°` (based on rebot_grasp ready pose)
+  - J4 pre-positioned at -60° (closer to -87° grasp target)
+  - J6 pre-positioned at -81° (matches grasp target)
+- Result: Max joint delta reduced from 86.7° → 65.4° (24% improvement)
 
-2. **升级 SafeArm 运动接口**
-   - `move_joints_path()` - 沿预计算航点序列运动
-   - `move_cartesian()` - 笛卡尔轨迹运动，自动回退 PTP
+### 3. Live Testing Fixes (b70f3a0)
+- **E-stop auto-reset**: Ctrl+C latched e-stop permanently; now auto-clears before each task
+- **Reflex expansion**: "back to zero" / "return to home" / "reset" now map to `move_home`
+- **Clean shutdown**: `KeyboardInterrupt` now caught during disconnect (was crashing)
 
-3. **升级运动技能**
-   - `grasp_object` - descend/lift 使用笛卡尔轨迹
-   - `place_at` - descend/lift 使用笛卡尔轨迹
-   - `push_object` - 三段运动使用笛卡尔轨迹
-   - `move_relative` - 笛卡尔直线运动
-   - **新增** `move_to_pose` - 通用笛卡尔位姿运动
+## Current State
 
-4. **诊断 IK settle 问题**
-   - 根因：大关节运动（86.7°）导致振荡
-   - 修复：settle_tol 0.05→0.08 rad, timeout 2.0→4.0 s
+### Working
+- Camera pipeline (Orbbec overhead + RealSense wrist)
+- YOLO detection + 3D fusion
+- Cartesian trajectory planning (with PTP fallback)
+- Home pose with reduced joint deltas
+- Reflex command parsing (expanded)
+- E-stop recovery between tasks
 
-### 改动的文件
+### Known Issues
+- **IK settle oscillation**: Max joint delta still 65.4° (J2), may still oscillate
+- **USB stability**: Occasional camera disconnects (physical issue)
+- **Grasp success rate**: Untested with new home pose + trajectory planning
 
-**新增：**
-- `src/wrc_demo/planning/__init__.py`
-- `src/wrc_demo/planning/cartesian_planner.py`
-- `scripts/diag_ik_settle.py` - IK 诊断工具
-- `scripts/diag_grasp_planning.py` - Grasp planning 诊断
+## Next Steps (Tomorrow)
 
-**修改：**
-- `src/wrc_demo/safety/harness.py` - SafeArm 新增方法
-- `src/wrc_demo/skills/runtime.py` - 5 个技能升级 + 新增
-- `src/wrc_demo/control/arm_base.py` - settle_timeout_s 默认值
-- `configs/arms/rebot_rs.yaml` - settle_tol 配置
-
-### 环境状态
-
-- ✅ DM conda env 可用（pinocchio, numpy, cv2）
-- ✅ reBotArm_control_py trajectory 模块可导入
-- ✅ 所有语法检查通过
-- ✅ 规划模块端到端测试通过（51 waypoints, 0.1mm error）
-
-### 待解决问题
-
-1. **IK settle 振荡**（已部分修复）
-   - 状态：增加了 tolerance 和 timeout
-   - 下一步：真实硬件测试验证
-
-2. **USB 相机断开**（物理问题）
-   - 状态：昨天已改善但未根除
-   - 建议：检查线缆和供电
-
-3. **轨迹规划实时测试**
-   - 状态：代码就绪
-   - 下一步：mock 模式测试 → 真实硬件测试
-
-## 启动命令
-
-### 验证改动
-
-```bash
-cd /home/seeed/wrc_demo
-PYTHONPATH=src:/home/seeed/reBotArm_control_py \
-/home/seeed/miniforge3/envs/DM/bin/python -c "
-from wrc_demo.planning import _AVAILABLE
-print(f'CartesianPlanner: {_AVAILABLE}')
-from wrc_demo.skills.runtime import TOOL_SPECS
-print(f'Skills: {len(TOOL_SPECS)}')
-"
-```
-
-### Mock 模式测试
-
-```bash
-cd /home/seeed/wrc_demo/models
-PYTHONPATH=/home/seeed/wrc_demo/src:/home/seeed/reBotArm_control_py \
-/home/seeed/miniforge3/envs/DM/bin/python -m wrc_demo.apps.demo \
-  --camera mock --arm mock --llm mock --interactive --no-view --no-serve
-```
-
-### 真实硬件测试
-
+### Priority 1: Verify IK Settle Fix
 ```bash
 cd /home/seeed/wrc_demo/models
 sudo ip link set can0 up type can bitrate 1000000
-sudo env HOME=/home/seeed YOLO_OFFLINE=True \
-PYTHONPATH=/home/seeed/wrc_demo/src:/home/seeed/reBotArm_control_py \
-/home/seeed/miniforge3/envs/DM/bin/python -m wrc_demo.apps.demo \
-  --interactive --cameras orbbec_overhead --arm rebot_rs --llm mock
-# 密码: 0000
-# 测试: "pick up the toy"
+sudo env HOME=/home/seeed PYTHONPATH=/home/seeed/wrc_demo/src:/home/seeed/reBotArm_control_py \
+  /home/seeed/miniforge3/envs/DM/bin/python -m wrc_demo.apps.demo \
+  --cameras orbbec_overhead --arm rebot_rs --llm mock --interactive
+# Password: 0000
+
+# Test commands:
+# - "pick up the toy" (should use Cartesian trajectory)
+# - "back to zero" (should trigger move_home reflex)
+# - Watch for oscillation during descend/lift phases
 ```
 
-### 诊断工具
+**Success criteria**: 
+- Grasp completes without "did not settle" errors
+- Smooth vertical motion during descend/lift (no joint-space arcs)
+- No oscillation at pregrasp/grasp poses
 
+### Priority 2: If Oscillation Persists
+Two options:
+1. **Reduce max_joint_vel** in `configs/demo.yaml` (currently 1.2 rad/s → try 0.8)
+2. **Further relax settle tolerance** (currently 0.08 rad → try 0.10)
+
+### Priority 3: End-to-End Grasp Test
+Once settle is stable:
 ```bash
-# IK settle 诊断
+# Switch from mock LLM to real planner
+--llm openai  # or --llm anthropic
+
+# Test full pick-and-place
+"pick up the toy and place it in the basket"
+```
+
+## Key Files Changed Today
+- `src/wrc_demo/planning/cartesian_planner.py` (new)
+- `src/wrc_demo/safety/harness.py` (added move_joints_path, move_cartesian)
+- `src/wrc_demo/skills/runtime.py` (upgraded 4 skills + added move_to_pose)
+- `configs/arms/rebot_rs.yaml` (new home_q)
+- `src/wrc_demo/apps/demo.py` (e-stop reset + KeyboardInterrupt handling)
+- `src/wrc_demo/agent/reflex.py` (expanded home intent)
+
+## Diagnostic Tools
+```bash
+# Test Cartesian planner (no hardware)
 PYTHONPATH=src:/home/seeed/reBotArm_control_py \
-/home/seeed/miniforge3/envs/DM/bin/python scripts/diag_ik_settle.py
+  /home/seeed/miniforge3/envs/DM/bin/python scripts/test_cartesian_planner.py
 
-# Grasp planning 诊断
+# Analyze joint deltas for a grasp
 PYTHONPATH=src:/home/seeed/reBotArm_control_py \
-/home/seeed/miniforge3/envs/DM/bin/python scripts/diag_grasp_planning.py
+  /home/seeed/miniforge3/envs/DM/bin/python scripts/diag_grasp_planning.py
+
+# Check IK reachability
+PYTHONPATH=src:/home/seeed/reBotArm_control_py \
+  /home/seeed/miniforge3/envs/DM/bin/python scripts/diag_ik_settle.py
 ```
 
-## 技术要点
-
-### 轨迹规划工作原理
-
+## Git Log
 ```
-目标位姿 (x,y,z,roll,pitch,yaw)
-    ↓ IK 求解 q_end
-    ↓ SE(3) 测地线插值 T_start → T_end
-    ↓ CLIK 跟踪生成 N 个关节角
-    ↓ SafetyHarness 逐点审查
-    ↓ min-jerk 流式发送
-```
-
-### 回退机制
-
-- `reBotArm_control_py` 不可用 → 自动回退 PTP
-- CLIK 跟踪失败 → 自动回退 PTP
-- 所有现有功能不受影响
-
-### 关键参数
-
-- `settle_tol`: 0.08 rad (4.6°) - 位置容差
-- `settle_timeout_s`: 4.0 s - 等待稳定时间
-- `pregrasp_offset_m`: 0.04 m - 预抓取高度
-- `max_joint_vel`: 1.2 rad/s - 关节速度限制
-
-## Git 状态
-
-```
-Modified:
-  src/wrc_demo/safety/harness.py
-  src/wrc_demo/skills/runtime.py
-  src/wrc_demo/control/arm_base.py
-  configs/arms/rebot_rs.yaml
-
-Untracked:
-  src/wrc_demo/planning/
-  scripts/diag_ik_settle.py
-  scripts/diag_grasp_planning.py
-```
-
-建议 commit message:
-```
-feat: cartesian trajectory planning + IK settle fix
-
-- Add CartesianPlanner wrapping reBotArm_control_py.trajectory
-- SafeArm: move_joints_path, move_cartesian with PTP fallback
-- Upgrade grasp/place/push/move_relative to cartesian trajectory
-- Add move_to_pose skill (22nd skill)
-- Fix IK settle: increase tol to 0.08 rad, timeout to 4.0 s
-- Add diagnostic scripts for IK and grasp planning
-```
-
----
-
-## 2026-07-22 (下午) — Home pose 优化
-
-### 问题诊断
-
-IK settle 振荡根因分析：
-
-```
-旧 home: [0, 68.8, 68.8, 0, 43, 0]°
-Pregrasp IK 唯一解: [8.9, 121.6, 118.3, -86.7, 0, -81.1]°
-
-J4: 0° → -86.7° (86.7° delta) ← 振荡主因
-J6: 0° → -81.1° (81.1° delta)
-```
-
-Pregrasp IK 对该旋转矩阵只有唯一解，轨迹规划无法改变目标关节角。
-
-### 解决方案
-
-采用 rebot_grasp 的 ready pose 并预置 J4/J6：
-
-```
-新 home: [0, 56.1, 76.2, -60.2, 0, -80.8]°
-  - 基于 rebot_grasp ready (x=0.3, y=0, z=0.3, pitch=0.7)
-  - J4 预置到 -60° (接近 grasping 的 -87°)
-  - J6 预置到 -81° (接近 grasping 的 -81°)
-```
-
-### 效果
-
-| 场景 | 旧 home max delta | 新 home max delta | 改善 |
-|------|-------------------|-------------------|------|
-| Toy [0.37, -0.06, 0.08] | 86.7° (J4) | 65.4° (J2) | **24%** |
-| Cup [0.3, 0, 0.05] | 90.0° (J6) | 43.8° (J2) | **51%** |
-
-### 提交
-
-```
+b70f3a0 fix: e-stop auto-reset + 'back to zero' reflex + clean shutdown
 f6fca0d fix: tune home_q to reduce joint deltas during grasps
+e97998c feat: cartesian trajectory planning + IK settle fix
 ```
-
-修改文件：`configs/arms/rebot_rs.yaml`
-
-### 下一步
-
-1. 真实硬件测试新 home pose
-2. 验证 settle 振荡是否解决
-3. 观察笛卡尔轨迹规划效果
-
