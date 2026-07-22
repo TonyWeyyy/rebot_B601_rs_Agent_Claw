@@ -126,8 +126,10 @@ _RULES: list[tuple[re.Pattern, str]] = [
                    r"(?P<dir>forward|back|left|right|up|down)(?:\s+a\s+(?:bit|little))?$"),
         "move_relative",
     ),
-    (re.compile(r"^(?:go\s+home|move\s+home|home|park(?:\s+the\s+arm)?|back\s+to\s+(?:zero|home|start)|return\s+to\s+(?:zero|home|start)|reset(?:\s+position)?|zero(?:\s+position)?)$"), "home"),
-    (re.compile(r"^(?:zero\s+joints?|joints?\s+to\s+zero|all\s+joints?\s+zero|go\s+to\s+(?:joint\s+)?zero|reset\s+joints?|mechanical\s+zero)$"), "zero_joints"),
+    # Home pose: operational ready position [0.25, 0, 0.35, 0, 0, 0]
+    (re.compile(r"^(?:go\s+home|move\s+home|home|park(?:\s+the\s+arm)?|back\s+to\s+home|return\s+to\s+home|ready\s+(?:pose|position))$"), "home"),
+    # Mechanical zero: all joints to [0, 0, 0, 0, 0, 0]
+    (re.compile(r"^(?:zero\s+joints?|joints?\s+to\s+zero|all\s+joints?\s+zero|mechanical\s+zero|joint\s+zero|zero\s+position)$"), "zero_joints"),
     (
         re.compile(
             r"^(?:look(?:\s+around)?|observe|scan|"
