@@ -26,7 +26,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/base_link.STL" />
+          filename="meshes/base_link.STL" />
       </geometry>
       <material
         name="">
@@ -40,7 +40,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/base_link.STL" />
+          filename="meshes/base_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -66,7 +66,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link1.STL" />
+          filename="meshes/link1.STL" />
       </geometry>
       <material
         name="">
@@ -80,7 +80,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link1.STL" />
+          filename="meshes/link1.STL" />
       </geometry>
     </collision>
   </link>
@@ -95,7 +95,7 @@
     <child
       link="link1" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
       lower="-2.8"
       upper="2.8"
@@ -109,14 +109,14 @@
         xyz="-0.117864812717456 -0.00342226413942967 -0.0271551938501484"
         rpy="0 0 0" />
       <mass
-        value="1.552" />
+        value="1.972" />
       <inertia
-        ixx="0.000577466775"
-        ixy="-3.3841785e-07"
-        ixz="6.69752535e-06"
-        iyy="0.00988484698"
-        iyz="1.00738337e-06"
-        izz="0.0100847496" />
+        ixx="0.00073374"
+        ixy="-0.00000043"
+        ixz="0.00000851"
+        iyy="0.01255987"
+        iyz="0.00000128"
+        izz="0.01281387" />
     </inertial>
     <!-- <visual>
       <origin
@@ -124,7 +124,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link2.STL" />
+          filename="meshes/link2.STL" />
       </geometry>
       <material
         name="">
@@ -138,7 +138,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/motor_2_3.STL" />
+          filename="meshes/motor_2_3.STL" />
       </geometry>
       <material
         name="">
@@ -152,7 +152,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/cnc2.STL" />
+          filename="meshes/cnc2.STL" />
       </geometry>
       <material
         name="">
@@ -166,7 +166,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/pla2_black.STL" />
+          filename="meshes/pla2_black.STL" />
       </geometry>
       <material
         name="">
@@ -180,7 +180,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/pla2_green.STL" />
+          filename="meshes/pla2_green.STL" />
       </geometry>
       <material
         name="">
@@ -194,7 +194,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link2.STL" />
+          filename="meshes/link2.STL" />
       </geometry>
     </collision>
   </link>
@@ -209,10 +209,10 @@
     <child
       link="link2" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
-      lower="-3.14"
-      upper="0"
+      lower="0"
+      upper="3.14"
       effort="36"
       velocity="50" />
   </joint>
@@ -223,14 +223,14 @@
         xyz="0.103427154487799 -0.0664137912104635 -0.0271068687716704"
         rpy="0 0 0" />
       <mass
-        value="1.252" />
+        value="1.062" />
       <inertia
-        ixx="0.000551811337"
-        ixy="-4.07430508e-05"
-        ixz="-5.02214689e-05"
-        iyy="0.00745889021"
-        iyz="7.07344633e-08"
-        izz="0.00764192742" />
+        ixx="0.00046807"
+        ixy="-0.00003456"
+        ixz="-0.00004260"
+        iyy="0.00632695"
+        iyz="0.00000006"
+        izz="0.00648221" />
     </inertial>
     <!--  <visual>
       <origin
@@ -238,7 +238,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link3.STL" />
+          filename="meshes/link3.STL" />
       </geometry>
       <material
         name="">
@@ -252,7 +252,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/cnc3.STL" />
+          filename="meshes/cnc3.STL" />
       </geometry>
       <material
         name="">
@@ -266,7 +266,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/motor_4.STL" />
+          filename="meshes/motor_4.STL" />
       </geometry>
       <material
         name="">
@@ -280,7 +280,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/pla3_black.STL" />
+          filename="meshes/pla3_black.STL" />
       </geometry>
       <material
         name="">
@@ -294,7 +294,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/pla3_green.STL" />
+          filename="meshes/pla3_green.STL" />
       </geometry>
       <material
         name="">
@@ -308,7 +308,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link3.STL" />
+          filename="meshes/link3.STL" />
       </geometry>
     </collision>
   </link>
@@ -323,10 +323,10 @@
     <child
       link="link3" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
-      lower="-3.14"
-      upper="0"
+      lower="0"
+      upper="3.14"
       effort="36"
       velocity="50" />
   </joint>
@@ -337,14 +337,14 @@
         xyz="0.0475544540775559 -0.0441113470158517 -0.0314111924918381"
         rpy="0 0 0" />
       <mass
-        value="0.46" />
+        value="0.66" />
       <inertia
-        ixx="0.000320508485"
-        ixy="0.000168799091"
-        ixz="-0"
-        iyy="0.000524525455"
-        iyz="-0"
-        izz="0.000465171515" />
+        ixx="0.00045986"
+        ixy="0.00024219"
+        ixz="-0.0"
+        iyy="0.00075258"
+        iyz="-0.0"
+        izz="0.00066742" />
     </inertial>
     <!-- <visual>
       <origin
@@ -352,7 +352,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link4.STL" />
+          filename="meshes/link4.STL" />
       </geometry>
       <material
         name="">
@@ -366,7 +366,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/motor_5.STL" />
+          filename="meshes/motor_5.STL" />
       </geometry>
       <material
         name="">
@@ -380,7 +380,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/cnc4.STL" />
+          filename="meshes/cnc4.STL" />
       </geometry>
       <material
         name="">
@@ -394,7 +394,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link4.STL" />
+          filename="meshes/link4.STL" />
       </geometry>
     </collision>
   </link>
@@ -409,10 +409,10 @@
     <child
       link="link4" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
-      lower="-1.79"
-      upper="1.69"
+      lower="-1.57"
+      upper="1.57"
       effort="14"
       velocity="40" />
   </joint>
@@ -420,17 +420,17 @@
     name="link5">
     <inertial>
       <origin
-        xyz="-0.0114400622356175 4.7907739316217E-06 0.0480487481818926"
+        xyz="0.0114400622356175 4.7907739316217E-06 0.0380487481818926"
         rpy="0 0 0" />
       <mass
-        value="0.20120457182895" />
+        value="0.150120457182895" />
       <inertia
-        ixx="9.84090046e-05"
-        ixy="1.81878283e-08"
-        ixz="-1.15016294e-06"
-        iyy="7.39220615e-05"
-        iyz="-1.77912637e-08"
-        izz="7.10245279e-05" />
+        ixx="7.34238025911107E-05"
+        ixy="1.35700947009798E-08"
+        ixz="-8.58146433770359E-07"
+        iyy="5.5153884237714E-05"
+        iyz="-1.32742144977931E-08"
+        izz="5.29920095811017E-05" />
     </inertial>
     <!-- <visual>
       <origin
@@ -438,7 +438,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link5.STL" />
+          filename="meshes/link5.STL" />
       </geometry>
       <material
         name="">
@@ -452,7 +452,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/motor_6.STL" />
+          filename="meshes/motor_6.STL" />
       </geometry>
       <material
         name="">
@@ -466,7 +466,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/cnc5.STL" />
+          filename="meshes/cnc5.STL" />
       </geometry>
       <material
         name="">
@@ -480,7 +480,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/pla5_green.STL" />
+          filename="meshes/pla5_green.STL" />
       </geometry>
       <material
         name="">
@@ -494,7 +494,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link5.STL" />
+          filename="meshes/link5.STL" />
       </geometry>
     </collision>
   </link>
@@ -509,7 +509,7 @@
     <child
       link="link5" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
       lower="-1.57"
       upper="1.57"
@@ -523,14 +523,14 @@
         xyz="1.80196022567525E-05 2.48334592051007E-08 0.00434805764057547"
         rpy="0 0 0" />
       <mass
-        value="0.1" />
+        value="0.03" />
       <inertia
-        ixx="1.47424612e-05"
-        ixy="1.05586155e-11"
-        ixz="5.06176061e-10"
-        iyy="1.45728507e-05"
-        iyz="-7.39546725e-12"
-        izz="2.8476646e-05" />
+        ixx="4.42273835852359E-06"
+        ixy="3.16758463739482E-12"
+        ixz="1.51852818442002E-10"
+        iyy="4.37185522080034E-06"
+        iyz="-2.21864017603015E-12"
+        izz="8.54299378942051E-06" />
     </inertial>
     <visual>
       <origin
@@ -538,7 +538,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link6.STL" />
+          filename="meshes/link6.STL" />
       </geometry>
       <material
         name="">
@@ -552,7 +552,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/link6.STL" />
+          filename="meshes/link6.STL" />
       </geometry>
     </collision>
   </link>
@@ -567,7 +567,7 @@
     <child
       link="link6" />
     <axis
-      xyz="0 0 1" />
+      xyz="0 0 -1" />
     <limit
       lower="-3.14"
       upper="3.14"
@@ -596,7 +596,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/gripper_end.STL" />
+          filename="meshes/gripper_end.STL" />
       </geometry>
       <material
         name="">
@@ -610,7 +610,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/pla7_green.STL" />
+          filename="meshes/pla7_green.STL" />
       </geometry>
       <material
         name="">
@@ -624,7 +624,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/cnc7.STL" />
+          filename="meshes/cnc7.STL" />
       </geometry>
       <material
         name="">
@@ -638,7 +638,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/motor_7.STL" />
+          filename="meshes/motor_7.STL" />
       </geometry>
       <material
         name="">
@@ -652,7 +652,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/gripper_end.STL" />
+          filename="meshes/gripper_end.STL" />
       </geometry>
     </collision>
   </link>
@@ -691,7 +691,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/gripper_left.STL" />
+          filename="meshes/gripper_left.STL" />
       </geometry>
       <material
         name="">
@@ -705,7 +705,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/pla_left.STL" />
+          filename="meshes/pla_left.STL" />
       </geometry>
       <material
         name="">
@@ -719,7 +719,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/cnc_left.STL" />
+          filename="meshes/cnc_left.STL" />
       </geometry>
       <material
         name="">
@@ -733,7 +733,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/gripper_left.STL" />
+          filename="meshes/gripper_left.STL" />
       </geometry>
     </collision>
   </link>
@@ -777,7 +777,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/gripper_right.STL" />
+          filename="meshes/gripper_right.STL" />
       </geometry>
       <material
         name="">
@@ -791,7 +791,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/pla_right.STL" />
+          filename="meshes/pla_right.STL" />
       </geometry>
       <material
         name="">
@@ -805,7 +805,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/cnc_right.STL" />
+          filename="meshes/cnc_right.STL" />
       </geometry>
       <material
         name="">
@@ -819,7 +819,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://00-arm-rs_asm-v3/meshes/gripper_right.STL" />
+          filename="meshes/gripper_right.STL" />
       </geometry>
     </collision>
   </link>

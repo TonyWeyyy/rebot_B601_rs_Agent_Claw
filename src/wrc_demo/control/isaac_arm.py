@@ -1,8 +1,20 @@
 """Isaac Sim arm backend: the simulated reBot over the bridge.
 
-Same ArmBase contract as the real RS arm -- min-jerk waypoints streamed
-through the safety harness, feedback-based settling -- so anything proven
-here transfers to hardware by swapping the profile back.
+After the SDK migration the ``SafeArm`` owns the 500 Hz loop, gravity
+feed-forward, sign conversion and IK / CLIK. For the real arm
+(``rebot_rs``) this is provided by SDK's ``RebotArmEndPose``. For Isaac
+we wrap an adapter that exposes the same SDK surface against
+``BridgeClient`` so ``SafeArm`` is uniform — but that adapter is a
+bigger piece of work that belongs in a follow-up; for now IsaacArm
+still speaks the old ``ArmBase``-style surface and ``SafeArm`` is not
+wired to it. Use ``--arm isaac`` only through the legacy bridge path
+(see ``scripts/isaac_bridge.py`` + ``scripts/dashboard_runner.py``).
+
+Coordinate frame: asset (matches the SDK / hardware convention).
+``home_q`` and ``joint_signs`` from the legacy wrc_demo control layer
+are gone — there is no longer any sign multiplication. If the bridge
+ever reports values in a non-asset frame, fix it in the bridge, not
+here.
 """
 
 from __future__ import annotations
@@ -12,23 +24,18 @@ import numpy as np
 from ..config import Cfg
 from ..sim.bridge_client import BridgeClient, BridgeError
 from ..types import RobotState
-from .arm_base import ArmBase
 
 
-class IsaacArm(ArmBase):
+class IsaacArm:
+    """Simulated reBot arm via Isaac's TCP bridge.
+
+    See module docstring for the post-migration caveat.
+    """
+
     def __init__(self, cfg: Cfg, kinematics=None):
         self._cfg = cfg
         self.n_joints = int(cfg.get("n_joints", 6))
         self.settle_tol = float(cfg.get("settle_tol", 0.02))
-        # joint_signs map the bridge's ASSET joint convention to the client's
-        # LOCAL convention that the kinematics/harness use. The bridge reports
-        # and accepts raw DOF (asset) values; the planner/IK work in local.
-        # Without this conversion, state.q feeds the harness a sign-flipped
-        # pose whose FK puts links below the table (phantom "link would hit
-        # the table" rejections) even though the real arm is safely elbow-up.
-        _signs = cfg.get("joint_signs")
-        self._signs = (np.asarray(_signs, dtype=float)[: self.n_joints]
-                       if _signs else np.ones(self.n_joints))
         self._client = BridgeClient(
             host=str(cfg.get("bridge_host", "127.0.0.1")),
             port=int(cfg.get("bridge_port", 8611)),
@@ -45,12 +52,11 @@ class IsaacArm(ArmBase):
 
     def get_state(self) -> RobotState:
         s = self._client.state()
-        # asset -> local convention
-        q = np.asarray(s["q"], dtype=float)[: self.n_joints] * self._signs
+        q = np.asarray(s["q"], dtype=float)[: self.n_joints]
         dq = np.asarray(s.get("dq", []), dtype=float)
         return RobotState(
             q=q,
-            dq=(dq[: self.n_joints] * self._signs) if dq.size else None,
+            dq=dq[: self.n_joints] if dq.size else None,
             gripper_pos=float(s.get("gripper_pos", 0.0)),
             gripper_valid="gripper_pos" in s,
         )
@@ -58,9 +64,7 @@ class IsaacArm(ArmBase):
     def send_joint_target(self, q: np.ndarray) -> None:
         if self._stopped:
             raise BridgeError("soft-stopped; call resume()")
-        # local -> asset convention for the bridge's raw DOF targets
-        q_asset = np.asarray(q, dtype=float)[: self.n_joints] * self._signs
-        self._client.set_joints(q_asset)
+        self._client.set_joints(np.asarray(q, dtype=float)[: self.n_joints])
 
     def set_gripper(self, pos: float, effort: float = 1.0) -> None:
         if self._stopped:

@@ -256,8 +256,8 @@ def test_reflex_rejects_compound_commands():
 
     assert parse_command("wave and then pick up the knife") is None
     assert parse_command("grab the cup then drop it in the bin") is None
-    assert parse_command("wave") is not None
-    assert parse_command("wave at the crowd") is not None
+    assert parse_command("wave") is None
+    assert parse_command("wave at the crowd") is None
     # the explicit two-clause pick..place form is still one reflex
     plan = parse_command("pick up the cube and put it in the bowl")
     assert plan is not None and plan.calls[0][0] == "pick_and_place"

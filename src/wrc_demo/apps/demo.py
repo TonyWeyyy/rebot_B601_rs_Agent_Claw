@@ -26,16 +26,14 @@ from ..agent.orchestrator import AgentOrchestrator
 from ..agent.reflex import ExperienceMemory, FastPlanner
 from ..agent.trace import TraceLogger
 from ..config import Cfg, PACKAGE_ROOT, load_demo_config
-from ..control.arm_base import make_arm
-from ..control.kinematics import Kinematics
-from ..control.lazy_arm import LazyArm
+from ..control import make_arm
 from ..memory import BeliefStore, EpisodicMemory
 from ..perception.camera_base import make_camera
 from ..perception.depth_provider import DepthProvider
 from ..perception.grounding import Extrinsics
 from ..perception.stream import CameraRig, CameraStream
 from ..perception.world import LockedDetector, WatchedCamera, WorldWatcher
-from ..safety.harness import SafeArm, SafetyHarness, SafetyLimits
+from ..safety.harness import Kinematics, SafetyHarness, SafetyLimits
 from ..skills.runtime import SkillRuntime
 
 
@@ -55,20 +53,15 @@ def build_runtime(
     serve: bool = False,
 ) -> tuple[SkillRuntime, object]:
     kin = Kinematics(
-        model_path=cfg.arm.model,
-        ee_frame=cfg.arm.get("ee_frame", "gripper_end"),
-        n_controlled=int(cfg.arm.get("n_joints", 6)),
-        joint_signs=cfg.arm.get("joint_signs"),
+        urdf_path=str(cfg.arm.urdf),
+        ee_frame=str(cfg.arm.get("ee_frame", "gripper_end")),
+        arm_joint_count=int(cfg.arm.get("n_joints", 6)),
     )
-    if lazy_arm:
-        # Perception pre-warms at startup; motors stay untouched until the
-        # first motion command materializes the arm (see LazyArm).
-        arm = LazyArm(lambda: make_arm(cfg.arm, kinematics=kin))
-    else:
-        arm = make_arm(cfg.arm, kinematics=kin)
-        arm.connect()
-    harness = SafetyHarness(SafetyLimits.from_config(cfg.safety), kinematics=kin)
-    safe_arm = SafeArm(arm, harness)
+    # ``make_arm`` returns the right arm type (MockArm / IsaacArm / SafeArm
+    # wrapping the vendored SDK) and connects it. For real arms this
+    # powers the motors immediately; the ``lazy_arm`` flag is now a
+    # no-op (kept in the signature for back-compat with the MCP server).
+    arm = make_arm(cfg, kinematics=kin)
 
     # ── the camera rig: N continuous streams, first = manipulation ──────
     cam_cfgs = _camera_cfgs(cfg)
@@ -77,9 +70,9 @@ def build_runtime(
 
     def fk():
         # Eye-in-hand extrinsics need live FK -- but the 3 Hz watcher must
-        # NEVER be the thing that materializes a LazyArm (that would power
-        # the motors as a side effect of starting the gateway). The watcher
-        # skips this camera until the arm is up.
+        # NEVER be the thing that triggers an arm re-connect (the SDK's
+        # start() powers the motors). The watcher skips this camera until
+        # the arm reports connected.
         if not getattr(arm, "connected", True):
             from ..types import SkillError
 
@@ -140,7 +133,7 @@ def build_runtime(
     trace = TraceLogger(run_dir)
     runtime = SkillRuntime(
         rig.primary, watched[0].depth, detector, watched[0].extrinsics,
-        kin, safe_arm, memory, beliefs, trace, cfg,
+        kin, arm, memory, beliefs, trace, cfg,
     )
     runtime.rig = rig
 
@@ -150,7 +143,7 @@ def build_runtime(
             watched, detector, beliefs,
             classes=list(cfg.get("detect_classes", [])) or ["cup", "bottle", "box"],
             rate_hz=float(pcfg.get("rate_hz", 3.0)),
-            harness=harness,
+            harness=arm.harness,  # MockArm / SafeArm both expose .harness
         )
         watcher.start()
         runtime.watcher = watcher
@@ -192,7 +185,7 @@ def _runtime_state(runtime) -> dict:
         "task": runtime.current_task,
         "holding": runtime.held_object,
         "objects": runtime.beliefs.summary(),
-        "arm_connected": getattr(runtime.arm.raw, "connected", True),
+        "arm_connected": getattr(runtime.arm, "connected", True),
         # human-readable narration: newest events last (observations, skill
         # calls, outcomes) -- the dashboard renders this as the activity feed
         "events": runtime.memory.digest(max_lines=14).splitlines(),
@@ -290,9 +283,17 @@ def main(argv: list[str] | None = None) -> int:
     is_mock = isinstance(llm, MockLLM)
     advisor = Advisor(llm) if (llm.supports_vision and not is_mock) else None
     experience = ExperienceMemory(PACKAGE_ROOT / "runs" / "experience.json")
+    # ADR-0008: optional LLM fallback chain. Read from cfg._data
+    # (sanctioned per CLAUDE.md §Config system) so a YAML block like
+    #   llm:
+    #     fallback: [local_qwen3_vl, mock]
+    # wires without any new API surface. Default empty chain = the
+    # pre-ADR-0008 behavior (raise on primary failure).
+    fallback_chain = list(cfg._data.get("llm", {}).get("fallback", []) or [])
     agent = AgentOrchestrator(
         llm, runtime, advisor=advisor, max_steps=args.max_steps,
         decompose=not is_mock, fast_planner=FastPlanner(experience),
+        cfg=cfg, fallback_chain=fallback_chain,
     )
 
     def _run(task: str):
@@ -341,6 +342,13 @@ def _print_report(report) -> None:
     print(f"path:    {report.path} ({report.duration_s}s)")
     print(f"steps:   {report.steps}")
     print(f"summary: {report.summary}")
+    # 2026-08-13: explicit "task done" signal — without this users see the
+    # arm still hovering at ready pose and (incorrectly) assume the task
+    # is still running, then re-issue the same command and trigger a fresh
+    # pick_and_place cycle on the object they just placed.
+    status = "✓ done" if report.success else "✗ failed"
+    print(f"\n[{status}] task complete — arm parked at home. "
+          f"Enter a new task or press Enter to quit.")
 
 
 if __name__ == "__main__":

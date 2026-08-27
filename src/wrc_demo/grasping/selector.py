@@ -20,6 +20,7 @@ def select_grasp(
     max_width_m: float = 0.09,
     pregrasp_offset_m: float = 0.12,
     validate=None,
+    ik_retries: int = 3,
 ) -> tuple[Grasp, np.ndarray, np.ndarray]:
     """-> (grasp, q_pregrasp, q_grasp) for the best executable candidate.
 
@@ -27,6 +28,13 @@ def select_grasp(
     veto candidates on grounds IK cannot see (safety-harness geometry): a
     candidate that would abort mid-descent must lose the ranking here, not
     kill the attempt later.
+
+    ik_retries (default 3) seeds the DLS solver with random restarts; the
+    first guess from ``q_current`` (typically ``home_q``) often lands in
+    a different basin than the candidate's true minimum, and a single
+    solve is enough to falsely mark an otherwise-reachable pose as
+    unreachable. The IK params (``Kinematics.ik``) take care of the
+    5e-3 / 2000-iter tuning; retries just add basin hops.
     """
     reasons: list[str] = []
     for g in sorted(grasps, key=lambda g: -g.quality):
@@ -38,11 +46,11 @@ def select_grasp(
             continue
         T_grasp = make_transform(g.rotation, g.position)
         T_pre = make_transform(g.rotation, g.pregrasp_position(pregrasp_offset_m))
-        pre = kin.ik(T_pre, q_current)
+        pre = kin.ik(T_pre, q_current, retries=ik_retries)
         if not pre.success:
             reasons.append(f"pregrasp IK failed (err {pre.error:.4f})")
             continue
-        grasp = kin.ik(T_grasp, pre.q)
+        grasp = kin.ik(T_grasp, pre.q, retries=ik_retries)
         if not grasp.success:
             reasons.append(f"grasp IK failed (err {grasp.error:.4f})")
             continue

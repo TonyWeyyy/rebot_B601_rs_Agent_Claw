@@ -82,19 +82,9 @@ def test_beliefs_resolve_color_queries():
         ("please can you grab the bottle", "grasp_object", "bottle", None),
         ("coge y coloca el objeto rosa", "pick_and_place", "objeto rosa", None),
         ("place it on the plate", "place_on_object", None, "plate"),
-        ("push the box left", "push_object", "box", None),
         ("go home", "move_home", None, None),
-        ("what do you see?", "describe_scene", None, None),
         ("look around", "get_observation", None, None),
-        ("hand me the pink object", "handover", None, None),
-        ("dame el objeto rosa", "handover", None, None),
-        ("point at the pink object", "point_at", None, None),
-        ("wave", "wave", None, None),
-        ("saluda", "wave", None, None),
-        ("sort the objects by color", "sort_by_color", None, None),
         ("stack the red cube on the blue box", "pick_and_place", "red cube", "blue box"),
-        ("how many red cubes are there?", "count_objects", None, None),
-        ("move a bit left", "move_relative", None, None),
         ("release", "open_gripper", None, None),
     ],
 )
@@ -239,6 +229,16 @@ def test_pick_and_place_red_object_end_to_end(tmp_path):
     from wrc_demo.apps.demo import build_runtime, shutdown_runtime
 
     cfg = load_demo_config(camera="mock", arm="mock", llm="mock")
+    # Mock arm's home_q is in a different basin than rebot_rs's; the
+    # production `approach_pitch_rad: 1.2` (tilted) pregrasp is unreachable
+    # from the mock seed. Pin legacy top-down for the e2e tests; the
+    # pitch=1.2 path is covered separately by the real-hardware demo.
+    # Isolate grasp memory under tmp_path so a stale ~/.wrc_demo/...json
+    # (with a learned z_nudge) doesn't push the pregrasp into a reach
+    # dead-zone (per CLAUDE.md "Persistent learned state").
+    import math
+    cfg._data["grasp"]["approach_pitch_rad"] = math.pi / 2
+    cfg._data["grasp"]["memory_path"] = str(tmp_path / "grasp_memory.json")
     runtime, arm = build_runtime(cfg, tmp_path / "run")
     arm.object_stop_frac = 0.5  # jaws jam halfway: an object is in the gripper
     try:
@@ -259,38 +259,6 @@ def test_pick_and_place_red_object_end_to_end(tmp_path):
 
 
 @needs_pin
-def test_social_skills_on_mock_stack(tmp_path):
-    """describe/count answer instantly from beliefs; wave/point/handover
-    move through the safety harness without violations."""
-    from wrc_demo.apps.demo import build_runtime, shutdown_runtime
-
-    cfg = load_demo_config(camera="mock", arm="mock", llm="mock")
-    runtime, arm = build_runtime(cfg, tmp_path / "run")
-    arm.object_stop_frac = 0.5
-    try:
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and runtime.beliefs.find("red cube") is None:
-            time.sleep(0.05)
-
-        desc = runtime.execute("describe_scene", {})
-        assert desc["ok"] and "red cube" in desc["description"]
-        count = runtime.execute("count_objects", {"query": "red object"})
-        assert count["ok"] and count["count"] == 1
-
-        assert runtime.execute("wave", {})["ok"]
-        point = runtime.execute("point_at", {"label": "red object"})
-        assert point["ok"], point
-
-        hand = runtime.execute("handover", {"label": "red object"})
-        assert hand["ok"], hand
-        assert runtime.held_object == "red object"
-        assert runtime.execute("open_gripper", {})["ok"]
-        assert runtime.held_object is None
-    finally:
-        shutdown_runtime(runtime, arm)
-
-
-@needs_pin
 def test_orchestrator_reflex_path_never_calls_llm(tmp_path):
     from wrc_demo.agent.orchestrator import AgentOrchestrator
     from wrc_demo.apps.demo import build_runtime, shutdown_runtime
@@ -302,6 +270,9 @@ def test_orchestrator_reflex_path_never_calls_llm(tmp_path):
             raise AssertionError("LLM must not be called on the reflex path")
 
     cfg = load_demo_config(camera="mock", arm="mock", llm="mock")
+    import math
+    cfg._data["grasp"]["approach_pitch_rad"] = math.pi / 2
+    cfg._data["grasp"]["memory_path"] = str(tmp_path / "grasp_memory.json")
     runtime, arm = build_runtime(cfg, tmp_path / "run")
     arm.object_stop_frac = 0.5
     try:

@@ -7,6 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 import numpy as np
 
 from wrc_demo.calibration import CalibrationResult, save_calibration
@@ -118,3 +120,80 @@ def test_loader_unknown_npz_raises(tmp_path: Path):
     except ValueError:
         raised = True
     assert raised
+
+
+# ── ADR-0009: hand_eye_compensation_m tests ─────────────────────────────────
+
+
+def test_hand_eye_compensation_default_is_zero():
+    """No compensation_m block -> _T_compensation is identity."""
+    cfg = Cfg({"mode": "eye_to_hand", "T": np.eye(4).tolist()})
+    e = Extrinsics.from_config(cfg)
+    assert np.allclose(e._T_compensation, np.eye(4))
+    assert np.allclose(e.cam_to_base(), np.eye(4))
+
+
+
+def test_hand_eye_compensation_eth_shifts_origin():
+    """ETH: T_cam2base = T_compensation @ T_hand_eye."""
+    cfg = Cfg({
+        "mode": "eye_to_hand",
+        "T": np.eye(4).tolist(),
+        "hand_eye_compensation_m": {"x": 0.0, "y": 0.0, "z": -0.01},
+    })
+    e = Extrinsics.from_config(cfg)
+    T = e.cam_to_base()
+    expected = np.eye(4)
+    expected[2, 3] = -0.01
+    assert np.allclose(T, expected)
+
+
+
+def test_hand_eye_compensation_matches_rebot_grasp_semantics():
+    """Cross-check: our ETH compensation equals rebot_grasp's output.
+
+    Skipped if rebot_grasp is not importable (separate repo).
+    """
+    pytest.importorskip("rebot_grasp.utils.camera_utils")
+    from rebot_grasp.utils.camera_utils import (
+        compose_cam_to_base_transform,
+    )
+    cfg_rebot = {
+        "calibration": {
+            "hand_eye_compensation_m": {"x": 0.0, "y": 0.0, "z": -0.01},
+        }
+    }
+    T_hand_eye = np.eye(4)  # identity for the test
+    expected = compose_cam_to_base_transform(
+        T_tcp2base=None,  # ETH does not use it
+        T_hand_eye=T_hand_eye,
+        hand_eye_mode="eye_to_hand",
+        cfg=cfg_rebot,
+    )
+
+    cfg_wrc = Cfg({
+        "mode": "eye_to_hand",
+        "T": T_hand_eye.tolist(),
+        "hand_eye_compensation_m": {"x": 0.0, "y": 0.0, "z": -0.01},
+    })
+    e = Extrinsics.from_config(cfg_wrc)
+    assert np.allclose(e.cam_to_base(), expected), (
+        "wrc_demo compensation diverged from rebot_grasp semantics"
+    )
+
+
+
+def test_hand_eye_compensation_eih_composes_with_fk():
+    """EIH: T_cam2base = T_compensation @ T_tcp2base @ T_hand_eye."""
+    def fake_fk():
+        return np.eye(4)
+    cfg = Cfg({
+        "mode": "eye_in_hand",
+        "T": np.eye(4).tolist(),
+        "hand_eye_compensation_m": {"x": 0.0, "y": 0.0, "z": -0.01},
+    })
+    e = Extrinsics.from_config(cfg, fk_tcp2base=fake_fk)
+    T = e.cam_to_base()
+    expected = np.eye(4)
+    expected[2, 3] = -0.01
+    assert np.allclose(T, expected)

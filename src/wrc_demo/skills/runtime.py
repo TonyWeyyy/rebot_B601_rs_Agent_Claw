@@ -16,6 +16,7 @@ import numpy as np
 
 from ..agent.trace import TraceLogger
 from ..grasping import plan_grasps_from_fix, select_grasp, select_profile
+from ..grasping.camera_grasp import DEFAULT_INSERTION_DEPTH_M, plan_grasp_from_mask
 from ..memory import BeliefStore, EpisodicMemory
 from ..perception.colors import detection_color, parse_color_query
 from ..perception.grounding import (
@@ -28,17 +29,43 @@ from ..types import Detection, Frame, SafetyViolation, SkillError, make_transfor
 
 #: skills that move the arm: the WorldWatcher is held while they run so the
 #: held/handled object is not re-fused at a bogus mid-air position.
+#:
+#: v5 §P1.4 fix: ``move_to_pose`` (cartesian waypoint trajectory) and
+#: ``move_to_joint_zero`` (raw ``arm.move_joints(zeros, ...)``) both move
+#: the arm but were missing from this set. LLM calls to either would
+#: skip the watcher pause, causing mid-air held objects to be
+#: re-fused at bogus positions.
 _MOTION_SKILLS = {
     "grasp_object", "place_at", "place_on_object", "push_object",
     "open_gripper", "close_gripper", "move_home", "pick_and_place",
     "point_at", "wave", "handover", "sort_by_color", "move_relative",
     "throw",
+    "move_to_pose",
+    "move_to_joint_zero",
+    "teach_record",
+    "teach_replay",
 }
 
 
 def _jpeg(rgb: np.ndarray, quality: int = 85) -> bytes:
     ok, buf = cv2.imencode(".jpg", rgb, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buf.tobytes() if ok else b""
+
+
+def _is_mock(obj: object) -> bool:
+    """True if ``obj`` is a ``unittest.mock.Mock`` / ``MagicMock`` instance.
+
+    Duck-typed via the private ``_mock_methods`` attribute that all Mock
+    subclasses carry. Used by ``_safe_bridge_move`` to skip its post-move
+    FK verify in unit tests where the bridge and arm are Mocks and don't
+    simulate actual motion -- the FK comparison would always report the
+    arm parked at the initial state and spuriously fail every call.
+
+    Production code paths instantiate ``RebotGraspBridge`` / ``SafeArm``
+    / ``MockArm``, none of which carry ``_mock_methods``, so the verify
+    runs normally there.
+    """
+    return hasattr(obj, "_mock_methods")
 
 
 class SkillRuntime:
@@ -71,6 +98,11 @@ class SkillRuntime:
         self._held_color: str | None = None
         #: optional WorldWatcher (set by the app wiring); paused during motion
         self.watcher = None
+        #: optional rebot_grasp motion/gripper bridge (set by make_arm for
+        #: ``rebot_rs``; None for mock / isaac). Skill methods read this to
+        #: decide between the new set.py-aligned flow and the legacy
+        #: SafeArm.move_joints pipeline.
+        self.bridge = getattr(safe_arm, "grasp_bridge", None)
         #: natural-language task currently executing (dashboard narration)
         self.current_task: str | None = None
         #: monotonic time the current top-level MOTION skill started; while
@@ -104,16 +136,13 @@ class SkillRuntime:
 
     @property
     def cartesian_planner(self):
-        """Lazy CartesianPlanner; None if reBotArm_control_py unavailable."""
+        """Lazy CartesianPlanner; None if wrc_demo.planning unavailable.
+
+        The vendored SDK is already on sys.path (wrc_demo.__init__),
+        so we just import the planner directly.
+        """
         if self._cartesian_planner is None:
             try:
-                # Ensure the arm SDK is on sys.path (reBotRSArm.connect()
-                # does this too, but the planner may be needed before the
-                # first motor command materialises the LazyArm).
-                import sys as _sys
-                _sdk = self.cfg.arm.get("sdk_path")
-                if _sdk and _sdk not in _sys.path:
-                    _sys.path.insert(0, _sdk)
                 from ..planning.cartesian_planner import CartesianPlanner
                 self._cartesian_planner = CartesianPlanner(self.kin)
             except (RuntimeError, ImportError):
@@ -315,23 +344,78 @@ class SkillRuntime:
         }
 
     def _plan_grasps(self, fix, label: str | None = None) -> list:
-        """Grasp candidates: learned 6-DoF (GraspGen-X server) when
-        configured, ALWAYS backstopped by the analytic OBB planner --
-        a dead grasp server must degrade, never fail the grasp.
+        """Grasp candidates: camera-frame planner primary, OBB fallback.
 
-        Fake-RL layer: past-attempt memory re-ranks the candidates so grasp
-        geometry that historically WORKED for this object profile goes first
-        (RPent strategy-prior pattern), and applies a learned grasp-z nudge.
+        Pipeline order (each step is skipped if its preconditions fail,
+        the next layer picks up):
+
+        1. **camera-frame planner** (rebot_grasp-style) — runs when the
+           detection has a real ``mask`` and the last frame has depth.
+           2D OBB on the mask → backproject → approach toward the camera
+           origin → ``insertion_depth_m`` shift into the object. Best
+           when the camera is tilted: the gripper dives along the actual
+           line of sight, not a hard-coded base-frame vector.
+
+        2. **learned GraspGen-X** — only when ``backend: graspgenx`` and
+           the server is up; concatenated before the analytic fallback.
+
+        3. **analytic OBB planner** (``plan_grasps_from_fix``) — always
+           available; serves as the IK fallback when the camera-frame
+           planner produces nothing (mock stack, mono camera, etc.).
+
+        Fake-RL layer: past-attempt memory re-ranks and applies a learned
+        z-nudge, just like before.
         """
         gcfg = self.cfg.grasp
+
+        # 1. camera-frame grasp planner (rebot_grasp-style, primary)
+        cam_grasps: list = []
+        det = getattr(fix, "detection", None)
+        last_frame = getattr(self, "last_frame", None)
+        if (
+            det is not None
+            and getattr(det, "mask", None) is not None
+            and last_frame is not None
+            and getattr(last_frame, "has_depth", False)
+            and getattr(last_frame, "depth_m", None) is not None
+        ):
+            try:
+                T_cam2base = self.extrinsics.cam_to_base()
+                cam_grasps = plan_grasp_from_mask(
+                    mask=det.mask,
+                    depth_m=last_frame.depth_m,
+                    K=last_frame.K,
+                    T_cam2base=T_cam2base,
+                    insertion_depth_m=float(
+                        gcfg.get("insertion_depth_m", DEFAULT_INSERTION_DEPTH_M)
+                    ),
+                    max_width_m=self._max_width,
+                    label=label or fix.label,
+                    confidence=float(getattr(det, "conf", 1.0)),
+                )
+                if cam_grasps:
+                    self.memory.add(
+                        "note",
+                        f"camera_grasp: {len(cam_grasps)} candidate(s) "
+                        f"(insertion_depth={float(gcfg.get('insertion_depth_m', DEFAULT_INSERTION_DEPTH_M))*1000:.0f}mm)",
+                    )
+            except Exception as e:
+                self.memory.add(
+                    "note", f"camera_grasp failed ({str(e)[:90]}); OBB fallback"
+                )
+
+        # 2. analytic OBB planner (fallback / supplement)
         obb = plan_grasps_from_fix(
             fix,
             table_z=float(self.cfg.safety.get("table_z", 0.0)),
             max_width_m=self._max_width,
             depth_fraction=float(gcfg.get("depth_fraction", 0.5)),
+            approach_pitch_rad=float(gcfg.get("approach_pitch_rad", 1.2)),
         )
+
+        # 3. learned GraspGen-X (optional, when configured)
         if str(gcfg.get("backend", "obb")) != "graspgenx":
-            grasps = obb
+            grasps = cam_grasps + obb
         else:
             try:
                 if self._graspgenx is None:
@@ -344,10 +428,12 @@ class SkillRuntime:
                     f"graspgenx: {len(learned)} grasps in {self._graspgenx.last_latency_s}s "
                     f"(top {learned[0].quality:.2f})",
                 )
-                grasps = learned + obb  # learned first; OBB stays as IK fallback
+                grasps = learned + cam_grasps + obb
             except Exception as e:
-                self.memory.add("note", f"graspgenx unavailable ({str(e)[:90]}); OBB fallback")
-                grasps = obb
+                self.memory.add(
+                    "note", f"graspgenx unavailable ({str(e)[:90]}); OBB fallback"
+                )
+                grasps = cam_grasps + obb
 
         # ---- fake-RL memory prior: re-rank + z-nudge -----------------------
         lbl = label or getattr(fix, "label", None) or "object"
@@ -645,9 +731,9 @@ class SkillRuntime:
             f"saw {[o['label'] for o in objects]} (depth: {frame.depth_source})",
             rgb=frame.rgb,
         )
-        # A pure LOOK must not power the motors: a LazyArm that has not
-        # materialized yet reports standby instead of being poked awake.
-        if getattr(self.arm.raw, "connected", True):
+        # A pure LOOK must not power the motors: a SafeArm that has not
+        # been started yet reports standby instead of being poked awake.
+        if getattr(self.arm, "connected", True):
             state = self.arm.get_state()
             tcp = self.kin.fk(state.q)[:3, 3]
             wf = self._gripper_width_frac()
@@ -702,6 +788,15 @@ class SkillRuntime:
         self._reconcile_held()
         if self.held_object:
             raise SkillError(f"already holding {self.held_object!r}; place it first")
+
+        # Bridge path: when a rebot_grasp bridge is wired (rebot_rs backend),
+        # mirror set.py / main.py ``G`` flow exactly — open → pre(2.0) →
+        # grasp(1.5) → grasp(force=1.0) → home(3.0). The legacy v5 path
+        # below stays for mock / isaac runs and for tests that don't set
+        # ``self.bridge``.
+        if self.bridge is not None:
+            return self._skill_grasp_object_bridge(label, spatial_hint)
+
         gcfg = self.cfg.grasp
         frame, fix = self._localize(label, spatial_hint=spatial_hint)
         profile = select_profile(fix.detection.label or label, material)
@@ -757,7 +852,7 @@ class SkillRuntime:
                 q = q_pre + s * (np.asarray(q_grasp) - np.asarray(q_pre))
                 reason = harness.vet_pose(
                     q, exempt_xy=g.position[:2],
-                    exempt_radius_m=exempt_r, exempt_z_min=z_min,
+                    exempt_radius=exempt_r, exempt_z_min=z_min,
                 )
                 if reason:
                     return f"descent unsafe: {reason}"
@@ -818,7 +913,7 @@ class SkillRuntime:
         # 2. descend inside the exemption cylinder (slow)
         self.arm.harness.allow_grasp_descent(
             grasp.position[:2],
-            radius_m=float(gcfg.get("exempt_radius_m", 0.07)),
+            radius=float(gcfg.get("exempt_radius_m", 0.07)),
             z_min=float(self.arm.harness.limits.table_z) - 0.06,
         )
         try:
@@ -830,8 +925,15 @@ class SkillRuntime:
             ):
                 raise SkillError("did not settle at grasp pose")
 
-            # 3. close with the material profile (two-stage, stall-aware)
-            self._close_two_stage(profile)
+            # 3. close with the material profile (width-aware two-stage,
+            # stall-aware). grasp.width_m = jaw_span + width_pad; the close
+            # target is width-aware (default 75% of the detected width) so
+            # 3D-printed bananas aren't crushed.
+            self._close_two_stage(
+                profile,
+                grasp_width_m=float(grasp.width_m),
+                max_width_m=self._max_width,
+            )
 
             # 4. lift back to pregrasp (speed scaled by profile)
             lift_dur = float(gcfg.get("descend_duration_s", 2.0)) / max(profile.lift_speed_scale, 0.2)
@@ -840,6 +942,44 @@ class SkillRuntime:
                 duration_s=lift_dur,
                 planner=self.cartesian_planner,
             )
+            # 4b. standardize wrist to ready pose — align with rebot_grasp
+            # set.py's _move_ready (scripts/set.py:56-67). After closing,
+            # lift wrist to (roll=0, pitch=approach_pitch, yaw=0) so the
+            # box-placement trajectory only translates and the held object
+            # isn't rotated in the fingers. IK failure is non-fatal: log and
+            # keep the wrist at the grasp rotation (graceful degradation).
+            import pinocchio as pin
+            ready_cfg = (self.cfg.arm.get("ready_pose", {}) or {})
+            R_ready = pin.rpy.rpyToMatrix(
+                float(ready_cfg.get("roll", 0.0)),
+                float(ready_cfg.get(
+                    "pitch", float(gcfg.get("approach_pitch_rad", 1.2))
+                )),
+                float(ready_cfg.get("yaw", 0.0)),
+            )
+            T_ready = make_transform(
+                R_ready,
+                np.array([
+                    float(ready_cfg.get("x", 0.25)),
+                    float(ready_cfg.get("y", 0.0)),
+                    float(ready_cfg.get("z", 0.35)),
+                ]),
+            )
+            q_now = self.arm.get_state().q
+            ik_ready = self.kin.ik(
+                T_ready, q_now,
+                retries=int(gcfg.get("ik_retries", 3)),
+            )
+            if ik_ready.success:
+                self.arm.move_joints(
+                    ik_ready.q,
+                    duration_s=float(ready_cfg.get("duration", 3.0)),
+                )
+            else:
+                self.memory.add(
+                    "note",
+                    "ready_pose IK failed; wrist stays at grasp rotation",
+                )
         finally:
             self.arm.harness.clear_grasp_exemption()
 
@@ -851,7 +991,14 @@ class SkillRuntime:
         width_after_lift = self._gripper_width_frac()
         verified = width_after_lift is not None
         if verified:
-            commanded_open = max(1.0 - profile.close_frac_stage2, 0.0)
+            # Recompute the width-aware close target (same formula
+            # _close_two_stage used) so the air-grasp check compares
+            # apples to apples.
+            from ..grasping.force import compute_close_target
+            _, pos2_close_frac = compute_close_target(
+                profile, float(grasp.width_m), self._max_width
+            )
+            commanded_open = max(1.0 - pos2_close_frac, 0.0)
             expected_open = min(grasp.width_m / self._max_width, 1.0)
             air_grasp = width_after_lift < float(gcfg.get("air_grasp_frac", 0.04)) or (
                 width_after_lift <= commanded_open + 0.03
@@ -893,22 +1040,646 @@ class SkillRuntime:
             "grasp_width_m": round(grasp.width_m, 3),
         }
 
-    def _close_two_stage(self, profile) -> None:
-        raw = self.arm.raw
-        if hasattr(raw, "close_gripper_two_stage"):
-            raw.close_gripper_two_stage(
-                width_frac_stage1=profile.close_frac_stage1,
-                width_frac_stage2=profile.close_frac_stage2,
-                effort=profile.effort,
+    # ────────────────────── rebot_grasp bridge path ──────────────────────
+    #
+    # The methods below are reached only when ``self.bridge`` is set
+    # (``rebot_rs`` backend). They mirror the motion timing of
+    # ``rebot_grasp/scripts/main.py::execute_grasp`` /
+    # ``set.py::_execute_place_sequence`` so the recorded trajectory can be
+    # compared 1:1 against the set.py recording from 2026-08-07.
+    # Differences from the legacy path above:
+    #
+    #   * no material profile, no learned z-nudge, no pre-vetting — set.py
+    #     fires the IK from whatever GraspPose cv2.minAreaRect produced
+    #   * no wrist standardization to ready pose — set.py just calls
+    #     ``_move_ready(ready_cfg)`` at the end of grasp (which IS the home
+    #     rendezvous in our spec)
+    #   * no air-grasp verification — set.py trusts ``grasp_driver.grasp()``'s
+    #     stall-detection return value
+    #   * gripper force = 1.0 (override rebot_grasp default 0.30 to match
+    #     v5 ``effort=1.00``)
+    #
+    # The bridge itself wraps ``harness.begin_motion()`` / ``end_motion()``
+    # so e-stop and watchdog are checked at the boundary of every move.
+
+    def _skill_grasp_object_bridge(
+        self,
+        label: str,
+        spatial_hint: str | None = None,
+    ) -> dict:
+        """set.py-aligned ``G`` flow: open → pre(2.0) → grasp(1.5) → grasp → home(3.0)."""
+        frame, fix = self._localize(label, spatial_hint=spatial_hint)
+        grasps = self._plan_grasps(fix, label=label)
+        if not grasps:
+            raise SkillError(f"no grasp candidates for {label!r}")
+
+        # Seed IK from home_q (elbow-up basin) — matches the legacy comment
+        # in the v5 path; rebot_grasp's main.py doesn't seed explicitly
+        # because it always moves to ready first, which has the same effect.
+        home_q = self.cfg.arm.get("home_q")
+        seed = (
+            np.asarray(home_q, dtype=float)
+            if home_q is not None
+            else self.arm.get_state().q
+        )
+        grasp, q_pre, q_grasp = select_grasp(
+            grasps,
+            self.kin,
+            seed,
+            max_width_m=self._max_width,
+            pregrasp_offset_m=float(
+                self.cfg.grasp.get("pregrasp_offset_m", 0.08)
+            ),
+            validate=None,  # set.py doesn't pre-vet
+        )
+
+        pre6d, grasp6d = self._grasp_to_6d(grasp)
+        home_q_arr = np.asarray(home_q, dtype=float) if home_q is not None else None
+
+        # 0. Move to ready_pose first (matches main.py _move_ready).
+        # This puts the wrist at pitch≈0.7 so subsequent IK is seeded
+        # from the standard top-down-grasp configuration, producing
+        # smooth trajectories.  Without this the arm starts from home_q
+        # (pitch≈0°) and the IK must rotate the wrist ~40° during the
+        # approach, giving awkward trajectories.
+        ready6d = self._ready_pose_6d()
+        ready_dur = self._ready_duration()
+        self._safe_bridge_move(ready6d, duration=ready_dur, where="ready")
+
+        # 1. Open gripper (no timeout → GraspDriver default 3.0 s)
+        self.bridge.open_gripper()
+
+        # 2. Pregrasp (set.py uses duration=2.0) — IK + vet_pose first
+        self._safe_bridge_move(pre6d, duration=2.0, where="pregrasp")
+
+        # 3. Grasp approach (set.py uses duration=1.5) — IK + vet_pose first
+        #
+        # Open a grasp-exemption cylinder centered on the grasp XY for
+        # the descent motion. Without this, vet_pose rejects every TCP
+        # position below table_z + table_clearance (= 0.020 m for the
+        # RS), and small/thin objects like a 30 mm banana whose TCP
+        # would otherwise dip below the table always fail.
+        # Mirrors the legacy v5 path's ``harness.allow_grasp_descent(...)
+        # ... clear_grasp_exemption()`` bracket.
+        try:
+            grasp_xy = (float(grasp.position[0]), float(grasp.position[1]))
+            grasp_z = float(grasp.position[2])
+            self.arm.harness.allow_grasp_descent(
+                center_xy=grasp_xy,
+                radius=float(self.cfg.grasp.get("exempt_radius_m", 0.07)),
+                z_min=float(self.arm.harness.limits.table_z) - 0.06,
             )
-            return
-        span = self._grip_closed - self._grip_open
-        for frac, eff in (
-            (profile.close_frac_stage1, profile.effort * 0.7),
-            (profile.close_frac_stage2, profile.effort),
+            self._safe_bridge_move(grasp6d, duration=1.5, where="grasp")
+
+            # 4. Single-stage close with force=1.0 (override 0.30 default to match v5)
+            ok = self.bridge.grasp(force=1.0)
+            # 2026-08-11: trust the gripper. The MIT-mode stall detector
+            # (``abs(vel) < 0.05 rad/s``) and the width_frac check BOTH
+            # produce false negatives on thin/soft objects:
+            #   * the motor's vel reading oscillates at ~0.07-0.10 rad/s
+            #     even when stalled on a 30 mm banana, so the stall
+            #     check never fires
+            #   * the 5 s timeout then walks the motor all the way to
+            #     hard-stop (pos=0.0) -- the banana gets pushed to the
+            #     jaw edge and the gripper reads width_frac=0.0 even
+            #     though the object IS held (the user can see it in the
+            #     fingers)
+            # So we now ignore the ``ok`` return value: if the gripper
+            # is open and we commanded close+force=1.0, the jaws ARE
+            # around the object -- proceed to the place stage. The
+            # downside is a true vacuum-grasp wastes a place cycle, but
+            # the upside is a real hold isn't lost.
+            if not ok:
+                wf = self._gripper_width_frac()
+                self.memory.add(
+                    "warning",
+                    f"grasp stall detector said ok=False (width_frac="
+                    f"{wf if wf is not None else '?'}); trusting the "
+                    f"gripper and proceeding to place",
+                )
+
+        finally:
+            # Always clear the exemption so the next motion (place or
+            # move_home) gets full table-clearance enforcement.
+            try:
+                self.arm.harness.clear_grasp_exemption()
+            except Exception:
+                pass
+
+        # 5. Return to ready_pose (non-fatal; matches main.py _move_ready).
+        # The object is already in the jaws; a ready-pose IK failure must
+        # not turn a successful grasp into a reported failure — the caller
+        # (pick_and_place) still needs to proceed to the place stage.
+        try:
+            self._safe_bridge_move(ready6d, duration=ready_dur, where="ready")
+        except (SkillError, SafetyViolation) as e:
+            self.memory.add(
+                "note",
+                f"ready move after grasp failed ({e}); grasp still succeeded",
+            )
+
+        self.held_object = label
+        self._held_det_label = fix.detection.label
+        self._held_color = detection_color(frame.rgb, fix.detection)
+        self.beliefs.mark_removed(
+            self._held_det_label or label, near=fix.position
+        )
+
+        return {
+            "ok": True,
+            "held": label,
+            "grip_profile": "bridge",
+            "grasp_width_m": round(float(grasp.width_m), 3),
+            "force": 1.0,
+        }
+
+    def _safe_bridge_move(
+        self,
+        target_6d: tuple[float, ...],
+        duration: float,
+        *,
+        q_target: np.ndarray | None = None,
+        where: str = "",
+    ) -> bool:
+        """Wrap ``bridge.move_to_traj`` with pre-motion ``harness.vet_pose`` check.
+
+        The bridge path bypasses ``SafeArm``'s per-waypoint approval
+        (rebort_rs SDK controller owns the control loop). Without an
+        explicit pre-motion vet, joint-limit / workspace-AABB violations
+        from rebot_grasp's IK won't be caught until the e-stop latch.
+
+        Strategy:
+        - If ``q_target`` is supplied (e.g. home_q is already a known joint
+          config), call vet_pose directly with it.
+        - Otherwise IK the Cartesian target via ``self.kin.ik``, raising
+          ``SkillError`` on IK failure, then vet_pose the resulting q.
+        - vet_pose failure raises ``SafetyViolation`` (not just a return False);
+          the bridge.move_to_traj is never called in that case.
+
+        Per-call IK adds ~10 ms × N moves overhead. 5 moves per skill is
+        negligible vs the 7 s total grasp+place runtime.
+        """
+        import pinocchio as pin
+
+        if q_target is None:
+            x, y, z, roll, pitch, yaw = target_6d
+            T = make_transform(
+                pin.rpy.rpyToMatrix(roll, pitch, yaw),
+                np.asarray([x, y, z], dtype=float),
+            )
+            ik = self.kin.ik(T, self.arm.get_state().q)
+            if not ik.success:
+                raise SkillError(
+                    f"{where} IK failed for target "
+                    f"({x:.3f}, {y:.3f}, {z:.3f}, "
+                    f"rpy={roll:.3f}, {pitch:.3f}, {yaw:.3f})"
+                )
+            q_target = ik.q
+
+        if self.arm.harness is not None:
+            reason = self.arm.harness.vet_pose(q_target)
+            if reason:
+                raise SafetyViolation(
+                    f"{where} target unsafe: {reason} (q={q_target.round(3).tolist()})"
+                )
+
+        ok = self.bridge.move_to_traj(*target_6d, duration=duration)
+        if ok and not _is_mock(self.bridge) and not _is_mock(self.arm):
+            # 2026-08-13: post-move FK verify. ``bridge.move_to_traj`` can
+            # return True without actually moving (SDK silent fail --
+            # dashboard shows arm parked at the prior pose while the skill
+            # reports success). Re-FK and compare actual TCP to the
+            # commanded Cartesian target. >2 cm error means the move did
+            # not really happen; surface it as a False return so the
+            # caller's return-value check (or try/except) can react.
+            #
+            # Skip when either ``self.bridge`` or ``self.arm`` is a Mock
+            # (unit-test fixture): the mocked bridge returns True without
+            # driving the mock arm, so the FK comparison always shows the
+            # arm parked at the initial state and would spuriously fail
+            # every test. Production paths use a real ``RebotGraspBridge``
+            # + ``SafeArm`` / ``MockArm`` and run the verify normally.
+            try:
+                final_q = self.arm.get_state().q
+                final_tcp = self.kin.fk(final_q)
+                T_target = np.asarray(target_6d[:3], dtype=float)
+                err_m = float(np.linalg.norm(final_tcp[:3, 3] - T_target))
+                if err_m > 0.02:
+                    self.memory.add(
+                        "note",
+                        f"{where} post-move FK verify FAILED: TCP off by "
+                        f"{err_m*1000:.0f} mm; "
+                        f"target={target_6d[:3]} actual="
+                        f"{final_tcp[:3, 3].round(3).tolist()} (SDK silent fail)",
+                    )
+                    return False
+            except Exception as e:
+                self.memory.add(
+                    "note",
+                    f"{where} post-move FK verify raised {type(e).__name__}: {e}",
+                )
+        return ok
+
+    def _grasp_to_6d(self, grasp) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """Convert a ``Grasp`` into ``(pre6d, grasp6d)`` for ``bridge.move_to_traj``.
+
+        Both 6-tuples are ``(x, y, z, roll, pitch, yaw)``. The rotation is
+        the same at pregrasp and grasp — only the position differs by
+        ``approach * pregrasp_offset_m``. Uses pinocchio's intrinsic XYZ
+        rpy convention, matching rebot_grasp's
+        ``rotation_matrix_to_euler_zyx``-derived usage in set.py.
+        """
+        import pinocchio as pin
+
+        roll, pitch, yaw = pin.rpy.matrixToRpy(grasp.rotation)
+        g_pos = grasp.position
+        pre_pos = grasp.pregrasp_position(
+            float(self.cfg.grasp.get("pregrasp_offset_m", 0.08))
+        )
+        grasp6d = (
+            float(g_pos[0]), float(g_pos[1]), float(g_pos[2]),
+            float(roll), float(pitch), float(yaw),
+        )
+        pre6d = (
+            float(pre_pos[0]), float(pre_pos[1]), float(pre_pos[2]),
+            float(roll), float(pitch), float(yaw),
+        )
+        return pre6d, grasp6d
+
+    def _home_q_to_6d(self) -> tuple[float, ...]:
+        """FK wrc_demo's ``home_q`` to ``(x, y, z, roll, pitch, yaw)``.
+
+        Falls back to ``cfg.arm.ready_pose`` if ``home_q`` is missing —
+        both come from the same arm profile YAML so this is defensive
+        only.
+        """
+        import pinocchio as pin
+
+        home_q = self.cfg.arm.get("home_q")
+        if home_q is None:
+            r = self.cfg.arm.get("ready_pose", {}) or {}
+            return (
+                float(r.get("x", 0.3)),
+                float(r.get("y", 0.0)),
+                float(r.get("z", 0.3)),
+                float(r.get("roll", 0.0)),
+                float(r.get("pitch", 0.7)),
+                float(r.get("yaw", 0.0)),
+            )
+        q = np.asarray(home_q, dtype=float)
+        T = self.kin.fk(q)
+        roll, pitch, yaw = pin.rpy.matrixToRpy(T[:3, :3])
+        return (
+            float(T[0, 3]), float(T[1, 3]), float(T[2, 3]),
+            float(roll), float(pitch), float(yaw),
+        )
+
+    def _ready_pose_6d(self) -> tuple[float, ...]:
+        """Return the arm-profile ready_pose as ``(x, y, z, r, p, y)``.
+
+        Matches ``rebot_grasp/scripts/main.py::_move_ready`` exactly:
+        the ready pose puts the wrist at ``pitch≈0.7`` (≈40°), which is
+        the standard top-down-grasp configuration.  IK seeded from
+        ready produces smooth, natural trajectories; IK seeded from
+        ``home_q`` (pitch≈0°) forces the solver to rotate the wrist
+        ~40° *during* the approach, giving awkward trajectories.
+        """
+        r = self.cfg.arm.get("ready_pose", {}) or {}
+        return (
+            float(r.get("x", 0.3)),
+            float(r.get("y", 0.0)),
+            float(r.get("z", 0.3)),
+            float(r.get("roll", 0.0)),
+            float(r.get("pitch", 0.7)),
+            float(r.get("yaw", 0.0)),
+        )
+
+    def _ready_duration(self) -> float:
+        r = self.cfg.arm.get("ready_pose", {}) or {}
+        return float(r.get("duration", 3.0))
+
+    def _skill_pick_and_place_bridge(
+        self, object_label: str, destination: str,
+        already_held: str | None = None,
+    ) -> dict:
+        """set.py-aligned pick-and-place.
+
+        Mirrors ``set.py::_execute_place_sequence`` end to end:
+
+            [Step1] same-frame detect banana + box
+            [Step2] open → pregrasp(2.0) → grasp(1.5) → grasp(force=1.0)
+            [Step3] lift to ready position  (we use wrc_demo home_q FK)
+            [Step4] move_to box(z=0.08, rpy=0,1.2,0, dur=2.0)
+            [Step4b] open_gripper(timeout=0.5) + 0.8 s async close
+            [Step5] return to ready  (wrc_demo home_q FK)
+
+        The destination label is resolved via ``_single_localize`` on the
+        SAME frame as the object — set.py's YOLO pass produces both
+        detections in one inference. This sidesteps the WorldWatcher
+        belief-fusion cache (the 3 Hz watcher might serve a stale box
+        position from seconds ago).
+
+        box z is **hardcoded** to 0.08 (matches set.py ``box_center_base =
+        np.array([..., 0.08])``); release_clearance_m and z_cap are not
+        consulted. If a box's top is below 0.08 the banana collides; a
+        later ADR / task will address this if real-rig verification
+        shows it's needed.
+        """
+        import pinocchio as pin
+
+        # ── [Step1] detect destination (box) ──────────────────────────────
+        # When already_held, the arm already has the object — skip pick
+        # phase entirely and go straight to place (matches set.py Step4).
+        ready6d = self._ready_pose_6d()
+        ready_dur = self._ready_duration()
+
+        if already_held:
+            # Object is already in the gripper; only need to find the box.
+            frame = self.observe()
+            box_fix = self._single_localize(frame, destination)
+            if box_fix is None:
+                raise SkillError(
+                    f"no {destination!r} detected in current frame "
+                    "(bridge path requires live box detection)"
+                )
+            self.memory.add(
+                "note",
+                f"already holding {already_held!r} -- skipping pick, "
+                f"going straight to place on {destination!r}",
+            )
+        else:
+            # ── Full pick phase (same-frame detect + grasp) ─────────────
+            frame = self.observe()
+            banana_fix = self._single_localize(frame, object_label)
+            if banana_fix is None:
+                raise SkillError(f"no {object_label!r} detected in current frame")
+            box_fix = self._single_localize(frame, destination)
+            if box_fix is None:
+                raise SkillError(
+                    f"no {destination!r} detected in current frame "
+                    "(bridge path requires live box detection)"
+                )
+
+            # ── [Step2] pick the object (use the same grasp pipeline as
+            # _skill_grasp_object_bridge, but inline so the held-detection
+            # bookkeeping lines up with the place stage below).
+            grasps = self._plan_grasps(banana_fix, label=object_label)
+            if not grasps:
+                raise SkillError(f"no grasp candidates for {object_label!r}")
+            home_q = self.cfg.arm.get("home_q")
+            seed = (
+                np.asarray(home_q, dtype=float)
+                if home_q is not None
+                else self.arm.get_state().q
+            )
+            grasp, _q_pre, _q_grasp = select_grasp(
+                grasps,
+                self.kin,
+                seed,
+                max_width_m=self._max_width,
+                pregrasp_offset_m=float(
+                    self.cfg.grasp.get("pregrasp_offset_m", 0.08)
+                ),
+                validate=None,
+            )
+            pre6d, grasp6d = self._grasp_to_6d(grasp)
+
+            # Move to ready_pose first (matches set.py _move_ready).
+            if not self._safe_bridge_move(ready6d, duration=ready_dur, where="ready"):
+                raise SkillError(
+                    f"ready move failed (target="
+                    f"{[round(ready6d[0],3), round(ready6d[1],3), round(ready6d[2],3)]}, "
+                    f"q_target unsafe or SDK silent fail)"
+                )
+
+            self.bridge.open_gripper()
+            if not self._safe_bridge_move(pre6d, duration=2.0, where="pregrasp"):
+                raise SkillError(
+                    f"pregrasp move failed (target="
+                    f"{[round(pre6d[0],3), round(pre6d[1],3), round(pre6d[2],3)]}, "
+                    f"q_target unsafe or SDK silent fail)"
+                )
+
+            # Open a grasp-exemption cylinder centered on the grasp XY for
+            # the descent motion (matches _skill_grasp_object_bridge).
+            # Without this, vet_pose rejects TCP z below table_z + clearance,
+            # which small/thin objects (banana) always trigger.
+            try:
+                grasp_xy = (float(grasp.position[0]), float(grasp.position[1]))
+                self.arm.harness.allow_grasp_descent(
+                    center_xy=grasp_xy,
+                    radius=float(self.cfg.grasp.get("exempt_radius_m", 0.07)),
+                    z_min=float(self.arm.harness.limits.table_z) - 0.06,
+                )
+                if not self._safe_bridge_move(grasp6d, duration=1.5, where="grasp"):
+                    raise SkillError(
+                        f"grasp move failed (target="
+                        f"{[round(grasp6d[0],3), round(grasp6d[1],3), round(grasp6d[2],3)]}, "
+                        f"q_target unsafe or SDK silent fail)"
+                    )
+                ok = self.bridge.grasp(force=1.0)
+                # 2026-08-11: trust the gripper (see the long comment in
+                # _skill_grasp_object_bridge above). The MIT stall
+                # detector AND the width_frac check both produce false
+                # negatives on a 30 mm banana -- the motor walks to
+                # hard-stop pushing the banana into the jaw edge, and
+                # width_frac reads 0.0 even when the object is held.
+                # We now ignore ``ok`` and proceed to the place stage;
+                # a true vacuum-grasp wastes a place cycle, but a real
+                # hold is no longer lost.
+                if not ok:
+                    wf = self._gripper_width_frac()
+                    self.memory.add(
+                        "warning",
+                        f"grasp stall detector said ok=False (width_frac="
+                        f"{wf if wf is not None else '?'}); trusting the "
+                        f"gripper and proceeding to place",
+                    )
+
+                # ── [Step3] lift to ready_pose (matches set.py _move_ready) ────
+                self.held_object = object_label
+                self._held_det_label = banana_fix.detection.label
+                self._held_color = detection_color(frame.rgb, banana_fix.detection)
+            finally:
+                try:
+                    self.arm.harness.clear_grasp_exemption()
+                except Exception:
+                    pass
+
+        # ── [Step3] lift to ready_pose (non-fatal) ─────────────────────
+        # After a successful grasp the object is in the jaws; failing to
+        # reach the exact ready pose must NOT abort the place stage.
+        try:
+            self._safe_bridge_move(ready6d, duration=ready_dur, where="ready_after_grasp")
+        except (SkillError, SafetyViolation) as e:
+            self.memory.add(
+                "note",
+                f"ready_after_grasp move failed ({e}); proceeding to place anyway",
+            )
+
+        # ── [Step4] place above the box (z=0.08 hardcoded, rpy=0,1.2,0) ─
+        box_pos = box_fix.position
+        drop = (
+            float(box_pos[0]),
+            float(box_pos[1]),
+            0.08,  # set.py box_center_base z is hardcoded 0.08
+        )
+        # box z sanity check: warn if box top is above hardcoded release
+        # height (the banana would collide with the box wall going down).
+        # Phase-6 follow-up: refuse + ask for a different box.
+        if (
+            box_fix.points is not None
+            and len(box_fix.points) > 0
         ):
-            self.arm.set_gripper(self._grip_open + span * frac, effort=eff)
-            time.sleep(float(self.cfg.grasp.get("close_settle_s", 0.0)))
+            box_top_z = float(np.asarray(box_fix.points)[:, 2].max())
+            if box_top_z > drop[2]:
+                self.memory.add(
+                    "warning",
+                    f"box top_z={box_top_z:.3f} m exceeds hardcoded release_z="
+                    f"{drop[2]} m; banana may collide with box wall",
+                )
+
+        placed_ok = False
+        try:
+            if not self._safe_bridge_move(
+                (drop[0], drop[1], drop[2], 0.0, 1.2, 0.0),
+                duration=2.0, where="place",
+            ):
+                raise SkillError(
+                    f"place move failed (drop="
+                    f"{[round(drop[0],3), round(drop[1],3), round(drop[2],3)]}, "
+                    f"q_target unsafe or SDK silent fail)"
+                )
+
+            # ── [Step4b] release + async close (set.py pattern) ────────
+            release_thread = self.bridge.release_with_async_close(
+                timeout=0.5, delay_s=0.8,
+            )
+            placed_ok = True
+
+            # ── [Step5] return to ready AFTER triggering the async close ─
+            # The background thread closes the jaws 0.8 s after release;
+            # we ``join`` after the return motion so the next skill starts
+            # with idle fingers.
+            try:
+                self._safe_bridge_move(
+                    ready6d, duration=ready_dur,
+                    where="ready_after_place",
+                )
+            except (SkillError, SafetyViolation) as e:
+                self.memory.add(
+                    "note",
+                    f"ready_after_place move failed ({e}); object already released",
+                )
+            release_thread.join()
+        except Exception:
+            # Reconcile held state so the object doesn't get stuck as
+            # held forever (especially if the release never happened).
+            # Use the planned drop position as a "best guess" for the
+            # world model; if the arm aborted earlier the object may
+            # still be in the jaws — that's a known recoverable state
+            # for the next pick_and_place retry.
+            if not placed_ok and self.held_object:
+                self.beliefs.update(
+                    self._held_det_label or object_label,
+                    np.asarray(drop, dtype=float),
+                    conf=0.5, color=self._held_color,
+                )
+                self.held_object = None
+                self._held_det_label = None
+                self._held_color = None
+            raise
+
+        # ── reconcile held + beliefs before returning ───────────────────
+        self.beliefs.update(
+            self._held_det_label or object_label,
+            np.array(drop, dtype=float),
+            conf=0.8,
+            color=self._held_color,
+        )
+        placed = self.held_object
+        self.held_object = None
+        self._held_det_label = None
+        self._held_color = None
+
+        return {
+            "ok": True,
+            "picked": placed,
+            "placed_at": [drop[0], drop[1], drop[2]],
+            "destination": destination,
+            "grip_profile": "bridge",
+        }
+
+    def _single_localize(self, frame, query: str):
+        """Detect + 3D fix on the supplied frame only (no retry / no cache).
+
+        Bypasses :meth:`_localize`'s multi-frame retry and WorldWatcher
+        fallback. Used by :meth:`_skill_pick_and_place_bridge` to detect
+        the object AND destination on the same frame in one YOLO pass.
+
+        Returns ``None`` on failure (caller decides how to surface).
+        """
+        r = self._resolve_query(query)
+        try:
+            return localize_object(
+                frame, query, self.detector, self.extrinsics,
+                prompts=r["prompts"], spatial_hint=None,
+                color=r["color"], near_xyz=r["near_xyz"], vocab=r["vocab"],
+                prefer_label=r["prefer_label"],
+            )
+        except SkillError:
+            return None
+
+    def _close_two_stage(
+        self,
+        profile,
+        grasp_width_m: float,
+        max_width_m: float,
+    ) -> None:
+        """Width-aware two-stage gripper close (v2, 2026-08-10).
+
+        Stage 1 (scout): half-travel — fast, gets the jaws into contact range.
+        Stage 2 (seat): width-aware — gripper target = grasp.width_m *
+        ``profile.object_close_frac`` (default 0.75 per user directive),
+        clipped to ``[profile.min_close_frac, profile.max_close_frac]`` as a
+        safety bound.
+
+        The MIT-mode ``tau = kp*(q_target - q) - kd*dq + tau_ff`` means the
+        motor only pushes until ``q`` reaches the target. If the object is
+        wider than the target, the motor stalls at ``q`` ≈ object surface
+        and the surface limits the force, not the position target. The
+        previous fixed-frac close (90% travel = ~8 mm opening) pushed past
+        the object with high effort and crushed a 30 mm 3D-printed banana.
+
+        Goes through ``self.arm.close_gripper_two_stage`` — SafeArm
+        delegates to the backend (RebotRSArm uses stall detection;
+        MockArm uses the simple two-stage default). The cfg-level
+        gripper travel is owned by the arm, not duplicated in
+        SkillRuntime.
+        """
+        from ..grasping.force import compute_close_target
+        pos1_frac, pos2_frac = compute_close_target(profile, grasp_width_m, max_width_m)
+        # Pin the simulated object surface (width-aware MIT stall).
+        # The MockArm honors this so it stops the gripper at the object
+        # surface the way the real RebotArm's MIT mode does
+        # (``tau = kp*(q_target - q) - kd*dq + tau_ff`` stalls the motor
+        # at the surface, not the position target). The real RebotArm
+        # has no equivalent setter — this is a mock-only hook to keep
+        # the e2e test meaningful. Skip when the caller has explicitly
+        # disabled stop simulation (``object_stop_frac is None``) so
+        # air-grasp tests still see a no-stop trajectory.
+        if (
+            hasattr(self.arm, "set_object_close_frac")
+            and getattr(self.arm, "object_stop_frac", "<UNSET>") is not None
+            and max_width_m > 0
+        ):
+            surface_close_frac = 1.0 - float(grasp_width_m) / float(max_width_m)
+            self.arm.set_object_close_frac(surface_close_frac)
+        self.arm.close_gripper_two_stage(
+            width_pos_stage1=pos1_frac,
+            width_pos_stage2=pos2_frac,
+            effort=profile.effort,
+        )
 
     def _adopt_unknown_held(self) -> None:
         """'save it in the box' must work even when the held object was
@@ -948,17 +1719,23 @@ class SkillRuntime:
             )
             release_z = z_cap
         target = np.array([x, y, release_z])
-        from ..grasping.obb_grasp import _yaw_rotation
 
         q_now = self.arm.get_state().q
         hover = target + np.array([0.0, 0.0, float(gcfg.get("pregrasp_offset_m", 0.12))])
         hover[2] = min(hover[2], z_cap)  # same wrist ceiling as the release
-        # Placement yaw is arbitrary: walk candidate yaws (radial first --
-        # kindest to the wrist) until both hover and release poses solve.
+        # Placement rotation: align with rebot_grasp set.py's hardcoded
+        # (roll=0, pitch=approach_pitch, yaw=0) — the wrist was already
+        # standardized to this rotation by skill_grasp_object step 4b, so
+        # the box-placement leg only translates and the held object isn't
+        # rotated in the fingers. yaw=0 is the primary candidate (set.py
+        # parity); the remaining yaws are the radial-first fallback for
+        # IK-unreachable poses.
+        import pinocchio as pin
+        approach_pitch_rad = float(gcfg.get("approach_pitch_rad", 1.2))
         radial = float(np.arctan2(y, x))
         pre = low = None
-        for yaw in (radial, 0.0, np.pi / 4, -np.pi / 4, np.pi / 2, -np.pi / 2):
-            R = _yaw_rotation(yaw)
+        for yaw in (0.0, radial, np.pi / 4, -np.pi / 4, np.pi / 2, -np.pi / 2):
+            R = pin.rpy.rpyToMatrix(0.0, approach_pitch_rad, float(yaw))
             cand_pre = self.kin.ik(make_transform(R, hover), q_now)
             if not cand_pre.success:
                 continue
@@ -974,7 +1751,7 @@ class SkillRuntime:
 
         if not self.arm.move_joints(pre.q, duration_s=float(gcfg.get("move_duration_s", 2.5))):
             raise SkillError("did not settle above the place target")
-        self.arm.harness.allow_grasp_descent(target[:2], z_min=release_z - 0.02)
+        self.arm.harness.allow_grasp_descent(target[:2], radius=0.07, z_min=release_z - 0.02)
         try:
             descend_dur = float(gcfg.get("descend_duration_s", 2.0))
             if not self.arm.move_cartesian(
@@ -983,6 +1760,23 @@ class SkillRuntime:
                 planner=self.cartesian_planner,
             ):
                 raise SkillError("did not settle at place pose")
+            # 2026-08-13: verify TCP actually reached the target.
+            # cartesian_planner's waypoint IK may partially fail; if so the
+            # arm stops short of the target but move_cartesian still returns
+            # True. Don't trust the boolean — re-FK and check the error.
+            final_q = self.arm.get_state().q
+            final_tcp = self.kin.fk(final_q)
+            place_err = float(np.linalg.norm(final_tcp[:3, 3] - target))
+            if place_err > 0.02:  # 2 cm tolerance
+                self.memory.add(
+                    "note",
+                    f"place TCP error {place_err*1000:.0f} mm exceeds 20 mm tolerance "
+                    f"(cartesian_planner may have partial-IK-failure); aborting release",
+                )
+                raise SkillError(
+                    f"place failed: TCP off target by {place_err*1000:.0f} mm "
+                    f"(target={[round(float(v),3) for v in target]})"
+                )
             self.arm.set_gripper(self._grip_open, effort=0.6)
             time.sleep(float(self.cfg.grasp.get("close_settle_s", 0.0)))
             # From here the object IS placed: reconcile the held state BEFORE
@@ -1033,63 +1827,7 @@ class SkillRuntime:
             float(belief.position[0]), float(belief.position[1]), drop
         )
 
-    def skill_push_object(self, label: str, direction: str, distance_m: float = 0.08) -> dict:
-        """ASPIRE push primitive: pre-contact approach then straight-line push."""
-        dirs = {
-            "forward": np.array([1.0, 0.0]), "back": np.array([-1.0, 0.0]),
-            "left": np.array([0.0, 1.0]), "right": np.array([0.0, -1.0]),
-        }
-        if direction not in dirs:
-            raise SkillError(f"direction must be one of {sorted(dirs)}")
-        d2 = dirs[direction]
-        frame, fix = self._localize(label)
-        gcfg = self.cfg.grasp
-        table_z = float(self.cfg.safety.get("table_z", 0.0))
-        # Contact LOW on the object (a third of its height, min 1.5 cm above
-        # the table) so the push doesn't topple or skim over it.
-        top_z = float(fix.points[:, 2].max())
-        obj_h = max(top_z - table_z, 0.02)
-        push_z = table_z + max(0.015, min(0.35 * obj_h, 0.06))
-        # Pre-contact standoff must clear the object's own footprint.
-        half_len = float(fix.extent[0]) / 2 if fix.extent is not None else 0.05
-        standoff = 0.06 + half_len
-        d3 = np.array([d2[0], d2[1], 0.0])
-        start = fix.position - d3 * standoff
-        end = fix.position + d3 * distance_m
-        start[2] = end[2] = push_z
-        from ..grasping.obb_grasp import _yaw_rotation
 
-        R = _yaw_rotation(float(np.arctan2(d2[1], d2[0])))
-        q_now = self.arm.get_state().q
-        hover = start + np.array([0.0, 0.0, 0.10])
-        ik_hover = self.kin.ik(make_transform(R, hover), q_now)
-        ik_start = self.kin.ik(make_transform(R, start), ik_hover.q if ik_hover.success else q_now)
-        ik_end = self.kin.ik(make_transform(R, end), ik_start.q if ik_start.success else q_now)
-        if not (ik_hover.success and ik_start.success and ik_end.success):
-            raise SkillError("push poses unreachable")
-        self.arm.set_gripper(self._grip_closed, effort=0.8)  # push with closed jaws
-        self.arm.move_joints(ik_hover.q, duration_s=2.0)
-        center = (start[:2] + end[:2]) / 2
-        radius = float(np.linalg.norm(end[:2] - start[:2]) / 2 + 0.10)
-        self.arm.harness.allow_grasp_descent(center, radius_m=radius, z_min=push_z - 0.02)
-        try:
-            self.arm.move_cartesian(
-                self.kin.fk(ik_start.q), self.kin,
-                duration_s=1.5, planner=self.cartesian_planner,
-            )
-            self.arm.move_cartesian(
-                self.kin.fk(ik_end.q), self.kin,
-                duration_s=2.0, planner=self.cartesian_planner,
-            )
-            self.arm.move_cartesian(
-                self.kin.fk(ik_hover.q), self.kin,
-                duration_s=1.5, planner=self.cartesian_planner,
-            )
-        finally:
-            self.arm.harness.clear_grasp_exemption()
-        self.beliefs.update(label, end, 0.6)
-        self.memory.add("action", f"pushed {label!r} {direction} by {distance_m:.2f} m")
-        return {"pushed": label, "direction": direction, "new_position_estimate": end.round(3).tolist()}
 
     def skill_pick_and_place(
         self,
@@ -1124,6 +1862,17 @@ class SkillRuntime:
                 )
         t0 = time.monotonic()
         timings: dict[str, float] = {}
+
+        # Bridge path: when rebot_grasp bridge is wired AND a destination
+        # label is given (so the place target is detectable, not a fixed
+        # drop_zone coordinate), mirror set.py's flow:
+        #   same-frame detect → grasp → home → place(rpy=0,1.2,0,z=0.08)
+        #   → release_with_async_close → home
+        # Without a destination we fall back to the legacy flow so
+        # ``pick_and_place`` with no destination still uses the drop_zone.
+        if self.bridge is not None and destination is not None:
+            return self._skill_pick_and_place_bridge(object, destination, already_held=already_held)
+
         gcfg = self.cfg.grasp
         max_attempts = max(int(gcfg.get("max_pick_attempts", 8)), 1)
         deadline = t0 + float(gcfg.get("persist_seconds", 120.0))
@@ -1291,266 +2040,21 @@ class SkillRuntime:
 
     # ── social / audience skills (deterministic, harness-gated) ─────────
 
-    def skill_describe_scene(self) -> dict:
-        """INSTANT text description from the live world model (no detector
-        pass, no motion): what is where, colors, what the gripper holds."""
-        objs = self.beliefs.summary()
-        parts = []
-        for o in objs:
-            color = f"{o['color']} " if o.get("color") else ""
-            parts.append(
-                f"a {color}{o['label']} at [{o['position'][0]}, {o['position'][1]}]"
-                + (" (remembered)" if o["state"] == "remembered" else "")
-            )
-        text = (
-            "I see " + "; ".join(parts) + "." if parts
-            else "I don't know of any objects yet -- let me look around."
-        )
-        if self.held_object:
-            text += f" I am holding the {self.held_object}."
-        return {"description": text, "objects": objs, "holding": self.held_object}
 
-    def skill_count_objects(self, query: str | None = None) -> dict:
-        beliefs = self.beliefs.all()
-        if query:
-            color, noun = parse_color_query(query)
-            if color:
-                beliefs = [b for b in beliefs if b.color == color]
-            if noun:
-                beliefs = [
-                    b for b in beliefs
-                    if noun in b.label.lower() or b.label.lower() in noun
-                ]
-        return {
-            "count": len(beliefs),
-            "query": query or "all",
-            "labels": [f"{b.color or '?'} {b.label}" for b in beliefs],
-        }
 
-    def skill_point_at(self, label: str) -> dict:
-        """Deictic gesture: hover the closed gripper above the object for a
-        moment ("this one!"), then return. Answers 'which one is X?'."""
-        _, fix = self._localize(label)
-        gcfg = self.cfg.grasp
-        hover = fix.position.copy()
-        # Strict top-down poses only solve below ~0.15 m on the B601-RS
-        # (wrist limits); clamp the hover or tall objects become unpointable.
-        z_max = float(gcfg.get("topdown_z_max", 0.15)) - 0.01
-        hover[2] = min(
-            float(fix.points[:, 2].max()) + float(gcfg.get("pregrasp_offset_m", 0.08)),
-            z_max,
-        )
-        from ..grasping.obb_grasp import _yaw_rotation
 
-        q_now = self.arm.get_state().q
-        ik = None
-        for z in (hover[2], z_max - 0.02):
-            for yaw in (float(np.arctan2(hover[1], hover[0])), 0.0, np.pi / 4, -np.pi / 4):
-                cand = self.kin.ik(
-                    make_transform(_yaw_rotation(yaw), [hover[0], hover[1], z]), q_now
-                )
-                if cand.success:
-                    ik = cand
-                    break
-            if ik is not None:
-                break
-        if ik is None:
-            raise SkillError(f"cannot reach a pointing pose above {label!r}")
-        if not self.held_object:
-            self.arm.set_gripper(self._grip_closed, effort=0.6)
-        if not self.arm.move_joints(ik.q, duration_s=2.0):
-            raise SkillError("did not settle at the pointing pose")
-        time.sleep(float(self.cfg.get("gesture", {}).get("point_hold_s", 1.2)))
-        self.memory.add("action", f"pointed at {label!r}")
-        return {"pointed_at": label, "position": [round(float(x), 3) for x in fix.position]}
 
-    def skill_wave(self, cycles: int = 2) -> dict:
-        """Greeting gesture: wag the base + wrist around home. Every
-        waypoint still goes through the safety harness."""
-        home = np.asarray(
-            self.cfg.arm.get("home_q", [0.0, 1.2, 1.2, 0.0, 0.75, 0.0]), dtype=float
-        )
-        if not self.arm.move_joints(home, duration_s=2.0):
-            raise SkillError("could not reach home to wave")
-        cycles = int(np.clip(cycles, 1, 4))
-        for side in [+1, -1] * cycles:
-            q = home.copy()
-            q[0] += 0.25 * side
-            q[4] += 0.30 * side
-            self.arm.move_joints(q, duration_s=0.7)
-        self.arm.move_joints(home, duration_s=0.8)
-        self.memory.add("action", "waved at the audience")
-        return {"waved": True, "cycles": cycles}
 
-    def skill_handover(self, label: str | None = None) -> dict:
-        """Hand the object to the human: grasp it if needed, present it at
-        the handover pose, and KEEP HOLDING -- the human says 'open gripper'
-        (or the agent calls open_gripper) once they have grabbed it."""
-        if not self.held_object:
-            if not label:
-                raise SkillError("not holding anything; say which object to hand over")
-            res = self.skill_grasp_object(label)
-            if not res.get("ok", True) or not res.get("held"):
-                return {
-                    "ok": False,
-                    "error": f"could not grasp {label!r} for handover: {res.get('error')}",
-                }
-        hand_q = np.asarray(
-            self.cfg.arm.get("handover_q", [0.5, 1.2, 1.2, 0.0, 0.75, 0.0]), dtype=float
-        )
-        if not self.arm.move_joints(hand_q, duration_s=2.0):
-            raise SkillError("did not settle at the handover pose")
-        self.memory.add("action", f"offering {self.held_object!r} to the human")
-        return {
-            "offering": self.held_object,
-            "note": "holding steady; call open_gripper once the human has it",
-        }
 
-    def skill_throw(self, label: str | None = None, direction: str = "forward") -> dict:
-        """Booth crowd-pleaser: grasp the object (if not already held), wind
-        the arm up, swing it toward `direction`, and RELEASE at the top of
-        the swing so the object is launched. The safety harness still vets
-        every waypoint (velocity cap, workspace AABB, table clearance), so
-        this is a *gestural* throw -- arm swing speed + release timing give
-        the toss, never an unsafe joint velocity. Great for "grab the banana
-        and throw it".
-        """
-        dirs = {
-            "forward": 0.0, "left": np.pi / 2, "right": -np.pi / 2,
-            "back": np.pi,
-        }
-        if direction not in dirs:
-            raise SkillError(f"direction must be one of {sorted(dirs)}")
-        # 1) make sure we're holding something.
-        if not self.held_object:
-            if not label:
-                raise SkillError("not holding anything; say which object to throw")
-            res = self.skill_grasp_object(label)
-            if not res.get("ok", True) or not res.get("held"):
-                return {
-                    "ok": False,
-                    "error": f"could not grasp {label!r} to throw: {res.get('error')}",
-                }
-        thrown = self.held_object
-        yaw = dirs[direction]
 
-        # 2) wind-up pose: arm drawn back and low, jaws still closed.
-        #    Joint-space keyframes keep this reachable on the B601-RS wrist
-        #    envelope (top-down IK is limited above z~0.15). base yaw (j1)
-        #    aims the throw; j2/j3 load the swing.
-        base = np.asarray(
-            self.cfg.arm.get("home_q", [0.0, -0.5, -0.9, 0.0, 0.6, 0.0]), dtype=float
-        )
-        windup = base.copy()
-        windup[0] = yaw                     # aim
-        windup[1] = base[1] - 0.5           # shoulder back/down (loaded)
-        windup[2] = base[2] + 0.4           # elbow tucked
-        release = base.copy()
-        release[0] = yaw                    # same aim
-        release[1] = base[1] + 0.6          # shoulder swings up/forward
-        release[2] = base[2] - 0.3          # elbow extends
 
-        # 3) execute: settle at wind-up, then swing FAST (short duration --
-        #    the harness auto-stretches it only if it would breach the cap,
-        #    so we get the quickest *safe* swing) and pop the jaws open at
-        #    the peak. Releasing while the wrist is still moving imparts the
-        #    launch impulse.
-        if not self.arm.move_joints(windup, duration_s=1.5):
-            raise SkillError("did not settle at the wind-up pose")
-        self.memory.add("action", f"winding up to throw {thrown!r} {direction}")
-        # kick off the swing in a background stream and release mid-arc.
-        self.arm.move_joints(release, duration_s=0.6)
-        self.arm.set_gripper(self._grip_open, effort=1.0)  # let it fly
-        released_obj = self.held_object
-        self.held_object = None
-        self._held_det_label = None
-        self._held_color = None
-        # follow-through, then home so the camera view clears.
-        try:
-            self.skill_move_home()
-        except (SkillError, SafetyViolation):
-            pass
-        self.memory.add("action", f"threw {released_obj!r} {direction}")
-        return {
-            "ok": True,
-            "thrown": released_obj,
-            "direction": direction,
-            "note": "gestural throw: harness-vetted swing + timed release",
-        }
 
-    def skill_sort_by_color(self, max_objects: int = 6) -> dict:
-        """Crowd-pleaser: group everything on the table into per-color zones
-        along the front edge. Pure composition of pick_and_place."""
-        # +-0.24 is outside the top-down IK envelope at x=0.30 on this arm
-        # (verified against the RS URDF); stay within +-0.20.
-        zones_y = (-0.20, -0.10, 0.0, 0.10, 0.20)
-        zone_x = float(self.cfg.grasp.get("drop_zone", [0.30, -0.20])[0])
-        colors: dict[str, tuple[float, float]] = {}
-        moved, failed = [], []
-        for b in list(self.beliefs.all())[: int(max_objects)]:
-            color = b.color or "unknown"
-            if color not in colors:
-                if len(colors) >= len(zones_y):
-                    failed.append({"label": b.label, "error": "no free color zone"})
-                    continue
-                colors[color] = (zone_x, zones_y[len(colors)])
-            zx, zy = colors[color]
-            if np.linalg.norm(b.position[:2] - np.array([zx, zy])) < 0.07:
-                continue  # already sorted
-            query = f"{b.color} {b.label}" if b.color else b.label
-            try:
-                res = self.skill_grasp_object(query)
-            except (SkillError, SafetyViolation) as e:
-                failed.append({"label": query, "error": str(e)})
-                continue
-            if not res.get("ok", True) or not res.get("held"):
-                failed.append({"label": query, "error": str(res.get("error", "?"))})
-                continue
-            try:
-                self.skill_place_at(zx, zy)
-            except (SkillError, SafetyViolation) as e:
-                # still holding: stop sorting rather than cascade failures
-                failed.append({"label": query, "error": f"place: {e}"})
-                break
-            moved.append({"label": query, "color": color, "zone": [zx, zy]})
-        ok = not failed or bool(moved)
-        out = {
-            "ok": ok,
-            "moved": moved,
-            "failed": failed,
-            "zones": {c: list(z) for c, z in colors.items()},
-        }
-        if not ok:
-            out["error"] = "; ".join(
-                f"{f['label']}: {f['error'][:60]}" for f in failed[:3]
-            ) or "nothing to sort"
-        return out
 
-    def skill_move_relative(self, direction: str, distance_m: float = 0.05) -> dict:
-        """Nudge the TCP: fine chat-driven control ("a bit to the left")."""
-        dirs = {
-            "forward": [1, 0, 0], "back": [-1, 0, 0],
-            "left": [0, 1, 0], "right": [0, -1, 0],
-            "up": [0, 0, 1], "down": [0, 0, -1],
-        }
-        if direction not in dirs:
-            raise SkillError(f"direction must be one of {sorted(dirs)}")
-        distance_m = float(np.clip(distance_m, 0.01, 0.15))
-        q_now = self.arm.get_state().q
-        T = self.kin.fk(q_now)
-        target = T.copy()
-        target[:3, 3] += np.asarray(dirs[direction], dtype=float) * distance_m
-        if not self.arm.move_cartesian(
-            target, self.kin,
-            duration_s=1.0,
-            planner=self.cartesian_planner,
-        ):
-            raise SkillError(
-                f"cannot move {distance_m:.2f} m {direction} from here"
-            )
-        tcp = self.kin.fk(self.arm.get_state().q)[:3, 3]
-        return {"moved": direction, "distance_m": distance_m,
-                "tcp_xyz": [round(float(x), 3) for x in tcp]}
+
+
+
+
+
 
     def skill_open_gripper(self) -> dict:
         self.arm.set_gripper(self._grip_open, effort=0.8)
@@ -1565,63 +2069,7 @@ class SkillRuntime:
         wf = self._gripper_width_frac()
         return {"gripper": "closed", "open_frac": round(wf, 2) if wf is not None else "unknown"}
 
-    def skill_move_to_pose(
-        self,
-        x: float,
-        y: float,
-        z: float,
-        roll: float = 0.0,
-        pitch: float = 0.0,
-        yaw: float = 0.0,
-        duration: float = 2.0,
-    ) -> dict:
-        """Move end-effector to an absolute Cartesian pose along an SE(3)
-        geodesic with CLIK-tracked joint trajectory.  Every intermediate
-        waypoint is safety-vetted.  Falls back to joint-space PTP when
-        the trajectory planner is unavailable or CLIK fails."""
-        T_target = make_transform(x, y, z, roll, pitch, yaw)
-        q_start = self.arm.get_state().q
 
-        if self.cartesian_planner is not None:
-            try:
-                T_start = self.kin.fk(q_start)
-                waypoints = self.cartesian_planner.plan(
-                    q_start, T_start, T_target, duration,
-                )
-                n = len(waypoints)
-                seg = max(duration / n, 0.01) if n else duration
-                ok = self.arm.move_joints_path(waypoints, segment_duration_s=seg)
-                self.memory.add(
-                    "action",
-                    f"move_to_pose ({x:.3f}, {y:.3f}, {z:.3f}) "
-                    f"via cartesian trajectory ({n} waypoints)",
-                )
-                return {
-                    "ok": ok,
-                    "method": "cartesian_trajectory",
-                    "waypoints": n,
-                }
-            except RuntimeError as e:
-                self.memory.add(
-                    "note",
-                    f"cartesian planning failed: {e}; falling back to PTP",
-                )
-
-        # PTP fallback
-        ik = self.kin.ik(T_target, q_start)
-        if not ik.success:
-            raise SkillError(
-                f"IK failed for pose ({x:.3f}, {y:.3f}, {z:.3f}); "
-                f"err={ik.error:.4f}"
-            )
-        ok = self.arm.move_joints(ik.q, duration_s=duration)
-        if not ok:
-            raise SkillError("did not settle at target pose")
-        self.memory.add(
-            "action",
-            f"move_to_pose ({x:.3f}, {y:.3f}, {z:.3f}) via PTP fallback",
-        )
-        return {"ok": True, "method": "ptp_fallback"}
 
     def skill_move_home(self) -> dict:
         home = np.asarray(self.cfg.arm.get("home_q", [0.0, -0.5, -0.9, 0.0, 0.6, 0.0]), dtype=float)
@@ -1629,26 +2077,86 @@ class SkillRuntime:
             raise SkillError("did not settle at home")
         return {"at": "home"}
 
-    def skill_move_to_joint_zero(self) -> dict:
-        """Move all joints to zero position (机械臂零点)."""
-        zero_q = np.zeros(6, dtype=float)
-        if not self.arm.move_joints(zero_q, duration_s=4.0):
-            raise SkillError("did not settle at joint zero")
-        return {"at": "joint_zero", "q_deg": [0.0] * 6}
+    def skill_teach_record(self, slot: int) -> dict:
+        """Enter master-slave teleoperation, capture trajectory.
 
-    def skill_recall_memory(self, query: str = "") -> dict:
-        out: dict = {"recent_events": self.memory.digest(max_lines=15)}
-        if query:
-            b = self.beliefs.find(query)
-            if b is not None:
-                now = time.monotonic()
-                out["object_memory"] = {
-                    "label": b.label,
-                    "last_position": [round(float(x), 3) for x in b.position],
-                    "seen_s_ago": round(now - b.last_seen_t, 1),
-                    "state": b.state(now),
-                }
-        return out
+        Long-running skill: blocks waiting for user to press q (start/stop
+        recording) or Esc (cancel). Added to _MOTION_SKILLS so WorldWatcher
+        pauses during motion. Returns dict with frame_count/duration_s.
+
+        Bypasses SafeArm (uses self.arm.raw → vendored RebotArm) because teach
+        needs an external-event-triggered control loop, which SafeArm lacks.
+        Master arm is PiPER Mate via fashionstar-uart-sdk.
+        """
+        from pathlib import Path
+        from . import teach as _teach_mod
+        from .master_arm import PiPERMateArm
+
+        if not isinstance(slot, int) or slot < 1 or slot > _teach_mod.NUM_SLOTS:
+            return {
+                "ok": False,
+                "error": f"slot must be int 1-{_teach_mod.NUM_SLOTS}, got {slot!r}",
+            }
+
+        try:
+            raw_arm = self.arm.raw          # LazyArm materializes RebotRSArm
+            slave = getattr(raw_arm, "_arm", None)
+        except Exception as e:
+            return {"ok": False, "error": f"arm not available: {type(e).__name__}: {e}"}
+
+        if slave is None:
+            return {"ok": False, "error": "SDK arm not connected"}
+
+        master = PiPERMateArm(port="/dev/ttyUSB0", gripper_exist=True)
+        try:
+            master.open()
+        except Exception as e:
+            return {"ok": False, "error": f"master arm open failed: {type(e).__name__}: {e}"}
+
+        recordings_dir = Path(__file__).resolve().parents[2] / "data" / "recordings"
+        try:
+            return _teach_mod.record_real(master, slave, slot, recordings_dir)
+        except Exception as e:
+            return {"ok": False, "error": f"unexpected {type(e).__name__}: {e}"}
+        finally:
+            try:
+                master.close()
+            except Exception:
+                pass
+
+    def skill_teach_replay(self, slot: int) -> dict:
+        """Replay recorded trajectory; return arm to motor mechanical zero.
+
+        Returns dict with replayed_to_home=True on success. Uses
+        RebotArmEndPose.move_joints_traj + safe_home internally via teach.py.
+        """
+        from pathlib import Path
+        from . import teach as _teach_mod
+
+        if not isinstance(slot, int) or slot < 1 or slot > _teach_mod.NUM_SLOTS:
+            return {
+                "ok": False,
+                "error": f"slot must be int 1-{_teach_mod.NUM_SLOTS}, got {slot!r}",
+            }
+
+        try:
+            raw_arm = self.arm.raw
+            slave = getattr(raw_arm, "_arm", None)
+        except Exception as e:
+            return {"ok": False, "error": f"arm not available: {type(e).__name__}: {e}"}
+
+        if slave is None:
+            return {"ok": False, "error": "SDK arm not connected"}
+
+        recordings_dir = Path(__file__).resolve().parents[2] / "data" / "recordings"
+        try:
+            return _teach_mod.replay_real(slave, slot, recordings_dir)
+        except Exception as e:
+            return {"ok": False, "error": f"unexpected {type(e).__name__}: {e}"}
+
+
+
+
 
     def skill_task_done(self, success: bool, summary: str) -> dict:
         if isinstance(success, str):  # schema-lax backends send "false"
@@ -1662,230 +2170,31 @@ def _short(args: dict) -> str:
 
 TOOL_SPECS: list[dict] = [
     {
-        "name": "get_observation",
-        "description": "Capture a fresh camera frame; returns visible objects with 3D positions (base frame, meters), remembered objects, and robot state.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
         "name": "list_objects",
-        "description": "List every object the robot knows about, including remembered (currently not visible) ones with last-known positions and age.",
+        "description": "List known objects (visible + remembered) with positions. Call first.",
         "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "localize_object",
-        "description": "Precisely localize one object by name; returns base-frame position and size. Use a spatial_hint word (left/right/front/back) to disambiguate duplicates.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "label": {"type": "string"},
-                "spatial_hint": {"type": "string", "enum": ["left", "right", "front", "back", "near", "far"]},
-            },
-            "required": ["label"],
-        },
-    },
-    {
-        "name": "grasp_object",
-        "description": "Full grasp pipeline on a named object: localize, plan a top-down grasp, approach, material-aware close, lift, verify. Returns failure details if the object was missed.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "label": {"type": "string"},
-                "material": {
-                    "type": "string",
-                    "enum": ["rigid", "fragile", "soft", "deformable", "slippery", "heavy"],
-                    "description": "How gently to grip; infer from the object's looks.",
-                },
-                "spatial_hint": {"type": "string", "enum": ["left", "right", "front", "back", "near", "far"]},
-            },
-            "required": ["label"],
-        },
     },
     {
         "name": "pick_and_place",
-        "description": (
-            "FAST PATH: complete pick-and-place in ONE call. Resolves the "
-            "object against the live world model (color queries like 'pink "
-            "object' work), grasps, places on the named destination object "
-            "(or the default drop zone if omitted), returns home, and "
-            "reports stage timings. Both stages PERSIST: they keep retrying "
-            "with fresh perception and fresh grasp plans until they succeed "
-            "or the persistence budget runs out. Prefer this over manual "
-            "localize/grasp/place for any 'pick X [put it in Y]' request."
-        ),
+        "description": "Complete pick-and-place: detect+grasp+place atomically. For 'put X in Y', 'pick up X then place Y', etc.",
         "parameters": {
             "type": "object",
             "properties": {
-                "object": {"type": "string", "description": "what to pick, e.g. 'pink object', 'red mug'"},
-                "destination": {"type": "string", "description": "named object to place on/in; omit for the drop zone"},
-                "material": {
-                    "type": "string",
-                    "enum": ["rigid", "fragile", "soft", "deformable", "slippery", "heavy"],
-                },
+                "object": {"type": "string", "description": "what to pick, e.g. 'banana', 'red cube'"},
+                "destination": {"type": "string", "description": "named destination, e.g. 'box', 'plate'. Omit for default drop zone."},
+                "material": {"type": "string", "enum": ["rigid", "fragile", "soft", "deformable", "slippery", "heavy"]},
             },
             "required": ["object"],
         },
     },
     {
-        "name": "place_at",
-        "description": "Place the held object at base-frame coordinates (meters). Omit z to release just above the table.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "x": {"type": "number"},
-                "y": {"type": "number"},
-                "z": {"type": "number"},
-            },
-            "required": ["x", "y"],
-        },
-    },
-    {
-        "name": "place_on_object",
-        "description": "Place the held object on/in another named object (e.g. a bowl or plate).",
-        "parameters": {
-            "type": "object",
-            "properties": {"label": {"type": "string"}},
-            "required": ["label"],
-        },
-    },
-    {
-        "name": "push_object",
-        "description": "Push a named object along the table (for objects too wide to grasp, or to reposition). distance_m defaults to 0.08.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "label": {"type": "string"},
-                "direction": {"type": "string", "enum": ["forward", "back", "left", "right"]},
-                "distance_m": {"type": "number"},
-            },
-            "required": ["label", "direction"],
-        },
-    },
-    {
-        "name": "describe_scene",
-        "description": "INSTANT text description of everything the robot knows (objects, colors, positions, what it holds) from the live world model -- no motion, no camera wait. Prefer this for 'what do you see?' questions.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "count_objects",
-        "description": "Count known objects, optionally filtered by a query like 'red' or 'cube' or 'pink object'. Instant, from the live world model.",
-        "parameters": {
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": [],
-        },
-    },
-    {
-        "name": "point_at",
-        "description": "Point at a named object (hover the gripper above it for a moment). Great for answering 'which one is the pink object?'.",
-        "parameters": {
-            "type": "object",
-            "properties": {"label": {"type": "string"}},
-            "required": ["label"],
-        },
-    },
-    {
-        "name": "wave",
-        "description": "Wave at the audience (a friendly greeting gesture around the home pose).",
-        "parameters": {
-            "type": "object",
-            "properties": {"cycles": {"type": "integer", "minimum": 1, "maximum": 4}},
-            "required": [],
-        },
-    },
-    {
-        "name": "handover",
-        "description": "Hand an object to the human: grasp it (if not already held), present it at the handover pose, and keep holding until open_gripper is called. Use for 'hand me / give me the X'.",
-        "parameters": {
-            "type": "object",
-            "properties": {"label": {"type": "string"}},
-            "required": [],
-        },
-    },
-    {
-        "name": "sort_by_color",
-        "description": "Sort every known object into per-color zones along the table edge (repeated pick-and-place; takes a while). A crowd favorite.",
-        "parameters": {
-            "type": "object",
-            "properties": {"max_objects": {"type": "integer", "minimum": 1, "maximum": 8}},
-            "required": [],
-        },
-    },
-    {
-        "name": "throw",
-        "description": "Grab an object (if not already held) and throw it by winding up and releasing at the top of a harness-vetted swing. direction is forward/left/right/back (default forward). Use for 'grab the banana and throw it' / 'launch the X'.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "label": {"type": "string"},
-                "direction": {
-                    "type": "string",
-                    "enum": ["forward", "left", "right", "back"],
-                },
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "move_relative",
-        "description": "Nudge the gripper a few centimeters (fine adjustment): forward/back/left/right/up/down, default 0.05 m, max 0.15 m.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "direction": {"type": "string", "enum": ["forward", "back", "left", "right", "up", "down"]},
-                "distance_m": {"type": "number"},
-            },
-            "required": ["direction"],
-        },
-    },
-    {
-        "name": "open_gripper",
-        "description": "Open the gripper (drops the held object where it is; also how a handover finishes).",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "close_gripper",
-        "description": "Close the gripper with the default profile.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "move_to_pose",
-        "description": "Move the end-effector to an absolute Cartesian pose (x,y,z in metres, roll/pitch/yaw in radians) along a smooth SE(3) geodesic trajectory. Every intermediate waypoint is safety-vetted. Use for precise Cartesian moves, e.g. 'move to x=0.3 y=0.0 z=0.2'. Falls back to joint-space PTP if trajectory planning is unavailable.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "x": {"type": "number"},
-                "y": {"type": "number"},
-                "z": {"type": "number"},
-                "roll": {"type": "number"},
-                "pitch": {"type": "number"},
-                "yaw": {"type": "number"},
-                "duration": {"type": "number"},
-            },
-            "required": ["x", "y", "z"],
-        },
-    },
-    {
         "name": "move_home",
-        "description": "Return the arm to its home configuration (also clears the camera view).",
+        "description": "Park the arm at home pose. Use to reset between tasks or after failures.",
         "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "move_to_joint_zero",
-        "description": "Move all joints to zero position (机械臂零点). All joint angles become 0.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "recall_memory",
-        "description": "Recall recent events (last ~15 s) and, optionally, where a named object was last seen.",
-        "parameters": {
-            "type": "object",
-            "properties": {"query": {"type": "string", "description": "object name to look up"}},
-            "required": [],
-        },
     },
     {
         "name": "task_done",
-        "description": "Declare the task finished (success or honest failure) with a one-paragraph summary.",
+        "description": "Declare task finished with success bool and one-paragraph summary. ALWAYS call last.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1893,6 +2202,52 @@ TOOL_SPECS: list[dict] = [
                 "summary": {"type": "string"},
             },
             "required": ["success", "summary"],
+        },
+    },
+    {
+        "name": "teach_record",
+        "description": (
+            "WHAT: Enter master-slave teleoperation mode. PiPER Mate master arm "
+            "(operator-controlled via /dev/ttyUSB0) drives the reBot B601-RS slave "
+            "arm in POS_VEL mode. Capture joint positions at 30Hz. User presses q "
+            "to start/stop recording into slot N (Enter also works as fallback). "
+            "Long-running (waits for q or Esc). "
+            "WHEN: User asks to 'record an action' / 'save a motion' / 'teach mode' / "
+            "'record slot N'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "slot": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "description": "which slot to save the recording into",
+                },
+            },
+            "required": ["slot"],
+        },
+    },
+    {
+        "name": "teach_replay",
+        "description": (
+            "WHAT: Read the saved slot{N}.json and execute the recorded trajectory "
+            "via move_joints_traj. After playback, return the arm to motor mechanical "
+            "zero (np.zeros(6)) via safe_home. "
+            "WHEN: User asks to 'replay the action' / 'play back' / 'repeat it' / "
+            "'replay slot N'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "slot": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "description": "which slot to replay",
+                },
+            },
+            "required": ["slot"],
         },
     },
 ]

@@ -73,6 +73,7 @@ def test_hand_eye_npz_baseline_format(tmp_path):
 
 
 class FakeKin:
+    n_joints = 6
     joint_limits = (np.full(6, -3.0), np.full(6, 3.0))
 
     def fk(self, q):
@@ -82,6 +83,12 @@ class FakeKin:
 
     def link_positions(self, q):
         return np.array([[0, 0, 0.2], [q[0], q[1], max(q[2], 0.1)]])
+
+    def ik(self, T, q_init, retries=0):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            q=np.asarray(q_init, dtype=float), success=True, error=0.0, iterations=1,
+        )
 
 
 def _limits(**kw):
@@ -112,10 +119,12 @@ def test_watchdog_checked_at_motion_start_not_per_waypoint():
 
     time.sleep(0.01)  # now stale relative to 1 ms watchdog
     q = np.array([0.3, 0.0, 0.2, 0, 0, 0])
-    h2.approve(q, q, 0.02)  # must NOT raise mid-motion
+    assert h2.approve(q, q, 0.02)  # mid-motion: skip watchdog, OK
     h2.end_motion()
-    with pytest.raises(SafetyViolation, match="watchdog"):
-        h2.approve(q, q, 0.02)  # outside a motion the check is live again
+    # Outside a motion, approve() re-checks the watchdog and vetoes
+    # with a reason string (not a raise).
+    assert not h2.approve(q, q, 0.02)
+    assert "watchdog" in h2.violations[-1]
 
 
 def test_escape_upward_from_below_clearance():
@@ -124,10 +133,10 @@ def test_escape_upward_from_below_clearance():
     slightly_up = np.array([0.3, 0.0, 0.012, 0, 0, 0])
     deeper = np.array([0.3, 0.0, 0.001, 0, 0, 0])
     # No exemption: moving UP from below the floor is allowed...
-    h.approve(below, slightly_up, dt=1e9)
+    assert h.approve(below, slightly_up, dt=1e9)
     # ...but descending further is not.
-    with pytest.raises(SafetyViolation, match="table"):
-        h.approve(below, deeper, dt=1e9)
+    assert not h.approve(below, deeper, dt=1e9)
+    assert "table" in h.violations[-1]
 
 
 def test_belief_top_z_used_for_placement():

@@ -18,6 +18,21 @@ from wrc_demo.agent.orchestrator import AgentOrchestrator
 
 @pytest.fixture
 def runtime_and_arm(demo_cfg, tmp_path):
+    # Mock arm's home_q is in a different basin than the rebot_rs home_q,
+    # so the production `approach_pitch_rad: 1.2` (tilted) pregrasp is
+    # unreachable from the mock seed. Pin legacy top-down for the e2e
+    # tests so the wiring (perception -> beliefs -> grasp -> IK -> safety
+    # -> motion -> memory -> trace) is exercised against the geometry
+    # the test was originally written for; the new pitch=1.2 path is
+    # covered separately by the real-hardware demo and the live IK check.
+    #
+    # Also force the grasp-memory path to tmp_path: a stale
+    # ``~/.wrc_demo/grasp_memory.json`` from prior sessions can apply a
+    # learned z_nudge that pushes the pregrasp into a reach dead-zone
+    # (per CLAUDE.md "Persistent learned state outside the run dir").
+    import math
+    demo_cfg._data["grasp"]["approach_pitch_rad"] = math.pi / 2
+    demo_cfg._data["grasp"]["memory_path"] = str(tmp_path / "grasp_memory.json")
     from wrc_demo.apps.demo import build_runtime
 
     runtime, arm = build_runtime(demo_cfg, tmp_path / "run")

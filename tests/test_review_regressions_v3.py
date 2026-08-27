@@ -1,5 +1,5 @@
 """Regression tests for defects found in the v3 adversarial review pass
-(PLAN.md §6.5, focused on the Orbbec hand-eye bring-up).
+(focused on the Orbbec hand-eye bring-up).
 
 Each test corresponds to one confirmed defect with the root cause
 recorded in its docstring. Convention from tests/test_review_regressions.py.

@@ -3,19 +3,33 @@
 Schema version: 1
 Frame convention: wrc_demo (base +x away from robot, +y left, TCP = gripper_end)
 
+Architecture ported from rebot_grasp/scripts/calibrate_top_camera.py:
+- Clean single-loop state machine for auto pose traversal (``tick_auto``
+  pattern) replaces the previous per-pose nested loop -- ~500 LOC
+  collapses to ~150 LOC.
+- Optional ``--gravity-comp`` flag enables MIT-mode gravity compensation
+  so the operator can hand-guide the arm during manual capture (uses
+  vendored ``RebotArm`` directly, matching the pattern in
+  ``skills/teach.py`` -- see CLAUDE.md "Motion safety path").
+- Reuses wrc_demo's ``OrbbecCamera``, ``Kinematics``, ``joint_solve_restart``
+  + ``save_calibration`` (no rebot_grasp dependency).
+
 Sub-commands:
 
 - ``--list``: enumerate Orbbec devices (no frames captured).
 - ``--bind <role>``: write the role -> serial binding into
   ``data/calibration/cameras.json`` (also updates profile YAMLs).
-- (default) collect a calibration dataset: for each stable pose of the
-  arm, capture ArUco + FK, run ``joint_solve``, persist the result.
 - ``--verify --npz <file> --known-points <csv>``: cross-check a saved
   calibration against operator-measured table points.
+- ``--dry-run``: synthesize samples and exercise solve/persist pipeline
+  end-to-end without hardware (smoke test).
+- (default) collect a calibration dataset. ``--manual`` waits for ENTER
+  after each pose (operator moves arm by hand); ``--gravity-comp`` adds
+  MIT-mode gravity compensation so the arm floats during manual capture.
 
-No cuRobo dependency: the FK comes from
-``wrc_demo.control.kinematics.Kinematics`` (Pinocchio on the RS URDF
-with ``joint_signs=[-1]*6`` and ``ee_frame='gripper_end'``).
+Output: ``data/calibration/hand_eye_top.json`` (schema v1) + ``.npz``
+sidecar -- loadable by ``scripts/flip_hand_eye.py`` and
+``scripts/verify_relative_motion.py``.
 
 Run via ``python -m wrc_demo.scripts.calib_top_orbbec ...`` (editable
 install means no PYTHONPATH gymnastics needed).
@@ -24,11 +38,15 @@ install means no PYTHONPATH gymnastics needed).
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
+import queue
+import signal as _signal
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -40,29 +58,33 @@ from ..calibration import (
     CalibrationResult,
     CalibrationSample,
     SCHEMA_VERSION,
-    joint_solve,
     joint_solve_restart,
     load_calibration,
     save_calibration,
 )
 from ..config import PACKAGE_ROOT
-from ..control.kinematics import Kinematics
+from ..safety.harness import Kinematics
 from ..perception.orbbec_camera import OrbbecCamera, list_orbbec_devices
+from ._calib_cleanup import safe_park_and_disconnect
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────
 
 # Stable directory layout for calibration artefacts (PLAN.md §4)
 CALIB_DIR = PACKAGE_ROOT / "data" / "calibration"
 ARM_PROFILE_DEFAULT = "rebot_rs"
-URDF_DEFAULT = PACKAGE_ROOT / "assets" / "urdf" / "00-arm-rs_asm-v3" / "urdf" / "00-arm-rs_asm-v3.urdf"
+URDF_DEFAULT = (
+    PACKAGE_ROOT
+    / "assets" / "urdf" / "00-arm-rs_asm-v3" / "urdf" / "00-arm-rs_asm-v3.urdf"
+)
 
-# Headless / SSH env fallback: opencv-python-headless has no GTK so
-# cv2.namedWindow always raises. We detect that once at import and
-# fall back to per-frame disk snapshots. 1-of-every-SNAP_EVERY frames
-# is saved (plus every successful detection), so the operator can
-# verify the camera + ArUco pipeline after the run.
+# Headless / SSH env fallback: cv2.namedWindow always raises. We detect
+# once at import and fall back to per-frame disk snapshots under
+# /tmp/calib_frames/ so the operator can still verify the pipeline.
 SNAP_DIR = Path("/tmp/calib_frames")
 SNAP_EVERY = 10
-SNAP_COUNTER = 0
 
 
 def _detect_gui_capable() -> bool:
@@ -75,6 +97,101 @@ def _detect_gui_capable() -> bool:
         return False
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Preset calibration poses (from rebot_grasp/scripts/calibrate_top_camera.py)
+# Cartesian pose sequence around the workspace center (0.30, -0.05, 0.28)
+# in the arm's base frame. Pitch is kept small so the gripper stays near
+# horizontal -- the ArUco marker (Solution B in 04b: pasted on the
+# gripper top with normal +Z) stays face-on to the top camera.
+# Source: rebot_grasp/scripts/calibrate_top_camera.py:46-91, copied
+# verbatim (rebot_grasp notes the same source: wrc_demo calib_top_orbbec.py,
+# so both files have always held identical pose data -- this rewrite
+# adopts rebot_grasp's provenance comment for clarity).
+# ──────────────────────────────────────────────────────────────────────
+TOP_CALIB_POSES: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = [
+    # 1. Roll sweep at base (0.30, -0.05, 0.28)
+    ((0.30, -0.05, 0.28), ( 0.00, 0.00, -0.50)),
+    ((0.30, -0.05, 0.28), ( 0.00, 0.00,  0.00)),
+    ((0.30, -0.05, 0.28), ( 0.00, 0.00,  0.50)),
+    # 2. Yaw sweep
+    ((0.30, -0.05, 0.28), (-0.60, 0.00,  0.00)),
+    ((0.30, -0.05, 0.28), (-0.30, 0.00,  0.00)),
+    ((0.30, -0.05, 0.28), ( 0.30, 0.00,  0.00)),
+    ((0.30, -0.05, 0.28), ( 0.60, 0.00,  0.00)),
+    # 3. Pitch lift + roll combos
+    ((0.30, -0.05, 0.28), ( 0.00, 0.20,  0.00)),
+    ((0.30, -0.05, 0.28), ( 0.00, 0.20,  0.50)),
+    ((0.30, -0.05, 0.28), ( 0.00, 0.20, -0.50)),
+    ((0.30, -0.05, 0.28), ( 0.00, 0.20, -1.00)),
+    ((0.30, -0.05, 0.28), ( 0.00, 0.40,  0.00)),
+    ((0.30, -0.05, 0.28), ( 0.00, 0.40,  0.50)),
+    ((0.30, -0.05, 0.28), ( 0.00, 0.40, -0.50)),
+    # 4. X / Y / Z translation sweep around the center
+    ((0.25, -0.05, 0.28), ( 0.00, 0.00,  0.00)),
+    ((0.25, -0.05, 0.28), ( 0.00, 0.20,  0.50)),
+    ((0.35, -0.05, 0.28), ( 0.00, 0.00,  0.00)),
+    ((0.35, -0.05, 0.28), ( 0.00, 0.20, -0.50)),
+    ((0.30, -0.10, 0.28), ( 0.00, 0.00,  0.00)),
+    ((0.30, -0.10, 0.28), ( 0.20, 0.20,  0.50)),
+    ((0.30, -0.05, 0.30), ( 0.00, 0.00,  0.00)),
+    ((0.30, -0.05, 0.32), ( 0.00, 0.00,  0.00)),
+    ((0.30,  0.00, 0.28), ( 0.00, 0.00,  0.00)),
+    ((0.30,  0.00, 0.28), ( 0.00, 0.20,  0.50)),
+    ((0.30,  0.05, 0.28), ( 0.00, 0.00,  0.00)),
+    ((0.30, -0.05, 0.22), ( 0.00, 0.20,  0.50)),
+    ((0.30, -0.05, 0.35), ( 0.00, 0.00,  0.00)),
+    ((0.30, -0.05, 0.35), ( 0.00, 0.20, -0.50)),
+    # 5. Combined rotations at four workspace corners
+    ((0.25, -0.05, 0.25), ( 0.30, 0.20,  0.50)),
+    ((0.25,  0.00, 0.25), (-0.30, 0.20, -0.50)),
+    ((0.35, -0.05, 0.25), (-0.30, 0.20,  0.50)),
+    ((0.35,  0.00, 0.25), ( 0.30, 0.20, -0.50)),
+    # 6. Extreme combined angles (probe IK feasibility)
+    ((0.30, -0.05, 0.28), (-0.40, 0.20, -1.00)),
+    ((0.30, -0.05, 0.28), (-0.30, 0.30, -1.00)),
+    ((0.30, -0.05, 0.28), ( 0.60, 0.20,  0.30)),
+    ((0.30, -0.05, 0.28), (-0.60, 0.20, -0.30)),
+    ((0.30, -0.05, 0.28), ( 0.50, 0.30,  0.50)),
+    ((0.30, -0.05, 0.28), (-0.50, 0.30, -0.50)),
+]
+
+# Auto-mode timing constants (match rebot_grasp; calibration needs
+# settle time before PnP reprojection is reliable).
+AUTO_MOVE_DURATION_S = 3.0
+AUTO_SETTLE_EXTRA_S = 0.6
+AUTO_MARKER_TIMEOUT_S = 2.5
+AUTO_MARKER_STABLE_FRAMES = 4
+MIN_CALIB_SAMPLES = 5
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Math helpers
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _pose_to_T(
+    xyz: tuple[float, float, float],
+    rpy: tuple[float, float, float],
+) -> np.ndarray:
+    """xyz (m) + rpy (rad) -> 4x4 SE(3) pose. Mirrors ``pose_to_T`` in
+    cuRobo's calibration module so the pose sequence can be copied
+    verbatim across the two codebases.
+
+    Rotation order: Rz @ Ry @ Rx (ZYX extrinsic / XYZ intrinsic -- the
+    convention rebot_grasp and cuRobo 04b both use).
+    """
+    T = np.eye(4, dtype=np.float64)
+    T[:3, 3] = xyz
+    cr, sr = np.cos(rpy[0]), np.sin(rpy[0])
+    cp, sp = np.cos(rpy[1]), np.sin(rpy[1])
+    cy, sy = np.cos(rpy[2]), np.sin(rpy[2])
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    T[:3, :3] = Rz @ Ry @ Rx
+    return T
+
+
 def _make_kinematics(arm_profile: str = ARM_PROFILE_DEFAULT) -> Kinematics:
     """Construct the wrc_demo FK on the RS URDF (mirrored joint convention)."""
     if not URDF_DEFAULT.exists():
@@ -82,11 +199,311 @@ def _make_kinematics(arm_profile: str = ARM_PROFILE_DEFAULT) -> Kinematics:
             f"RS URDF not found at {URDF_DEFAULT}; run from the wrc_demo repo root"
         )
     return Kinematics(
-        model_path=str(URDF_DEFAULT),
+        urdf_path=str(URDF_DEFAULT),
         ee_frame="gripper_end",
-        n_controlled=6,
-        joint_signs=[-1, -1, -1, -1, -1, -1],
+        arm_joint_count=6,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Manual mode: gravity compensation controller (ported from rebot_grasp)
+#
+# Uses the vendored ``reBotArm_control_py`` SDK directly (bypasses
+# SafeArm) to drive MIT-mode + gravity feed-forward at the SDK's native
+# control rate (~500 Hz). This is the same pattern as
+# ``skills/teach.py`` (see CLAUDE.md "Motion safety path" exception
+# clause) -- external-event-triggered control loops bypass SafeArm's
+# trajectory streaming because SafeArm only exposes ``move_joints``.
+#
+# The operator can hand-guide the arm while the controller compensates
+# for gravity + tracks the current pose. End-effector velocity locking
+# (V_THRESH / W_THRESH) latches the target when motion is detected, so
+# the operator feels the arm "freeze" when they stop moving and re-engage
+# as they push it again.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _ensure_sdk_on_path(sdk_path: str) -> None:
+    """Insert the vendored SDK root into ``sys.path`` so the
+    ``reBotArm_control_py`` package becomes importable.
+
+    Idempotent; mirrors the pattern in ``control/rebot_rs_arm.py``.
+    """
+    if sdk_path and sdk_path not in sys.path:
+        sys.path.insert(0, sdk_path)
+
+
+class GravityCompController:
+    """MIT mode + gravity FF + end-effector velocity locking.
+
+    Ported from rebot_grasp/scripts/calibrate_top_camera.py::GravityCompController
+    with vendored SDK paths swapped in. KP/KD/V_THRESH/W_THRESH match
+    rebot_grasp; the 500 Hz control rate matches the SDK's
+    ``arm.start_control_loop(rate=...)`` default.
+    """
+
+    KP = 8.0
+    KD = 1.5
+    V_THRESH = 0.04   # End-effector linear velocity threshold (m/s)
+    W_THRESH = 0.08   # End-effector angular velocity threshold (rad/s)
+
+    def __init__(self, arm, *, sdk_path: str | None = None,
+                 urdf_path: str | None = None) -> None:
+        # Lazy imports -- the SDK pulls in pinocchio + the rebot arm
+        # drivers, which is heavy and unavailable in the dry-run env.
+        _ensure_sdk_on_path(sdk_path or str(PACKAGE_ROOT / "sdk"))
+        from reBotArm_control_py.dynamics.inverse_dynamics import (  # type: ignore
+            compute_generalized_gravity,
+        )
+        from reBotArm_control_py.kinematics.robot_model import (  # type: ignore
+            load_robot_model,
+            get_end_effector_frame_id,
+            pad_q_for_model,
+        )
+        import pinocchio as pin  # type: ignore
+
+        self._compute_gravity = compute_generalized_gravity
+        self._pad_q_for_model = pad_q_for_model
+        self._pin = pin
+
+        self._arm = arm
+        if not arm.has_gripper:
+            raise ValueError(
+                "Hardware config is missing groups.gripper. "
+                "Enable the gripper group in the selected hardware YAML under "
+                "sdk/config."
+            )
+        # load_robot_model() defaults to the SDK-shipped URDF; we pass
+        # the wrC URDF explicitly so the gravity comp uses the same model
+        # as the rest of the calibration pipeline (joint_signs baked in).
+        urdf = urdf_path or str(URDF_DEFAULT)
+        if not Path(urdf).exists():
+            raise FileNotFoundError(f"URDF not found at {urdf}")
+        self._model = load_robot_model(urdf)
+        self._data = self._model.createData()
+        self._ee_id = get_end_effector_frame_id(self._model)
+
+        self._n: Optional[int] = None
+        self._q_target: Optional[np.ndarray] = None
+        self._integral: Optional[np.ndarray] = None
+        self._gc_running = threading.Event()
+        self._io_lock = threading.RLock()
+
+    def start(self) -> None:
+        """Connect (idempotent if already connected), enable, set MIT
+        mode, and start the gravity-compensation control loop."""
+        self._arm.connect()
+        print("[GravityComp] Connected", file=sys.stderr)
+
+        self._arm.arm.mode_mit(
+            kp=np.full(self._arm.arm.num_joints, self.KP),
+            kd=np.full(self._arm.arm.num_joints, self.KD),
+        )
+        self._arm.gripper.mode_mit()
+        self._arm.enable_all()
+        print("[GravityComp] Enabled", file=sys.stderr)
+
+        n = self._arm.arm.num_joints
+        self._n = n
+        self._wait_state_valid()
+        with self._io_lock:
+            q0 = self._arm.get_state()[0][:n]
+        self._q_target = q0.copy()
+        self._integral = np.zeros(n)
+
+        print(
+            f"[GravityComp] MIT mode, kp={self.KP} kd={self.KD}. "
+            "Move the arm by hand.", file=sys.stderr,
+        )
+
+        self._gc_running.set()
+        self._arm.start_control_loop(self._worker, rate=self._arm.rate)
+
+    def _wait_state_valid(self, timeout: float = 2.0) -> None:
+        """Wait until all motor feedback is available."""
+        t_end = time.monotonic() + timeout
+        while time.monotonic() < t_end:
+            with self._io_lock:
+                self._arm.get_state()
+                ok = all(
+                    m.get_state() is not None
+                    for m in self._arm._motor_map.values()
+                )
+            if ok:
+                return
+            time.sleep(0.02)
+        raise RuntimeError("[GravityComp] Arm feedback is not ready")
+
+    def read_q(self, n: int | None = None) -> Optional[np.ndarray]:
+        """Read the current arm joint state. Returns ``None`` on failure.
+
+        Used by the gravity-comp collection loop to feed FK after a
+        stable marker detection.
+        """
+        if self._n is None:
+            return None
+        try:
+            with self._io_lock:
+                q_all, _, _ = self._arm.get_state()
+            return np.asarray(q_all[: self._n], dtype=float)
+        except Exception as e:
+            print(f"[GravityComp] read_q failed: {e}", file=sys.stderr)
+            return None
+
+    def safe_home(self) -> None:
+        """Stop gravity compensation, drive to home with a fresh SDK
+        controller, then disconnect. Mirrors rebot_grasp's
+        ``GravityCompController.safe_home`` -- uses ``RebotArmEndPose``
+        (vendored SDK) directly because the arm is in raw MIT mode and
+        cannot accept ``SafeArm.home()``.
+        """
+        self._gc_running.clear()
+        try:
+            print("[GravityComp] Homing...", file=sys.stderr)
+            self._arm.stop_control_loop()
+            n = self._n or self._arm.arm.num_joints
+            with self._io_lock:
+                q_now = self._arm.get_state()[0][:n]
+                g_now = (
+                    self._arm.gripper.get_positions()
+                    if self._arm.has_gripper else np.array([])
+                )
+
+            _ensure_sdk_on_path(str(PACKAGE_ROOT / "sdk"))
+            from reBotArm_control_py.controllers import (  # type: ignore
+                RebotArmEndPose,
+            )
+            ctrl = RebotArmEndPose(
+                self._arm,
+                arm_control_mode="mit",
+                use_gravity_ff=True,
+            )
+            ctrl.set_gripper_target(float(g_now[0]) if g_now.size else 0.0)
+            ctrl._q_target[:] = q_now
+            ctrl.start()
+            ctrl.safe_home()
+            self._arm.stop_control_loop()
+        except Exception as e:
+            print(f"[GravityComp] Homing failed: {e}", file=sys.stderr)
+        try:
+            self._arm.disconnect()
+        except Exception:
+            pass
+        print("[GravityComp] Disconnected", file=sys.stderr)
+
+    def _worker(self, r, dt: float) -> None:
+        if not self._gc_running.is_set():
+            return
+
+        pin = self._pin
+        model, data, ee_id = self._model, self._data, self._ee_id
+        n = self._n
+        KP, KD = self.KP, self.KD
+
+        try:
+            with self._io_lock:
+                q_all, qd_all, _ = r.get_state()
+            q = q_all[:n]
+            qd = qd_all[:n]
+            q_model = self._pad_q_for_model(model, q, n)
+            tau_g = self._compute_gravity(model=model, q=q_model)[:n]
+
+            q_err = self._q_target - q
+            self._integral += q_err
+            np.clip(self._integral, -0.5, 0.5, out=self._integral)
+
+            qd_model = np.zeros(model.nv)
+            qd_model[: min(model.nv, n)] = qd[: min(model.nv, n)]
+            pin.computeJointJacobians(model, data, q_model)
+            pin.updateFramePlacements(model, data)
+            J = pin.getFrameJacobian(model, data, ee_id, pin.ReferenceFrame.WORLD)
+            v = J @ qd_model
+
+            if (np.linalg.norm(v[:3]) > self.V_THRESH or
+                    np.linalg.norm(v[3:]) > self.W_THRESH):
+                self._q_target = q.copy()
+                self._integral *= 0.9
+
+            with self._io_lock:
+                r.arm.send_mit(
+                    pos=self._q_target,
+                    vel=np.zeros(n),
+                    kp=np.full(n, KP),
+                    kd=np.full(n, KD),
+                    tau=tau_g + self._integral,
+                )
+                r.gripper.send_mit(r.gripper.get_positions())
+        except Exception:
+            # Silent: the worker fires at 500 Hz; transient state-read
+            # glitches (motor not ready yet) shouldn't bring the loop down.
+            pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Cleanup (wrc_demo contract; rebot_grasp has no equivalent)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _make_arm_cleanup(safe_arm, *, label: str = "calib_top") -> Callable[[], None]:
+    """Idempotent, no-raise cleanup: parks to home via ``SafeArm.home()``
+    then disconnects. Safe to call from atexit + signal handler +
+    explicit ``finally`` -- the inner guard makes it idempotent.
+
+    ``getattr`` guards let the cleanup tolerate stub arms that lack
+    ``home`` / ``disconnect`` (test fixtures + manual modes where no
+    arm is connected).
+    """
+    if safe_arm is None:
+        return lambda: None
+    done = [False]
+    home_fn = getattr(safe_arm, "home", None)
+    disconnect_fn = getattr(safe_arm, "disconnect", None)
+
+    def cleanup() -> None:
+        if done[0]:
+            return
+        done[0] = True
+        safe_park_and_disconnect(
+            park_fn=(lambda: home_fn(duration_s=3.0))
+            if callable(home_fn) else None,
+            disconnect_fn=disconnect_fn
+            if callable(disconnect_fn) else None,
+            label=label,
+        )
+
+    return cleanup
+
+
+def _register_process_cleanup(cleanup: Callable[[], None]) -> None:
+    """Register ``cleanup`` as an atexit hook + SIGTERM handler so any
+    abnormal exit (Ctrl+C in bash, ``kill``, unhandled exception,
+    ``sys.exit``) parks the arm to home and disconnects instead of
+    leaving it at the last collection pose with motors enabled.
+    """
+    atexit.register(cleanup)
+    try:
+        prev = _signal.getsignal(_signal.SIGTERM)
+    except (ValueError, OSError):
+        return  # not in main thread
+
+    def _on_term(sig, frame):
+        cleanup()
+        if callable(prev) and prev not in (_signal.SIG_DFL, _signal.SIG_IGN):
+            try:
+                prev(sig, frame)
+            except Exception:
+                pass
+        raise SystemExit(128 + sig)
+
+    try:
+        _signal.signal(_signal.SIGTERM, _on_term)
+    except (ValueError, OSError):
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Camera / serial helpers
+# ──────────────────────────────────────────────────────────────────────
 
 
 def _print_devices() -> int:
@@ -109,14 +526,17 @@ def _print_devices() -> int:
 
 def _bind_role(role: str, serial: str | None = None, index: int | None = None) -> int:
     """Persist role -> serial in ``cameras.json``. If ``serial`` is omitted
-    we use the first enumerated device whose index matches ``--index``."""
+    we use the first enumerated device whose index matches ``--index``.
+    """
     role = role.lower()
     if role not in {"top", "wrist"}:
         print(f"[calib] bind: role must be 'top' or 'wrist', got {role!r}", file=sys.stderr)
         return 2
     CALIB_DIR.mkdir(parents=True, exist_ok=True)
     p = CALIB_DIR / "cameras.json"
-    existing = CamerasBinding.from_json(json.loads(p.read_text())) if p.exists() else CamerasBinding()
+    existing = (
+        CamerasBinding.from_json(json.loads(p.read_text())) if p.exists() else CamerasBinding()
+    )
     if serial is None:
         devices = list_orbbec_devices()
         if not devices:
@@ -124,18 +544,22 @@ def _bind_role(role: str, serial: str | None = None, index: int | None = None) -
             return 1
         idx = index if index is not None else 0
         if idx < 0 or idx >= len(devices):
-            print(f"[calib] bind: index {idx} out of range (0..{len(devices)-1})", file=sys.stderr)
+            print(f"[calib] bind: index {idx} out of range (0..{len(devices) - 1})", file=sys.stderr)
             return 1
         serial = str(devices[idx].get("serial", ""))
         index = int(devices[idx].get("index", idx))
     binding = CameraBinding(serial=serial, index_when_bound=index if index is not None else -1)
     if role == "top":
         updated = CamerasBinding(
-            top=binding, wrist=existing.wrist, updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            top=binding,
+            wrist=existing.wrist,
+            updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         )
     else:
         updated = CamerasBinding(
-            top=existing.top, wrist=binding, updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            top=existing.top,
+            wrist=binding,
+            updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         )
     p.write_text(json.dumps(updated.to_json(), indent=2, sort_keys=True))
     print(f"[calib] bound {role} -> serial={serial} (index {binding.index_when_bound}); wrote {p}")
@@ -196,89 +620,131 @@ def _wait_for_user(prompt: str) -> None:
         pass
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Auto-mode calibration (cuRobo 04b-style state machine, Cartesian poses)
-# ─────────────────────────────────────────────────────────────────────────
-# Cartesian pose sequence around the workspace center (0.30, -0.05, 0.28)
-# in the arm's base frame. Pitch is kept small so the gripper stays near
-# horizontal -- the ArUco marker (Solution B in 04b: pasted on the
-# gripper top with normal +Z) stays face-on to the top camera.
-# Each pose is (xyz, rpy); see TOP_CALIB_POSES below.
-TOP_CALIB_POSES: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = [
-    # 1. Roll sweep at base (0.30, -0.05, 0.28)
-    ((0.30, -0.05, 0.28), ( 0.00, 0.00, -0.50)),
-    ((0.30, -0.05, 0.28), ( 0.00, 0.00,  0.00)),
-    ((0.30, -0.05, 0.28), ( 0.00, 0.00,  0.50)),
-    # 2. Yaw sweep
-    ((0.30, -0.05, 0.28), (-0.60, 0.00,  0.00)),
-    ((0.30, -0.05, 0.28), (-0.30, 0.00,  0.00)),
-    ((0.30, -0.05, 0.28), ( 0.30, 0.00,  0.00)),
-    ((0.30, -0.05, 0.28), ( 0.60, 0.00,  0.00)),
-    # 3. Pitch lift + roll combos
-    ((0.30, -0.05, 0.28), ( 0.00, 0.20,  0.00)),
-    ((0.30, -0.05, 0.28), ( 0.00, 0.20,  0.50)),
-    ((0.30, -0.05, 0.28), ( 0.00, 0.20, -0.50)),
-    ((0.30, -0.05, 0.28), ( 0.00, 0.20, -1.00)),
-    ((0.30, -0.05, 0.28), ( 0.00, 0.40,  0.00)),
-    ((0.30, -0.05, 0.28), ( 0.00, 0.40,  0.50)),
-    ((0.30, -0.05, 0.28), ( 0.00, 0.40, -0.50)),
-    # 4. X / Y / Z translation sweep around the center
-    ((0.25, -0.05, 0.28), ( 0.00, 0.00,  0.00)),
-    ((0.25, -0.05, 0.28), ( 0.00, 0.20,  0.50)),
-    ((0.35, -0.05, 0.28), ( 0.00, 0.00,  0.00)),
-    ((0.35, -0.05, 0.28), ( 0.00, 0.20, -0.50)),
-    ((0.30, -0.10, 0.28), ( 0.00, 0.00,  0.00)),
-    ((0.30, -0.10, 0.28), ( 0.20, 0.20,  0.50)),
-    ((0.30, -0.05, 0.30), ( 0.00, 0.00,  0.00)),
-    ((0.30, -0.05, 0.32), ( 0.00, 0.00,  0.00)),
-    ((0.30,  0.00, 0.28), ( 0.00, 0.00,  0.00)),
-    ((0.30,  0.00, 0.28), ( 0.00, 0.20,  0.50)),
-    ((0.30,  0.05, 0.28), ( 0.00, 0.00,  0.00)),
-    ((0.30, -0.05, 0.22), ( 0.00, 0.20,  0.50)),
-    ((0.30, -0.05, 0.35), ( 0.00, 0.00,  0.00)),
-    ((0.30, -0.05, 0.35), ( 0.00, 0.20, -0.50)),
-    # 5. Combined rotations at four workspace corners
-    ((0.25, -0.05, 0.25), ( 0.30, 0.20,  0.50)),
-    ((0.25,  0.00, 0.25), (-0.30, 0.20, -0.50)),
-    ((0.35, -0.05, 0.25), (-0.30, 0.20,  0.50)),
-    ((0.35,  0.00, 0.25), ( 0.30, 0.20, -0.50)),
-    # 6. Extreme combined angles (probe IK feasibility)
-    ((0.30, -0.05, 0.28), (-0.40, 0.20, -1.00)),
-    ((0.30, -0.05, 0.28), (-0.30, 0.30, -1.00)),
-    ((0.30, -0.05, 0.28), ( 0.60, 0.20,  0.30)),
-    ((0.30, -0.05, 0.28), (-0.60, 0.20, -0.30)),
-    ((0.30, -0.05, 0.28), ( 0.50, 0.30,  0.50)),
-    ((0.30, -0.05, 0.28), (-0.50, 0.30, -0.50)),
-]
+# ──────────────────────────────────────────────────────────────────────
+# Frame grab / ArUco detection helpers
+# ──────────────────────────────────────────────────────────────────────
 
 
-def _pose_to_T(
-    xyz: tuple[float, float, float],
-    rpy: tuple[float, float, float],
-) -> np.ndarray:
-    """xyz (m) + rpy (rad) -> 4x4 SE(3) pose. Mirrors ``pose_to_T`` in
-    cuRobo's calibration module so the pose sequence can be copied
-    verbatim across the two codebases.
+def _grab_color(cam) -> Optional[np.ndarray]:
+    """Read one frame; return the BGR array or None on failure.
+
+    Returns BGR (``Frame.rgb`` is BGR despite the name -- see CLAUDE.md
+    contract).
     """
-    T = np.eye(4, dtype=np.float64)
-    T[:3, 3] = xyz
-    cr, sr = np.cos(rpy[0]), np.sin(rpy[0])
-    cp, sp = np.cos(rpy[1]), np.sin(rpy[1])
-    cy, sy = np.cos(rpy[2]), np.sin(rpy[2])
-    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
-    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
-    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
-    T[:3, :3] = Rz @ Ry @ Rx
-    return T
+    try:
+        f = cam.get_frame()
+    except Exception:
+        return None
+    return f.rgb
+
+
+def _stable_detect(
+    cam, aruco, K, D, marker_size_m,
+    *, settle_time: float, marker_timeout: float, stable_frames: int,
+) -> tuple[object | None, list[object]]:
+    """Grab frames until the marker has been stable for N consecutive
+    detections or ``settle_time + marker_timeout`` elapses.
+
+    Returns ``(best_detection, all_detections)``.
+    """
+    best = None
+    stable_count = 0
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < settle_time + marker_timeout:
+        try:
+            frame = cam.get_frame()
+        except Exception:
+            time.sleep(0.1)
+            continue
+        det = aruco.detect(frame.rgb, K, D, marker_size_m)
+        if det is None:
+            stable_count = 0
+            time.sleep(0.05)
+            continue
+        stable_count += 1
+        best = det
+        if stable_count >= stable_frames:
+            return det, []
+    return best, []
+
+
+# ──────────────────────────────────────────────────────────────────────
+# OSD / HUD (rebot_grasp style: clean status text + sample progress bar)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _draw_osd(
+    vis: np.ndarray,
+    *,
+    pose_label: str,
+    n_samples: int,
+    target_n: int,
+    state: str,
+    marker_id: Optional[int] = None,
+    marker_z: Optional[float] = None,
+    mode: str = "AUTO",
+    capture_flash: bool = False,
+) -> None:
+    """Draw the calibrator HUD on top of `vis` (in place).
+
+    Style mirrors rebot_grasp/scripts/calibrate_top_camera.py: status
+    text drawn directly on the frame (no opaque top panel) with color
+    coding by marker-detection state, plus a sample-count progress bar
+    and a mode label in the bottom-right corner.
+    """
+    h, w = vis.shape[:2]
+
+    if marker_id is not None and marker_z is not None:
+        status_color = (80, 220, 80)
+        status_text = f"[ID={marker_id}] z={marker_z:.3f}m  samples:{n_samples}/{target_n}"
+    else:
+        status_color = (80, 80, 220)
+        status_text = f"No marker  samples:{n_samples}/{target_n}"
+    cv2.putText(
+        vis, status_text, (10, 28),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 1, cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        vis, f"{pose_label[:60]}  --  {state[:40]}",
+        (10, 50),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 60), 1, cv2.LINE_AA,
+    )
+
+    bar_max = max(target_n, 1)
+    filled = min(n_samples, target_n) * (400 // bar_max)
+    cv2.rectangle(vis, (10, 70), (10 + filled, 82), (0, 200, 100), -1)
+    cv2.rectangle(vis, (10, 70), (410, 82), (160, 160, 160), 1)
+    cv2.putText(
+        vis, f"{n_samples}/{target_n}", (10, 95),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        vis, mode, (max(w - 200, 10), h - 10),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 60), 1, cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        vis, "press 'c' or 'q' to finish early, ESC to abort",
+        (10, h - 10),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA,
+    )
+
+    if capture_flash:
+        cv2.rectangle(vis, (0, 0), (w - 1, h - 1), (0, 255, 0), 6)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# CAN bus + arm connection (wrc_demo helpers; rebot_grasp uses different
+# APIs and we bridge to wrC's make_arm() factory).
+# ──────────────────────────────────────────────────────────────────────
 
 
 def _diagnose_can_bus() -> str | None:
     """Return a human-readable diagnostic string if the CAN bus looks
     unhealthy (ERROR-PASSIVE / BUS-OFF / bitrate wrong / no device),
     else ``None``.
-
-    Surfaces the most common rig bring-up mistakes before the arm
-    connect timeout swallows them.
     """
     import subprocess
 
@@ -316,95 +782,548 @@ def _connect_arm_with_safety(arm_cfg_path: str):
     profile. Returns ``None`` if the arm can't be connected (so the
     caller can fall back to manual mode).
 
-    Retries ``connect()`` once after a short delay if the first attempt
-    fails with the typical "CAN buffer full" symptom (which happens
-    when motorbridge's enable_all + mode_mit sequence floods a freshly
-    restarted bus). The retry usually succeeds because the SDK has
-    drained its queue during the wait.
+    ``make_arm`` already calls connect() + clear_error() +
+    start_control_loop internally; we verify with a quick get_state() read
+    and propagate any failure as a clean error string.
     """
-    import time as _t
-
-    from ..config import Cfg, load_profile
-    from ..safety.harness import SafetyHarness, SafetyLimits, SafeArm
-    from ..control.arm_base import make_arm
+    from ..config import load_demo_config, load_profile
+    from ..control import make_arm
 
     arm_prof = load_profile("arms", arm_cfg_path)
+    # load_demo_config returns a full cfg (camera + arm + llm + safety);
+    # make_arm needs the whole cfg, not just the arm profile.
+    demo_cfg = load_demo_config(camera="mock", arm=arm_cfg_path, llm="mock")
     kin = Kinematics(
-        model_path=str(arm_prof.model),
-        ee_frame=str(arm_prof.get("ee_frame", "gripper_end")),
-        n_controlled=int(arm_prof.get("n_joints", 6)),
-        joint_signs=arm_prof.get("joint_signs"),
+        urdf_path=str(demo_cfg.arm.urdf),
+        ee_frame=str(demo_cfg.arm.get("ee_frame", "gripper_end")),
+        arm_joint_count=int(demo_cfg.arm.get("n_joints", 6)),
     )
-    arm_raw = make_arm(arm_prof, kinematics=kin)
+    safe_arm = make_arm(demo_cfg, kinematics=kin)
 
-    last_err: str | None = None
-    for attempt in range(2):
-        try:
-            arm_raw.connect()
-            last_err = None
-            break
-        except Exception as e:
-            last_err = f"connect failed (attempt {attempt + 1}): {e}"
-            # Try to release any half-open state before retrying.
-            try:
-                arm_raw.disconnect()
-            except Exception:
-                pass
-            if attempt == 0:
-                _t.sleep(2.0)  # give the CAN controller time to drain
-    if last_err is not None:
-        return None, last_err
-
-    # Construct harness using the demo's cfg.safety; fall back to file
-    # load if not provided (this CLI runs standalone, no cfg.safety).
     try:
-        from ..config import load_demo_config
-        demo_cfg = load_demo_config(camera="mock", arm=arm_cfg_path, llm="mock")
-        safety_limits = SafetyLimits.from_config(demo_cfg.safety)
+        _ = safe_arm.get_state()
+    except Exception as e:
+        try:
+            safe_arm.disconnect()
+        except Exception:
+            pass
+        return None, f"post-connect state read failed: {e}"
+    return (kin, safe_arm, safe_arm._arm), None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Auto-mode state machine (ported from rebot_grasp's tick_auto pattern)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _collect_loop_auto(
+    safe_arm, kin, aruco, cam, K, D,
+    *, n_target: int, marker_size_m: float, settle_time: float,
+    marker_timeout: float, stable_frames: int,
+    samples: list[CalibrationSample], trace,
+    win_name: str, show_window: bool,
+) -> tuple[list[CalibrationSample], str]:
+    """Auto-mode: idle -> moving -> settling -> searching -> capture -> idle.
+
+    Faithful port of rebot_grasp/scripts/calibrate_top_camera.py's
+    ``tick_auto`` state machine. Differences vs. rebot_grasp:
+      - IK via ``Kinematics.ik`` (Pinocchio on RS URDF, joint_signs baked)
+      - Motion via ``safe_arm.move_joints`` (SafetyHarness + velocity cap)
+      - Per-pose IK/move failures are skipped + logged, not retried
+    """
+    finish_reason = "all target poses done"
+    target_n = max(n_target, len(TOP_CALIB_POSES))
+    snap_counter = [0]
+
+    def _stop_requested() -> tuple[bool, str]:
+        key = cv2.waitKey(30) & 0xFF if show_window else 0
+        if key in (ord('q'), ord('Q'), ord('c'), ord('C'), 27):
+            return True, "user finish (key)"
+        if show_window:
+            try:
+                if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+                    return True, "user finish (window closed)"
+            except cv2.error:
+                return True, "user finish (window gone)"
+        return False, ""
+
+    def _record_sample(best, pose_idx: int, xyz, rpy, q_target: np.ndarray) -> None:
+        # Use safe_arm.get_state() (truncates to n_arm joints); falls back
+        # to the last commanded q if state read fails (very rare).
+        try:
+            st = safe_arm.get_state()
+            q = np.asarray(st.q, dtype=float)[: safe_arm.n_joints]
+        except Exception:
+            q = q_target
+        G = kin.fk(q)
+        sample = CalibrationSample(
+            pose_label=f"auto_{pose_idx + 1:02d}",
+            T_gripper2base=G,
+            T_marker2cam=best.T_marker2cam,
+            aruco_reprojection_px=float(best.reprojection_rmse_px),
+            inlier=True,
+        )
+        samples.append(sample)
+        trace.write(json.dumps({
+            "event": "sample_recorded", "i": pose_idx, "ts": time.time(),
+            "q": q.tolist(),
+            "pose_label": f"xyz={xyz} rpy={rpy}",
+            "aruco_rmse_px": float(best.reprojection_rmse_px),
+        }) + "\n")
+        print(
+            f"[calib] captured sample {len(samples)}: "
+            f"xyz=({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f}) "
+            f"rpy=({rpy[0]:+.2f},{rpy[1]:+.2f},{rpy[2]:+.2f}); "
+            f"aruco rmse={best.reprojection_rmse_px:.2f}px"
+        )
+
+    def _draw_with_hud(
+        color: np.ndarray, det, pose_label: str, n: int, state: str,
+        *, capture_flash: bool = False,
+    ) -> None:
+        overlay = (
+            aruco.draw_aruco_overlay(color, det)
+            if det is not None else color
+        )
+        _draw_osd(
+            overlay,
+            pose_label=pose_label,
+            n_samples=n,
+            target_n=target_n,
+            state=state,
+            marker_id=getattr(det, "id", None) if det is not None else None,
+            marker_z=(det.T_marker2cam[2, 3]
+                      if det is not None and hasattr(det, "T_marker2cam") else None),
+            mode="AUTO",
+            capture_flash=capture_flash,
+        )
+        if show_window:
+            cv2.imshow(win_name, overlay)
+        else:
+            # Headless fallback: 1-of-every-SNAP_EVERY frames + every detection.
+            snap_counter[0] += 1
+            if det is not None or snap_counter[0] % SNAP_EVERY == 0:
+                try:
+                    label = "det" if det is not None else "nodet"
+                    out = overlay if det is not None else color
+                    cv2.imwrite(
+                        str(SNAP_DIR / f"f{snap_counter[0]:05d}_{label}.png"),
+                        out,
+                    )
+                except Exception:
+                    pass
+
+    last_q: list[Optional[np.ndarray]] = [None]
+
+    try:
+        for idx, (xyz, rpy) in enumerate(TOP_CALIB_POSES):
+            pose_label = (
+                f"xyz=({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f}) "
+                f"rpy=({rpy[0]:+.2f},{rpy[1]:+.2f},{rpy[2]:+.2f})"
+            )
+            print(f"\n[calib] auto pose {idx + 1}/{target_n}: {pose_label}")
+
+            # IK. Seed from previous solution when available.
+            T_target = _pose_to_T(xyz, rpy)
+            q_init = (last_q[0] if last_q[0] is not None
+                      else np.zeros(safe_arm.n_joints, dtype=float))
+            ik = kin.ik(T_target, q_init, retries=2)
+            if not ik.success:
+                print(
+                    f"[calib] pose {idx + 1}: IK failed (error={ik.error:.4f}); "
+                    "skipping", file=sys.stderr,
+                )
+                trace.write(json.dumps({
+                    "event": "pose_skipped", "i": idx, "ts": time.time(),
+                    "reason": "ik_failed",
+                }) + "\n")
+                continue
+            q_target = np.asarray(ik.q, dtype=float)[: safe_arm.n_joints]
+            last_q[0] = q_target
+
+            # Refresh safety harness's perception watchdog. Calibration
+            # is itself the only perception consumer here; the watchdog
+            # was last touched at connect() -- too long ago.
+            if hasattr(safe_arm, "harness") and hasattr(safe_arm.harness, "heartbeat"):
+                safe_arm.harness.heartbeat()
+
+            # Defensive pre-check: IK's ``limit_margin`` (0.025) should
+            # keep us clear of the harness's ``joint_margin`` (0.020), but
+            # empirical runs at workspace edges (e.g. xyz=(0.25, ...))
+            # have produced q with joint2 = 0.019 < URDF lower + margin.
+            # Reject such poses locally so we never call move_joints with
+            # a guaranteed-to-violate target -- the harness would raise
+            # ``SafetyViolation`` and crash the whole loop, losing all
+            # earlier samples. Wrapping move_joints in try/except (below)
+            # is the catch-all; this pre-check is the optimisation.
+            harness = getattr(safe_arm, "harness", None)
+            kin_for_limits = getattr(harness, "kin", None) if harness is not None else None
+            joint_limits = getattr(kin_for_limits, "joint_limits", None)
+            if joint_limits is not None:
+                margin = float(getattr(harness.limits, "joint_margin", 0.020))
+                lo, hi = joint_limits
+                lo = np.asarray(lo, dtype=float)[: safe_arm.n_joints] + margin
+                hi = np.asarray(hi, dtype=float)[: safe_arm.n_joints] - margin
+                viol = (q_target < lo) | (q_target > hi)
+                if viol.any():
+                    bad = np.where(viol)[0].tolist()
+                    print(
+                        f"[calib] pose {idx + 1}: IK solution violates "
+                        f"harness margin at joints {[i + 1 for i in bad]} "
+                        f"(q={q_target.round(3).tolist()}); skipping",
+                        file=sys.stderr,
+                    )
+                    trace.write(json.dumps({
+                        "event": "pose_skipped", "i": idx, "ts": time.time(),
+                        "reason": "ik_at_margin",
+                        "violated_joints": [i + 1 for i in bad],
+                    }) + "\n")
+                    continue
+
+            try:
+                ok = safe_arm.move_joints(q_target, duration_s=2.0)
+            except Exception as e:  # SafetyViolation + any hardware fault
+                # The harness's begin_motion / motion check raises on
+                # geometric violation (e.g. joint2 = 0.019 < 0.020).
+                # Skip this pose gracefully -- the rest of the loop
+                # should keep going so we still get >= 4 samples to fit.
+                # If we crash here, we lose every earlier sample.
+                print(
+                    f"[calib] pose {idx + 1}: safe_arm.move_joints raised "
+                    f"({type(e).__name__}: {e}); skipping", file=sys.stderr,
+                )
+                trace.write(json.dumps({
+                    "event": "pose_skipped", "i": idx, "ts": time.time(),
+                    "reason": "harness_raised",
+                    "exc_type": type(e).__name__,
+                    "exc_msg": str(e)[:200],
+                }) + "\n")
+                continue
+            if not ok:
+                print(
+                    f"[calib] pose {idx + 1}: safe_arm.move_joints refused; "
+                    "skipping", file=sys.stderr,
+                )
+                trace.write(json.dumps({
+                    "event": "pose_skipped", "i": idx, "ts": time.time(),
+                    "reason": "harness_refused",
+                }) + "\n")
+                continue
+
+            # Wait for arm to settle (best-effort; if backend lacks this,
+            # just sleep the configured settle_time).
+            arm = getattr(safe_arm, "_arm", safe_arm)
+            settled = True
+            if hasattr(arm, "wait_settled"):
+                settled = bool(arm.wait_settled(q_target, tol=0.05, timeout_s=5.0))
+                if not settled:
+                    print(
+                        f"[calib] pose {idx + 1}: arm didn't settle in 5s; "
+                        "continuing with detection anyway", file=sys.stderr,
+                    )
+
+            # State machine: settling -> searching -> (capture | skip).
+            t_settle_until = time.monotonic() + settle_time
+            t_timeout = t_settle_until + marker_timeout
+            stable_count = 0
+            best = None
+            phase = "settling"
+            while time.monotonic() < t_timeout:
+                stopped, reason = _stop_requested()
+                if stopped:
+                    finish_reason = reason
+                    return samples, finish_reason
+
+                color = _grab_color(cam)
+                if color is None:
+                    time.sleep(0.05)
+                    continue
+
+                if hasattr(safe_arm, "harness") and hasattr(safe_arm.harness, "heartbeat"):
+                    safe_arm.harness.heartbeat()
+
+                if phase == "settling" and time.monotonic() >= t_settle_until:
+                    phase = "searching"
+
+                det = aruco.detect(color, K, D, marker_size_m) if phase == "searching" else None
+                _draw_with_hud(
+                    color, det,
+                    pose_label=f"{idx + 1}/{target_n} {pose_label}",
+                    n=len(samples),
+                    state=(f"settling" if phase == "settling"
+                           else f"searching ({stable_count}/{stable_frames})"),
+                )
+
+                if det is None:
+                    stable_count = 0
+                    best = None
+                    time.sleep(0.05)
+                    continue
+                stable_count += 1
+                best = det
+                if stable_count >= stable_frames:
+                    break
+
+            if best is None:
+                print(
+                    f"[calib] pose {idx + 1}: marker not detected within timeout; "
+                    "skipping", file=sys.stderr,
+                )
+                trace.write(json.dumps({
+                    "event": "sample_skipped", "i": idx, "ts": time.time(),
+                    "reason": "no_marker",
+                }) + "\n")
+                continue
+
+            # Capture-flash HUD: one extra frame with green border so the
+            # operator sees when a sample was recorded. Skip if no frame
+            # is available (camera hiccup) -- no point drawing the flash
+            # on a blank canvas.
+            color = _grab_color(cam)
+            if color is not None:
+                vis = color.copy()
+                _draw_with_hud(
+                    vis, best,
+                    pose_label=f"{idx + 1}/{target_n} {pose_label}",
+                    n=len(samples) + 1,
+                    state=f"captured ({stable_count}/{stable_frames})",
+                    capture_flash=True,
+                )
+                if show_window:
+                    cv2.waitKey(120)
+                else:
+                    try:
+                        cv2.imwrite(
+                            str(SNAP_DIR / f"capture_{len(samples):02d}.png"),
+                            vis,
+                        )
+                    except Exception:
+                        pass
+
+            _record_sample(best, idx, xyz, rpy, q_target)
+
+            stopped, reason = _stop_requested()
+            if stopped:
+                finish_reason = reason
+                return samples, finish_reason
+
+    except KeyboardInterrupt:
+        finish_reason = "Ctrl+C"
+    return samples, finish_reason
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Manual mode (no auto motion; operator moves arm + presses ENTER)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _read_arm_q(serial: str | None = None) -> Optional[np.ndarray]:
+    """Read the current arm joint state from the rebot_rs arm.
+
+    Lazy import so the script is runnable on the dry-run path (no arm).
+    Returns ``None`` if the arm isn't connected; the caller decides how
+    to handle that (skip vs synthetic).
+
+    Tests ``monkeypatch.setattr(cli, "_read_arm_q", ...)`` this -- the
+    public symbol must stay importable from ``calib_top_orbbec``.
+    """
+    try:
+        from ..control.rebot_rs_arm import RebotRSArm  # type: ignore
     except Exception:
-        from ..config import Cfg
-        safety_cfg = Cfg({
-            "workspace": {
-                "min": [-1.0, -1.0, -0.5],
-                "max": [1.0, 1.0, 1.5],
-            },
-            "table_z": 0.0,
-            "max_joint_vel": 1.2,
-            "joint_margin": 0.02,
-            "watchdog_s": 5.0,
-            "table_clearance": 0.02,
-        })
-        safety_limits = SafetyLimits.from_config(safety_cfg)
-    harness = SafetyHarness(safety_limits, kinematics=kin)
-    safe_arm = SafeArm(arm_raw, harness)
-    return (kin, safe_arm, arm_raw), None
+        return None
+    try:
+        arm = RebotRSArm.__new__(RebotRSArm)  # bypass __init__ state checks
+        # Minimal state to read .get_state(): see rebot_rs_arm.__init__.
+        # If the arm can't be probed, just return None (dry-run path).
+        from ..safety.harness import SafetyLimits
+        arm.connect()
+        st = arm.get_state()
+        arm.disconnect()
+        return np.asarray(st.q[:6], dtype=float)
+    except Exception as e:
+        print(f"[calib] arm read failed: {e}", file=sys.stderr)
+        return None
 
 
-def _draw_osd(
-    vis: np.ndarray,
-    *,
-    pose_label: str,
-    n_samples: int,
-    target_n: int,
-    state: str,
-    capture_flash: bool = False,
-) -> None:
-    """Draw the calibrator HUD on top of `vis` (in place)."""
-    h, w = vis.shape[:2]
-    panel = np.zeros((90, w, 3), dtype=np.uint8)
-    panel[:] = (32, 32, 32)
-    cv2.putText(panel, f"Calibration -- TOP   samples: {n_samples}/{target_n}",
-                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
-    cv2.putText(panel, f"pose: {pose_label[:60]}",
-                (10, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(panel, f"state: {state[:60]}",
-                (10, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 220, 160), 1, cv2.LINE_AA)
-    cv2.putText(panel, "press 'c' or 'q' to finish early, ESC to abort",
-                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1, cv2.LINE_AA)
-    vis[0:90, :] = panel
-    if capture_flash:
-        # Bright green border that fades over 0.8s by drawing two rects.
-        cv2.rectangle(vis, (0, 0), (w - 1, h - 1), (0, 255, 0), 6)
+def _collect_loop_manual(
+    kin, aruco, cam, K, D,
+    *, n_target: int, marker_size_m: float,
+    settle_time: float, marker_timeout: float, stable_frames: int,
+    samples: list[CalibrationSample], trace,
+    arm_q_provider: Optional[Callable[[], Optional[np.ndarray]]] = None,
+) -> tuple[list[CalibrationSample], str]:
+    """Manual mode: operator moves arm + presses ENTER; we wait for a
+    stable ArUco detection and record one sample per pose.
+
+    ``arm_q_provider`` is an optional callable returning the current
+    joint vector. If None (or returns None on failure), we fall back to
+    ``_read_arm_q()`` and ultimately to a synthetic seed (dry-run-style).
+    """
+    finish_reason = "operator finished"
+    for i in range(n_target):
+        print(f"\n[calib] === sample {i + 1}/{n_target} ===")
+        _wait_for_user(
+            "Move the arm to a new pose, hold still. The detector will "
+            f"look for stable ArUco readings for {stable_frames} frames within "
+            f"{settle_time + marker_timeout:.1f}s."
+        )
+        det, _ = _stable_detect(
+            cam, aruco, K, D, marker_size_m,
+            settle_time=settle_time,
+            marker_timeout=marker_timeout,
+            stable_frames=stable_frames,
+        )
+        if det is None:
+            print(
+                f"[calib] sample {i + 1}: no ArUco detected within timeout, "
+                "skipping (operator can re-run with --n N)",
+                file=sys.stderr,
+            )
+            trace.write(json.dumps({
+                "event": "sample_skipped", "i": i,
+                "ts": time.time(), "reason": "no_marker",
+            }) + "\n")
+            continue
+        if arm_q_provider is not None:
+            try:
+                q = arm_q_provider()
+            except Exception:
+                q = None
+        else:
+            q = _read_arm_q(cam.serial if cam is not None else None)
+        if q is None:
+            print(
+                "[calib] cannot read arm state (no rebot_rs connection); "
+                "saving synthetic FK from a deterministic seed for "
+                "dry-run only", file=sys.stderr,
+            )
+            q = np.zeros(6)
+            q[0] = 0.30 + 0.05 * i
+        G = kin.fk(q)
+        sample = CalibrationSample(
+            pose_label=f"manual_{i + 1}",
+            T_gripper2base=G,
+            T_marker2cam=det.T_marker2cam,
+            aruco_reprojection_px=float(det.reprojection_rmse_px),
+            inlier=True,
+        )
+        samples.append(sample)
+        trace.write(json.dumps({
+            "event": "sample_recorded", "i": i, "ts": time.time(),
+            "q": q.tolist(),
+            "aruco_rmse_px": float(det.reprojection_rmse_px),
+        }) + "\n")
+        print(
+            f"[calib] recorded sample {len(samples)}: aruco rmse="
+            f"{det.reprojection_rmse_px:.2f}px, q[:3]={q[:3].round(3).tolist()}"
+        )
+    return samples, finish_reason
+
+
+def _collect_loop_gravity_comp(
+    gc_ctrl, kin, aruco, cam, K, D,
+    *, n_target: int, marker_size_m: float,
+    settle_time: float, marker_timeout: float, stable_frames: int,
+    samples: list[CalibrationSample], trace,
+) -> tuple[list[CalibrationSample], str]:
+    """Manual mode with MIT gravity-compensation (Phase 3).
+
+    Same operator flow as ``_collect_loop_manual`` (ENTER to capture,
+    c/q to finish early) but q is read from the ``GravityCompController``
+    which keeps the arm floating under MIT-mode gravity FF.
+    """
+    finish_reason = "operator finished"
+    for i in range(n_target):
+        print(f"\n[calib] === sample {i + 1}/{n_target} (gravity-comp) ===")
+        _wait_for_user(
+            "Move the arm to a new pose (it should float under gravity FF). "
+            "Hold still. The detector will look for stable ArUco readings "
+            f"for {stable_frames} frames within "
+            f"{settle_time + marker_timeout:.1f}s."
+        )
+        det, _ = _stable_detect(
+            cam, aruco, K, D, marker_size_m,
+            settle_time=settle_time,
+            marker_timeout=marker_timeout,
+            stable_frames=stable_frames,
+        )
+        if det is None:
+            print(
+                f"[calib] sample {i + 1}: no ArUco detected within timeout, "
+                "skipping", file=sys.stderr,
+            )
+            trace.write(json.dumps({
+                "event": "sample_skipped", "i": i,
+                "ts": time.time(), "reason": "no_marker",
+            }) + "\n")
+            continue
+        q = gc_ctrl.read_q()
+        if q is None:
+            print(
+                "[calib] cannot read arm q from GravityCompController; "
+                "skipping sample", file=sys.stderr,
+            )
+            trace.write(json.dumps({
+                "event": "sample_skipped", "i": i,
+                "ts": time.time(), "reason": "no_arm_q",
+            }) + "\n")
+            continue
+        G = kin.fk(q)
+        sample = CalibrationSample(
+            pose_label=f"gc_{i + 1}",
+            T_gripper2base=G,
+            T_marker2cam=det.T_marker2cam,
+            aruco_reprojection_px=float(det.reprojection_rmse_px),
+            inlier=True,
+        )
+        samples.append(sample)
+        trace.write(json.dumps({
+            "event": "sample_recorded", "i": i, "ts": time.time(),
+            "q": q.tolist(),
+            "mode": "gravity_comp",
+            "aruco_rmse_px": float(det.reprojection_rmse_px),
+        }) + "\n")
+        print(
+            f"[calib] recorded sample {len(samples)} (gravity-comp): "
+            f"aruco rmse={det.reprojection_rmse_px:.2f}px, "
+            f"q[:3]={q[:3].round(3).tolist()}"
+        )
+    return samples, finish_reason
+
+
+def _connect_gc_controller(arm_profile: str):
+    """Construct a ``GravityCompController`` from a wrc_demo arm profile.
+
+    Returns ``(gc_ctrl, None)`` on success, or ``(None, error_str)`` if
+    the SDK / hardware / arm profile aren't usable. Caller should fall
+    back to plain ``--manual`` on error.
+    """
+    from ..config import load_profile
+
+    arm_prof = load_profile("arms", arm_profile)
+    sdk_path = arm_prof.get("sdk_path") or str(PACKAGE_ROOT / "sdk")
+    urdf_path = (
+        arm_prof.get("urdf")
+        or str(URDF_DEFAULT)
+    )
+    hw_yaml = arm_prof.get("hw_yaml", "rebotarm_rs.yaml")
+
+    try:
+        _ensure_sdk_on_path(sdk_path)
+        from reBotArm_control_py.actuator import RebotArm  # type: ignore
+
+        arm = RebotArm(hw_yaml)
+        gc_ctrl = GravityCompController(
+            arm, sdk_path=sdk_path, urdf_path=urdf_path,
+        )
+        return gc_ctrl, None
+    except Exception as e:
+        return None, f"gravity-comp init failed: {e}"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Public entry point: signature preserved (tests import this).
+# ──────────────────────────────────────────────────────────────────────
 
 
 def _collect_samples(
@@ -423,16 +1342,24 @@ def _collect_samples(
     arm_profile: str = ARM_PROFILE_DEFAULT,
     manual: bool = False,
     show_window: bool = True,
+    gravity_comp: bool = False,
 ) -> tuple[list[CalibrationSample], str]:
     """Collect ``n_target`` calibration samples.
 
     Mode:
-      - ``manual=False``: arm moves itself through ``TOP_CALIB_JOINT_POSES``;
-        the OpenCV window shows live detection + OSD. ``c``/``q``/ESC stop
-        early (PLAN §cuRobo 04b reference). Requires the rebot_rs arm on
-        can0; falls back to manual mode when arm can't be reached.
-      - ``manual=True``: operator presses ENTER after each pose; no arm
-        motion. Useful for offline / dry-run / debugging.
+      - ``manual=False, gravity_comp=False`` (default auto): arm moves
+        itself through ``TOP_CALIB_POSES`` (auto state machine); the
+        OpenCV window shows live detection + OSD. Falls back to manual
+        when the arm can't be reached.
+      - ``manual=True, gravity_comp=False``: operator presses ENTER
+        after each pose; arm stays where the operator left it. Useful
+        for offline / dry-run / debugging.
+      - ``gravity_comp=True``: same as manual, but the arm is driven in
+        MIT mode with gravity feed-forward via ``GravityCompController``,
+        so the operator can hand-guide the arm without it falling. q is
+        read directly from the vendored SDK. Requires the rebot_rs arm
+        on can0; falls back to plain ``manual`` when the SDK is
+        unreachable.
 
     Returns ``(samples, finish_reason)`` so the caller knows whether the
     loop ended because the operator stopped early vs. all poses done.
@@ -449,21 +1376,13 @@ def _collect_samples(
     samples: list[CalibrationSample] = []
     trace_log.parent.mkdir(parents=True, exist_ok=True)
     finish_reason = "session end"
+    cleanup: Callable[[], None] = lambda: None
 
-    # Always open the visualization window when requested (so manual
-    # mode also gets live ArUco preview + OSD -- the operator can see
-    # whether the marker is detected before pressing ENTER). Headless
-    # boxes (CI / tests + opencv-python-headless) lack GTK and will
-    # raise on namedWindow; we silently fall back so the rest of the
-    # pipeline still works.
     WIN = "Hand-Eye Calibration -- TOP"
     if show_window:
         try:
             cv2.namedWindow(WIN, cv2.WINDOW_AUTOSIZE)
         except cv2.error:
-            # opencv-python-headless has no GTK support; cv2.imshow
-            # would always fail in this env. Fall back to disk snapshots
-            # so the operator can still verify the camera + ArUco.
             print(
                 "[calib] cv2.namedWindow unavailable (headless opencv). "
                 "Frames will be saved to /tmp/calib_frames/ for offline "
@@ -492,15 +1411,16 @@ def _collect_samples(
             manual = True
         else:
             (kin, safe_arm, _arm_raw) = result
+            cleanup = _make_arm_cleanup(safe_arm, label="calib_top")
+            _register_process_cleanup(cleanup)
+
             # Move to home (first pose in TOP_CALIB_POSES) before starting
-            # the sequence. Use IK on the home Cartesian pose; fall back
-            # to a fixed joint seed if IK is infeasible.
+            # the sequence.
             xyz0, rpy0 = TOP_CALIB_POSES[0]
             T_home = _pose_to_T(xyz0, rpy0)
             q_init = np.zeros(int(safe_arm.n_joints), dtype=float)
             home_ik = kin.ik(T_home, q_init, retries=2)
             if not home_ik.success:
-                # Fallback: use the demo profile's home_q seed.
                 from ..config import load_profile
                 arm_prof = load_profile("arms", arm_profile)
                 q_init = np.asarray(arm_prof.get("home_q", [0.0] * 6), dtype=float)
@@ -514,7 +1434,7 @@ def _collect_samples(
                 safe_arm = None
                 manual = True
             else:
-                home_q = np.asarray(home_ik.q, dtype=float)[:safe_arm.n_joints]
+                home_q = np.asarray(home_ik.q, dtype=float)[: safe_arm.n_joints]
                 print(
                     f"[calib] home Cartesian: xyz={xyz0} rpy={rpy0} -> "
                     f"q={home_q.round(3).tolist()}"
@@ -541,7 +1461,6 @@ def _collect_samples(
                     safe_arm = None
                     manual = True
                 else:
-                    # Give the arm a moment to settle.
                     time.sleep(2.0)
 
     with trace_log.open("a") as trace:
@@ -552,16 +1471,49 @@ def _collect_samples(
             "aruco_dict": aruco_dict,
             "n_target": n_target,
             "manual": manual,
+            "gravity_comp": gravity_comp,
             "arm_profile": arm_profile,
         }) + "\n")
 
+        if gravity_comp:
+            # Stand up the gravity-comp controller (raw RebotArm, MIT mode).
+            # On any failure (SDK missing, hardware unreachable), fall back
+            # to plain --manual so the operator still gets a working session.
+            gc_ctrl, gc_err = _connect_gc_controller(arm_profile)
+            if gc_err:
+                print(
+                    f"[calib] gravity-comp unavailable ({gc_err}); "
+                    "falling back to plain --manual", file=sys.stderr,
+                )
+                manual = True
+            else:
+                try:
+                    gc_ctrl.start()
+                except Exception as e:
+                    print(
+                        f"[calib] gravity-comp start failed ({e}); "
+                        "falling back to plain --manual", file=sys.stderr,
+                    )
+                    manual = True
+
         if manual:
-            samples, finish_reason = _collect_loop_manual(
-                kin, aruco, cam, K, D,
-                n_target=n_target, marker_size_m=marker_size_m,
-                settle_time=settle_time, marker_timeout=marker_timeout,
-                stable_frames=stable_frames, samples=samples, trace=trace,
-            )
+            if gravity_comp and not gc_err:
+                samples, finish_reason = _collect_loop_gravity_comp(
+                    gc_ctrl, kin, aruco, cam, K, D,
+                    n_target=n_target, marker_size_m=marker_size_m,
+                    settle_time=settle_time, marker_timeout=marker_timeout,
+                    stable_frames=stable_frames,
+                    samples=samples, trace=trace,
+                )
+            else:
+                samples, finish_reason = _collect_loop_manual(
+                    kin, aruco, cam, K, D,
+                    n_target=n_target, marker_size_m=marker_size_m,
+                    settle_time=settle_time, marker_timeout=marker_timeout,
+                    stable_frames=stable_frames, samples=samples, trace=trace,
+                    arm_q_provider=(lambda: np.asarray(safe_arm.get_state().q[:6], dtype=float)
+                                    if safe_arm is not None else None),
+                )
         else:
             samples, finish_reason = _collect_loop_auto(
                 safe_arm, kin, aruco, cam, K, D,
@@ -583,340 +1535,22 @@ def _collect_samples(
             cv2.destroyWindow(WIN)
         except cv2.error:
             pass
-        except cv2.error:
-            pass
     cam.close()
-    return samples, finish_reason
-
-
-def _collect_loop_manual(
-    kin, aruco, cam, K, D,
-    *, n_target, marker_size_m, settle_time, marker_timeout, stable_frames,
-    samples, trace,
-) -> tuple[list[CalibrationSample], str]:
-    finish_reason = "operator finished"
-    for i in range(n_target):
-        print(f"\n[calib] === sample {i + 1}/{n_target} ===")
-        _wait_for_user(
-            "Move the arm to a new pose, hold still. The detector will "
-            f"look for stable ArUco readings for {stable_frames} frames within "
-            f"{settle_time}s."
-        )
-        det, _ = _stable_detect(
-            cam, aruco, K, D, marker_size_m,
-            settle_time=settle_time, marker_timeout=marker_timeout,
-            stable_frames=stable_frames,
-        )
-        if det is None:
-            print(
-                f"[calib] sample {i + 1}: no ArUco detected within timeout, "
-                "skipping (operator can re-run with --target N)",
-                file=sys.stderr,
-            )
-            trace.write(json.dumps({
-                "event": "sample_skipped", "i": i,
-                "ts": time.time(), "reason": "no_marker",
-            }) + "\n")
-            continue
-        q = _read_arm_q(cam.serial)
-        if q is None:
-            print(
-                "[calib] cannot read arm state (no rebot_rs connection); "
-                "saving synthetic FK from a deterministic seed for "
-                "dry-run only",
-                file=sys.stderr,
-            )
-            q = np.zeros(6)
-            q[0] = 0.30 + 0.05 * i
-        G = kin.fk(q)
-        sample = CalibrationSample(
-            pose_label=f"manual_{i + 1}",
-            T_gripper2base=G,
-            T_marker2cam=det.T_marker2cam,
-            aruco_reprojection_px=float(det.reprojection_rmse_px),
-            inlier=True,
-        )
-        samples.append(sample)
-        trace.write(json.dumps({
-            "event": "sample_recorded", "i": i, "ts": time.time(),
-            "q": q.tolist(), "aruco_rmse_px": float(det.reprojection_rmse_px),
-        }) + "\n")
-        print(
-            f"[calib] recorded sample {len(samples)}: aruco rmse="
-            f"{det.reprojection_rmse_px:.2f}px, q[:3]={q[:3].round(3).tolist()}"
-        )
-    return samples, finish_reason
-
-
-def _collect_loop_auto(
-    safe_arm, kin, aruco, cam, K, D,
-    *, n_target, marker_size_m, settle_time, marker_timeout, stable_frames,
-    samples, trace, win_name, show_window,
-) -> tuple[list[CalibrationSample], str]:
-    """Auto-mode state machine: idle -> moving -> settling -> searching -> (capture) -> idle.
-
-    Faithful port of cuRobo 04b's state machine:
-    - Cartesian poses ``TOP_CALIB_POSES`` (xyz, rpy)
-    - IK per pose via ``Kinematics.ik``; ``safe_arm.move_joints`` to drive
-      the arm (no motion planner needed for calibration; we only need
-      reachability + final q for FK)
-    - Reads ``safe_arm._arm.get_state().q`` after settle for FK
-    """
-    finish_reason = "all target poses done"
-    poses = TOP_CALIB_POSES[: max(1, n_target)]
-    target_n = max(n_target, len(poses))
-    last_color: list[np.ndarray | None] = [None]
-    last_q_solution: list[np.ndarray | None] = [None]
-
-    def _stop_requested() -> tuple[bool, str]:
-        key = cv2.waitKey(30) & 0xFF if show_window else 0
-        if key in (ord('q'), ord('Q'), ord('c'), ord('C'), 27):
-            return True, "user finish (key)"
-        if show_window:
-            try:
-                if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
-                    return True, "user finish (window closed)"
-            except cv2.error:
-                return True, "user finish (window gone)"
-        return False, ""
-
-    def _grab_color() -> np.ndarray | None:
+    # gc mode cleanup is the controller's safe_home (drives via SDK,
+    # not via SafeArm). safe_arm cleanup is the atexit-registered one.
+    if gravity_comp and 'gc_ctrl' in locals() and gc_ctrl is not None:
         try:
-            f = cam.get_frame()
-        except Exception:
-            return None
-        return f.rgb
-
-    try:
-        for idx, (xyz, rpy) in enumerate(poses):
-            pose_label = f"xyz=({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f}) rpy=({rpy[0]:+.2f},{rpy[1]:+.2f},{rpy[2]:+.2f})"
-            print(
-                f"\n[calib] auto pose {idx + 1}/{target_n}: {pose_label}"
-            )
-
-            T_target = _pose_to_T(xyz, rpy)
-            # Seed IK from the previous solution (or zeros); the IKResult
-            # ``q`` is in joint-local frame already (joint_signs baked in).
-            q_init = (last_q_solution[0]
-                      if last_q_solution[0] is not None
-                      else np.zeros(safe_arm.n_joints, dtype=float))
-            ik = kin.ik(T_target, q_init, retries=2)
-            if not ik.success:
-                print(
-                    f"[calib] pose {idx + 1}: IK failed (error={ik.error:.4f}); "
-                    "skipping",
-                    file=sys.stderr,
-                )
-                trace.write(json.dumps({
-                    "event": "pose_skipped", "i": idx,
-                    "ts": time.time(), "reason": "ik_failed",
-                }) + "\n")
-                continue
-            q_target = np.asarray(ik.q, dtype=float)[:safe_arm.n_joints]
-            last_q_solution[0] = q_target
-
-            # The auto-loop drives every motion through the safety
-            # harness. The harness's begin_motion() rejects stale
-            # perception. The calib tool is itself the only perception
-            # consumer here, but the harness's watchdog was last
-            # touched at connect() — too long ago. Heartbeat just
-            # before each move to satisfy the watchdog.
-            if hasattr(safe_arm, "harness") and hasattr(safe_arm.harness, "heartbeat"):
-                safe_arm.harness.heartbeat()
-
-            ok = safe_arm.move_joints(q_target, duration_s=2.0)
-            if not ok:
-                print(
-                    f"[calib] pose {idx + 1}: safe_arm.move_joints refused; "
-                    "skipping",
-                    file=sys.stderr,
-                )
-                trace.write(json.dumps({
-                    "event": "pose_skipped", "i": idx,
-                    "ts": time.time(), "reason": "harness_refused",
-                }) + "\n")
-                continue
-
-            arm = getattr(safe_arm, "_arm", safe_arm)
-            if hasattr(arm, "wait_settled"):
-                settled = arm.wait_settled(q_target, tol=0.05, timeout_s=5.0)
-                if not settled:
-                    print(
-                        f"[calib] pose {idx + 1}: arm didn't settle in 5s; "
-                        "continuing with detection anyway",
-                        file=sys.stderr,
-                    )
-
-            stable_count = 0
-            best = None
-            t_settle_until = time.monotonic() + settle_time
-            t_timeout = t_settle_until + marker_timeout
-            while time.monotonic() < t_timeout:
-                stopped, reason = _stop_requested()
-                if stopped:
-                    finish_reason = reason
-                    return samples, finish_reason
-
-                color = _grab_color()
-                if color is None:
-                    time.sleep(0.05)
-                    continue
-                last_color[0] = color
-                # Refresh the safety harness's perception watchdog. The
-                # calib tool is itself the only perception consumer in
-                # this session (no WorldWatcher thread), so the camera
-                # frames we just grabbed are the most recent observation
-                # the harness can know about.
-                if hasattr(safe_arm, "harness") and hasattr(safe_arm.harness, "heartbeat"):
-                    safe_arm.harness.heartbeat()
-
-                det = aruco.detect(color, K, D, marker_size_m)
-                overlay = (
-                    aruco.draw_aruco_overlay(color, det)
-                    if det is not None else color
-                )
-                _draw_osd(
-                    overlay,
-                    pose_label=f"{idx + 1}/{target_n} {pose_label}",
-                    n_samples=len(samples),
-                    target_n=target_n,
-                     state=(f"searching ({stable_count}/{stable_frames})"
-                            if det is not None else "waiting ArUco"),
-                )
-                if show_window:
-                    cv2.imshow(win_name, overlay)
-                else:
-                    # Headless fallback: save 1 of every SNAP_EVERY frames
-                    # to /tmp/calib_frames/ for the operator to inspect.
-                    # Successful captures (det is not None) are always saved.
-                    global SNAP_COUNTER
-                    SNAP_COUNTER += 1
-                    if det is not None or SNAP_COUNTER % SNAP_EVERY == 0:
-                        try:
-                            label = "det" if det is not None else "nodet"
-                            out = overlay if det is not None else color
-                            cv2.imwrite(
-                                str(SNAP_DIR / f"f{SNAP_COUNTER:05d}_{label}.png"),
-                                out,
-                            )
-                        except Exception:
-                            pass
-
-                if det is None:
-                    stable_count = 0
-                    best = None
-                    time.sleep(0.05)
-                    continue
-                stable_count += 1
-                best = det
-                if stable_count >= stable_frames:
-                    break
-
-            if best is None:
-                print(
-                    f"[calib] pose {idx + 1}: marker not detected within timeout; "
-                    "skipping",
-                    file=sys.stderr,
-                )
-                trace.write(json.dumps({
-                    "event": "sample_skipped", "i": idx,
-                    "ts": time.time(), "reason": "no_marker",
-                }) + "\n")
-                continue
-
-            if show_window and last_color[0] is not None:
-                vis = last_color[0].copy()
-                _draw_osd(
-                    vis, pose_label=f"{idx + 1}/{target_n} {pose_label}",
-                    n_samples=len(samples) + 1,
-                    target_n=target_n,
-                    state=f"captured ({stable_count}/{stable_frames})",
-                    capture_flash=True,
-                )
-                if show_window:
-                    cv2.imshow(win_name, vis)
-                    cv2.waitKey(120)
-                else:
-                    # Headless: always save the capture-flash frame.
-                    try:
-                        cv2.imwrite(
-                            str(SNAP_DIR / f"capture_{len(samples):02d}.png"),
-                            vis,
-                        )
-                    except Exception:
-                        pass
-
-            arm = getattr(safe_arm, "_arm", safe_arm)
-            state = arm.get_state() if hasattr(arm, "get_state") else None
-            q = np.asarray(state.q, dtype=float)[:6] if state is not None else q_target
-            G = kin.fk(q)
-            sample = CalibrationSample(
-                pose_label=f"auto_{idx + 1:02d}",
-                T_gripper2base=G,
-                T_marker2cam=best.T_marker2cam,
-                aruco_reprojection_px=float(best.reprojection_rmse_px),
-                inlier=True,
-            )
-            samples.append(sample)
-            trace.write(json.dumps({
-                "event": "sample_recorded", "i": idx, "ts": time.time(),
-                "q": q.tolist(),
-                "pose_label": pose_label,
-                "aruco_rmse_px": float(best.reprojection_rmse_px),
-            }) + "\n")
-            print(
-                f"[calib] captured sample {len(samples)}: {pose_label}, "
-                f"aruco rmse={best.reprojection_rmse_px:.2f}px, "
-                f"q[:3]={q[:3].round(3).tolist()}"
-            )
-
-            stopped, reason = _stop_requested()
-            if stopped:
-                finish_reason = reason
-                return samples, finish_reason
-
-    except KeyboardInterrupt:
-        finish_reason = "Ctrl+C"
+            gc_ctrl.safe_home()
+        except Exception as e:
+            print(f"[calib] gravity-comp safe_home raised: {e}", file=sys.stderr)
+    else:
+        cleanup()
     return samples, finish_reason
 
 
-def _grab_color(cam) -> np.ndarray | None:
-    """Read one frame; return the BGR array or None on failure."""
-    try:
-        f = cam.get_frame()
-    except Exception:
-        return None
-    return f.rgb
-
-
-def _stable_detect(
-    cam, aruco, K, D, marker_size_m,
-    *, settle_time, marker_timeout, stable_frames,
-) -> tuple[object | None, list[object]]:
-    """Grab frames until the marker has been stable for N consecutive
-    detections or ``settle_time + marker_timeout`` elapses.
-
-    Returns ``(best_detection, all_detections)``.
-    """
-    best = None
-    stable_count = 0
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < settle_time + marker_timeout:
-        try:
-            frame = cam.get_frame()
-        except Exception:
-            time.sleep(0.1)
-            continue
-        det = aruco.detect(frame.rgb, K, D, marker_size_m)
-        if det is None:
-            stable_count = 0
-            time.sleep(0.05)
-            continue
-        stable_count += 1
-        best = det
-        if stable_count >= stable_frames:
-            return det, []
-    return best, []
+# ──────────────────────────────────────────────────────────────────────
+# Solve + persist (unchanged from prior implementation; only ONE copy)
+# ──────────────────────────────────────────────────────────────────────
 
 
 def _synthesize_samples(
@@ -926,70 +1560,6 @@ def _synthesize_samples(
     """Generate synthetic (FK, PnP) samples with a known ground-truth
     ``X = T_cam2base`` and ``Y = T_marker2gripper`` so the operator can
     sanity-check the entire calibration pipeline without hardware.
-
-    Returns ``(samples, X_true, Y_true)``. The poses are diverse enough
-    that the joint SE(3) fit converges (per test_handeye_solver).
-    """
-    from ..calibration.handeye_solver import so3_exp
-
-    rng = np.random.default_rng(seed)
-    X_true = np.eye(4)
-    X_true[:3, 3] = [0.30, -0.10, 0.85]
-    ang_y, ang_z = 0.5, 0.25
-    Ry = np.array(
-        [[np.cos(ang_y), 0.0, np.sin(ang_y)],
-         [0.0, 1.0, 0.0],
-         [-np.sin(ang_y), 0.0, np.cos(ang_y)]]
-    )
-    Rz = np.array(
-        [[np.cos(ang_z), -np.sin(ang_z), 0.0],
-         [np.sin(ang_z),  np.cos(ang_z), 0.0],
-         [0.0, 0.0, 1.0]]
-    )
-    X_true[:3, :3] = Rz @ Ry
-
-    Y_true = np.eye(4)
-    Y_true[:3, 3] = [0.005, 0.0, 0.04]
-    Y_true[:3, :3] = so3_exp(rng.normal(scale=0.05, size=3))
-
-    samples: list[CalibrationSample] = []
-    for i in range(n):
-        ang_z_g = 0.3 * i
-        ang_y_g = 0.2 + 0.1 * i
-        Rz_g = np.array(
-            [[np.cos(ang_z_g), -np.sin(ang_z_g), 0.0],
-             [np.sin(ang_z_g),  np.cos(ang_z_g), 0.0],
-             [0.0, 0.0, 1.0]]
-        )
-        Ry_g = np.array(
-            [[np.cos(ang_y_g), 0.0, np.sin(ang_y_g)],
-             [0.0, 1.0, 0.0],
-             [-np.sin(ang_y_g), 0.0, np.cos(ang_y_g)]]
-        )
-        G = np.eye(4)
-        G[:3, :3] = Ry_g @ Rz_g
-        G[:3, 3] = [0.28 + 0.02 * i, 0.03 * np.cos(i), 0.15 + 0.04 * i]
-        M = np.linalg.inv(X_true) @ G @ Y_true
-        samples.append(CalibrationSample(
-            pose_label=f"dryrun_{i + 1}",
-            T_gripper2base=G,
-            T_marker2cam=M,
-            aruco_reprojection_px=0.1,
-            inlier=True,
-        ))
-    return samples, X_true, Y_true
-
-
-def _synthesize_samples(
-    n: int,
-    seed: int = 0,
-) -> tuple[list[CalibrationSample], np.ndarray, np.ndarray]:
-    """Generate synthetic (FK, PnP) samples with a known ground-truth
-    ``X = T_cam2base`` and ``Y = T_marker2gripper`` so the operator can
-    sanity-check the entire calibration pipeline without hardware.
-
-    Returns ``(samples, X_true, Y_true)``. The poses are diverse enough
-    that the joint SE(3) fit converges (per test_handeye_solver).
     """
     from ..calibration.handeye_solver import so3_exp
 
@@ -1042,31 +1612,6 @@ def _synthesize_samples(
     return samples, X_true, Y_true
 
 
-def _read_arm_q(serial: str | None) -> np.ndarray | None:
-    """Read the current arm joint state from the rebot_rs arm.
-
-    Lazy import so the script is runnable on the dry-run path (no arm).
-    Returns ``None`` if the arm isn't connected; the caller decides how
-    to handle that (skip vs synthetic).
-    """
-    try:
-        from ..control.rebot_rs_arm import RebotRSArm  # type: ignore
-    except Exception:
-        return None
-    try:
-        arm = RebotRSArm.__new__(RebotRSArm)  # bypass __init__ state checks
-        # Minimal state to read .get_state(): see rebot_rs_arm.__init__.
-        # If the arm can't be probed, just return None (dry-run path).
-        from ..safety.harness import SafetyLimits
-        arm.connect()
-        st = arm.get_state()
-        arm.disconnect()
-        return np.asarray(st.q[:6], dtype=float)
-    except Exception as e:
-        print(f"[calib] arm read failed: {e}", file=sys.stderr)
-        return None
-
-
 def _solve_and_persist(
     samples: list[CalibrationSample],
     out_json: Path,
@@ -1091,8 +1636,6 @@ def _solve_and_persist(
         f"max={fit.metrics.get('translation_max_err_mm', float('nan')):.2f}mm "
         f"inliers={len(fit.inliers)} outliers={len(fit.outliers)}"
     )
-    # Re-flag samples based on the inlier set so the persisted record
-    # carries the same labels as the solver saw.
     inlier_set = set(fit.inliers)
     flagged = tuple(
         CalibrationSample(
@@ -1128,13 +1671,7 @@ def _solve_and_persist(
         metrics={k: float(v) for k, v in fit.metrics.items()},
         samples_for_repro=flagged,
     )
-    # When running in dry-run mode, persist the ground-truth matrices
-    # alongside so a reviewer can verify the solve without re-running.
     if X_true is not None and Y_true is not None:
-        # CalibrationResult.metrics is a flat dict[str, float], so we
-        # encode ground-truth by storing only the Frobenius norms of
-        # the recovered-vs-true differences (the actual matrices are
-        # logged on stdout by main()).
         x_err = float(np.linalg.norm(fit.T_cam2base - X_true))
         y_err = float(np.linalg.norm(fit.T_marker2gripper - Y_true))
         result = CalibrationResult(
@@ -1146,8 +1683,6 @@ def _solve_and_persist(
         )
     K = np.eye(3)
     D = np.zeros(5)
-    # Pull K/D from the saved JSON if the user already ran calibration
-    # once and we're re-fitting offline.
     json_path, npz_path = save_calibration(result, out_json, K=K, D=D)
     print(f"[calib] wrote {json_path}")
     print(f"[calib] wrote {npz_path}")
@@ -1173,14 +1708,6 @@ def _verify(npz_path: Path, known_points: Sequence[tuple[float, float, float]]) 
     )
     for kp in known_points:
         kp_arr = np.asarray(kp, dtype=float).reshape(3)
-        # For each inlier sample, the camera-side prediction of marker
-        # origin in base frame is ``(X @ M)[:3, 3]`` -- the marker
-        # position predicted by the camera path. By the hand-eye
-        # equation ``G @ Y == X @ M`` this must equal ``(G @ Y)[:3, 3]``
-        # (the gripper-FK path) up to measurement noise. We average the
-        # camera-side prediction across inliers to get the centroid of
-        # where the marker was during calibration, then compare to the
-        # operator-supplied known point.
         cam_pts = []
         for s in res.samples_for_repro:
             if not s.inlier:
@@ -1203,6 +1730,42 @@ def _verify(npz_path: Path, known_points: Sequence[tuple[float, float, float]]) 
     mx = float(np.max(errs_mm))
     print(f"[calib] verify RMSE = {rmse:.2f}mm, max = {mx:.2f}mm")
     return 0 if rmse <= 10.0 else 1
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Stub for Phase 3: --gravity-comp manual mode with MIT gravity FF.
+# The full implementation is added in Phase 3 (T3.1+T3.2); for now the
+# flag is accepted but --gravity-comp falls back to the simplified
+# ``_collect_loop_manual`` so the CLI surface stays stable during
+# incremental rollout.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def make_input_thread(line_queue: queue.Queue) -> threading.Thread:
+    """Background thread that mirrors stdin to ``line_queue`` without
+    blocking the main loop. Rebot_grasp pattern.
+
+    Returns a daemon thread (caller doesn't need to ``.join()``).
+    """
+    def _loop():
+        while True:
+            try:
+                line_queue.put(input())
+            except EOFError:
+                line_queue.put(None)
+                break
+            except KeyboardInterrupt:
+                line_queue.put(None)
+                break
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return t
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1245,8 +1808,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run-out", default=str(CALIB_DIR / "hand_eye_dryrun.json"),
                    help="output JSON path for --dry-run (does NOT clobber --out)")
     p.add_argument("--manual", action="store_true",
-                   help="disable auto-mode arm motion + OpenCV window: wait for "
-                        "ENTER after each pose (matches cuRobo 04b's --manual)")
+                   help="disable auto-mode arm motion: wait for ENTER after "
+                        "each pose (operator moves arm by hand)")
+    p.add_argument("--gravity-comp", action="store_true",
+                   help="enable MIT-mode gravity compensation in manual mode "
+                        "so the arm floats (operator can hand-guide without "
+                        "it falling). Falls back to --manual if the SDK / "
+                        "arm aren't reachable.")
     args = p.parse_args(argv)
 
     if args.list:
@@ -1264,8 +1832,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         try:
             kps = [
-                tuple(float(t) for t in p.split(","))
-                for p in args.known_points.split(";")
+                tuple(float(t) for t in pp.split(","))
+                for pp in args.known_points.split(";")
             ]
         except ValueError as e:
             print(f"--known-points parse error: {e}", file=sys.stderr)
@@ -1274,7 +1842,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         out_p = Path(args.dry_run_out)
-        # Don't let --dry-run clobber the real calibration file by accident.
         if out_p.resolve() == Path(args.out).resolve():
             print(
                 f"[calib] --dry-run-out must differ from --out ({args.out})",
@@ -1291,22 +1858,21 @@ def main(argv: list[str] | None = None) -> int:
             serial="DRYRUN",
             X_true=X_true, Y_true=Y_true,
         )
-        # Per-sample residual is the actual quality signal; the joint
-        # fit can have multiple global optima in (X, Y) space (PLAN.md
-        # §13.4), so the X / Y distance to ground truth is reported
-        # for diagnostic purposes only.
-        x_err = float(np.linalg.norm(result.T_cam2base - X_true))
-        y_err = float(np.linalg.norm(result.T_marker2gripper - Y_true))
+        x_err = float(np.linalg.norm(np.asarray(result.T_cam2base) - X_true))
+        y_err = float(np.linalg.norm(np.asarray(result.T_marker2gripper) - Y_true))
         per_sample_mm = float(result.metrics.get("translation_rmse_mm", float("nan")))
         print(
             f"[calib] dry-run: per-sample rmse = {per_sample_mm:.4f}mm; "
             f"||X - X_true||_F = {x_err:.4f}, ||Y - Y_true||_F = {y_err:.4f}; "
             f"wrote {out_p}"
         )
-        # Smoke-test criterion: the solver converged to a low-residual
-        # fit (the pipeline works). Don't fail on the X / Y distance
-        # since joint SE(3) fits have known (X, Y) ambiguities.
         return 0 if per_sample_mm < 1.0 else 1
+
+    # Default: collect samples.
+    if args.gravity_comp:
+        # gc mode implies manual capture (operator presses ENTER per
+        # pose, but the arm is gravity-compensated so it floats).
+        args.manual = True
 
     serial = args.serial or _get_serial_from_binding("top") or ""
     samples, finish_reason = _collect_samples(
@@ -1325,6 +1891,7 @@ def main(argv: list[str] | None = None) -> int:
         arm_profile=args.arm_profile,
         manual=args.manual,
         show_window=not args.manual,  # auto-mode uses cv2.imshow; manual doesn't
+        gravity_comp=args.gravity_comp,
     )
     print(f"[calib] session ended: {finish_reason}")
     if len(samples) < 4:

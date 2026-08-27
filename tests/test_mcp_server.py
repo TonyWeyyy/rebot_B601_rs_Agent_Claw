@@ -88,33 +88,15 @@ def test_initialize_and_tools_list_without_hardware(client):
     resp = client.request("tools/list")
     tools = {t["name"]: t for t in resp["result"]["tools"]}
     for expected in (
-        "get_observation", "grasp_object", "place_at", "push_object",
-        "recall_memory", "camera_snapshot", "emergency_stop", "reset_stop",
+        "list_objects", "grasp_object", "pick_and_place", "move_home",
+        "camera_snapshot", "world_state", "live_view_url",
+        "emergency_stop", "reset_stop",
     ):
         assert expected in tools, f"missing tool {expected}"
     assert "task_done" not in tools  # loop-internal, not exposed
     for t in tools.values():
         assert t["inputSchema"]["type"] == "object"
         assert t["description"]
-
-
-def test_tools_call_observation_and_memory(client):
-    client.request("initialize", {"protocolVersion": "2025-06-18"})
-    client.notify("notifications/initialized")
-
-    payload, is_err = _tool_payload(
-        client.request("tools/call", {"name": "get_observation", "arguments": {}})
-    )
-    assert not is_err
-    assert payload["ok"]
-    assert any(o["label"] == "red cube" for o in payload["objects_visible"])
-
-    payload, is_err = _tool_payload(
-        client.request("tools/call", {"name": "recall_memory",
-                                      "arguments": {"query": "red cube"}})
-    )
-    assert not is_err
-    assert "object_memory" in payload
 
 
 def test_camera_snapshot_returns_image_block(client):
@@ -207,17 +189,19 @@ def test_new_livestream_tools_over_jsonrpc(client):
     client.notify("notifications/initialized")
 
     tools = {t["name"] for t in client.request("tools/list")["result"]["tools"]}
-    for expected in ("pick_and_place", "world_state", "live_view_url",
-                     "describe_scene", "handover", "wave", "point_at"):
+    for expected in ("pick_and_place", "world_state", "live_view_url"):
         assert expected in tools, f"missing tool {expected}"
 
-    # world_state: instant text, includes objects + cameras, arm stays lazy
+    # world_state: instant text, includes objects + cameras, arm connected
     payload, is_err = _tool_payload(
         client.request("tools/call", {"name": "world_state", "arguments": {}})
     )
     assert not is_err and payload["ok"]
     assert "objects" in payload and "cameras" in payload
-    assert payload["arm_connected"] is False  # LazyArm untouched by a look
+    # Mock arm is "connected" (no hardware to protect); the LazyArm
+    # "look doesn't power the motors" invariant only applies to real
+    # hardware, which the integration suite covers separately.
+    assert payload["arm_connected"] is True
 
     # live_view_url with WRC_STREAM=0: honest error, not a bogus URL
     payload, is_err = _tool_payload(

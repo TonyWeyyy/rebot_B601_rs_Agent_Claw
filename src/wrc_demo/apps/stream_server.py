@@ -42,7 +42,12 @@ _INDEX_HTML = """<!doctype html>
  #cams {{ display:flex; flex-wrap:wrap; gap:12px; align-content:start; }}
  .cam {{ background:#161c22; border-radius:8px; padding:8px; }}
  .cam h2 {{ font-size:13px; margin:0 0 6px 2px; color:#9fb0c0; font-weight:500; }}
- .cam img {{ max-width:min(44vw,760px); border-radius:4px; display:block; }}
+  /* 2026-08-13: img auto-fills its container while preserving aspect ratio,
+     so the orbbec_overhead feed scales with the browser window instead
+     of being capped at 44vw/760px (which made the view tiny on big
+     monitors and on the small cells used by the multi-cam tile layout). */
+  .cam img {{ width:100%; max-width:100%; height:auto; aspect-ratio:16/9;
+              border-radius:4px; display:block; object-fit:contain; background:#000; }}
  aside {{ display:flex; flex-direction:column; gap:12px; min-width:300px; }}
  .panel {{ background:#161c22; border-radius:8px; padding:10px 12px; }}
  .panel h3 {{ margin:0 0 8px; font-size:12px; color:#9fb0c0; text-transform:uppercase;

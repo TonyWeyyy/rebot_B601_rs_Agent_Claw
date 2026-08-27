@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import cv2
 import numpy as np
 
 from ..config import Cfg
@@ -281,9 +282,17 @@ class OrbbecCamera(CameraBase):
         # OBFormat values seen on pyorbbecsdk >= 2.x (Gemini 2):
         # RGB=22, BGR=23, MJPG=5, H264=6, H265=7, NV12=3, NV21=4,
         # YUYV=0, YUY2=1, COMPRESSED=26, Y16=8, ...
-        # Compressed/encoded formats break our BGR reshape path.
-        _PREFERRED_FORMATS = {22, 23}  # RGB, BGR
-        _BLOCKED_FORMATS = {0, 1, 2, 3, 4, 5, 6, 7, 26, 27}  # YUYV, YUY2, UYVY, NV12, NV21, MJPG, H264, H265, COMPRESSED, RVL
+        #
+        # MJPG (5) is the ONLY format the Gemini 2 exposes at 1280x720 -- the
+        # uncompressed RGB/BGR streams top out around 640x480 over USB2. The
+        # previous code BLOCKED MJPG because ``np.frombuffer(...).reshape(h,w,3)``
+        # on raw JPEG bytes produces garbage; the proper fix is to decode MJPG
+        # with ``cv2.imdecode`` (mirrors rebot_grasp/drivers/camera/orbbec_gemini2.py).
+        # Without MJPG support the pipeline silently drops to 640x480 RGB --
+        # which is what makes wrc_demo's view look "low-res + wrong colors" vs.
+        # rebot_grasp's 1280x720 view.
+        _PREFERRED_FORMATS = {5, 22, 23}  # MJPG, RGB, BGR (MJPG first)
+        _BLOCKED_FORMATS = {0, 1, 2, 3, 4, 6, 7, 26, 27}  # YUYV, YUY2, UYVY, NV12, NV21, H264, H265, COMPRESSED, RVL
 
         exact: list = []
         same_res: list = []
@@ -326,6 +335,76 @@ class OrbbecCamera(CameraBase):
                 pass
             self._pipeline = None
 
+    # ── color format decoding ─────────────────────────────────────────────
+    #
+    # The Orbbec SDK reports the color stream's pixel format via
+    # ``color.get_format()``. Three are observed on Gemini 2:
+    #
+    #   * OBFormat.MJPG (5)  -- JPEG-compressed bytes; MUST be decoded with
+    #                            ``cv2.imdecode`` before reshape, else the raw
+    #                            bytes look like garbage. This is the ONLY
+    #                            format that exposes 1280x720 over USB2.
+    #   * OBFormat.RGB  (22) -- RGB byte order; needs cv2.cvtColor to BGR for
+    #                            downstream OpenCV consumers.
+    #   * OBFormat.BGR  (23) -- BGR byte order; reshape directly.
+    #
+    # Anything else (YUYV/NV12/H264/...) is rejected by _pick_video_profile
+    # so the active stream is always one of the three above. The fallback
+    # here only fires if the SDK reports an unexpected format mid-session.
+    #
+    # Mirrors rebot_grasp/drivers/camera/orbbec_gemini2.py::get_frame --
+    # the two implementations MUST stay in sync, otherwise the wrc_demo
+    # view and the rebot_grasp view diverge in color / format.
+    _MJPG_FORMAT = 5
+    _RGB_FORMAT = 22
+    _BGR_FORMAT = 23
+
+    @classmethod
+    def _decode_color_frame(cls, payload, w: int, h: int, fmt):
+        """Decode a color frame's raw bytes into a contiguous HxWx3 BGR
+        uint8 array, regardless of the underlying pixel format.
+
+        * fmt == MJPG  -> ``cv2.imdecode`` (the SDK hands us JPEG bytes;
+                          reshape without decoding produces a smeared mess).
+        * fmt == RGB   -> reshape + ``cv2.cvtColor(COLOR_RGB2BGR)``.
+        * fmt == BGR   -> reshape only.
+        * fmt unknown  -> legacy reshape with a warning; ``_pick_video_profile``
+                          should have filtered anything outside the 3 handled
+                          formats, so reaching this branch indicates a new
+                          OBFormat constant the SDK exposes -- add it to the
+                          table above.
+        """
+        if fmt == cls._MJPG_FORMAT:
+            raw = np.frombuffer(payload, dtype=np.uint8)
+            decoded = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+            if decoded is None:
+                raise CameraError(
+                    "cv2.imdecode returned None on MJPG payload -- the "
+                    "Orbbec SDK may have handed us a truncated JPEG"
+                )
+            if decoded.shape[0] != h or decoded.shape[1] != w:
+                raise CameraError(
+                    f"MJPG decoded shape {decoded.shape[:2][::-1]} != "
+                    f"requested {w}x{h}"
+                )
+            return decoded  # cv2.imdecode returns BGR
+        if fmt == cls._RGB_FORMAT:
+            raw = np.frombuffer(payload, dtype=np.uint8).reshape(h, w, 3)
+            return cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+        if fmt == cls._BGR_FORMAT:
+            return np.frombuffer(payload, dtype=np.uint8).reshape(h, w, 3).copy()
+        # Unknown format -- try the legacy reshape and surface a clear
+        # error if the payload size doesn't match (so we don't ship
+        # silently-wrong colors to the detector).
+        expected = h * w * 3
+        if len(payload) != expected:
+            raise CameraError(
+                f"Orbbec color frame size mismatch on format={fmt}: got "
+                f"{len(payload)} bytes, expected {expected} (h*w*3 = {h}*{w}*3). "
+                "Add this format to _decode_color_frame."
+            )
+        return np.frombuffer(payload, dtype=np.uint8).reshape(h, w, 3).copy()
+
     def _grab(self) -> Frame:
         if self._pipeline is None:
             raise CameraError("Orbbec pipeline not started")
@@ -349,22 +428,8 @@ class OrbbecCamera(CameraBase):
             w = color.get_width()
             h = color.get_height()
             payload = color.get_data()
-            expected = h * w * 3
-            if len(payload) != expected:
-                # The active stream's format is MJPG/YUYV (compressed /
-                # sub-sampled). MJPG bytes are decoded by the SDK normally,
-                # but a profile selection race or firmware quirk can land
-                # the stream on a non-BGR format. Surface the actual size
-                # and the most likely cause.
-                fmt = color.get_format() if hasattr(color, "get_format") else "unknown"
-                raise CameraError(
-                    f"Orbbec color frame size mismatch: got {len(payload)} bytes, "
-                    f"expected {expected} (h*w*3 = {h}*{w}*3). Active format={fmt}; "
-                    "this usually means the stream fell back to MJPG or YUYV. "
-                    "Re-open the camera or set min_depth_m=0 to force a profile "
-                    "refresh."
-                )
-            bgr = np.frombuffer(payload, dtype=np.uint8).reshape(h, w, 3).copy()
+            fmt = color.get_format() if hasattr(color, "get_format") else None
+            bgr = self._decode_color_frame(payload, w, h, fmt)
         except Exception as e:
             raise CameraError(f"failed to decode Orbbec color frame: {e}") from e
         try:

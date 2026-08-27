@@ -220,20 +220,26 @@ def joint_solve(
         weights = np.where(norms > thresh, 0.1, 1.0)
 
     X, Y = _param_to_se3(p0)
+    # Per-sample SE(3) log residual vector [tx, ty, tz, rx, ry, rz] (m, rad)
+    # -- used both for the outlier 3*MAD test (on the L2 norm) and for the
+    # per-axis metric computation.
     with np.errstate(invalid="ignore"):
-        norms = np.array([
-            float(np.linalg.norm(se3_log_residual(G[i], M[i], X, Y)))
-            for i in range(len(samples))
+        res_6d = np.array([
+            se3_log_residual(G[i], M[i], X, Y) for i in range(len(samples))
         ])
+    norms = np.linalg.norm(res_6d, axis=1)
     med = float(np.median(norms)) if len(norms) else 0.0
     mad = float(np.median(np.abs(norms - med))) + 1e-9
     thresh = 3.0 * mad
     inliers = tuple(int(i) for i, n in enumerate(norms) if n <= thresh)
     outliers = tuple(int(i) for i, n in enumerate(norms) if n > thresh)
 
-    # Aggregate metrics
-    inlier_norms = norms[list(inliers)] if inliers else norms
-    metrics = _metrics_from_norms(inlier_norms, norms)
+    # Aggregate metrics. ``res_6d[list(inliers)]`` keeps the per-axis
+    # split so we can report translation in mm and rotation in deg as
+    # independent quantities (the old combined SE(3) norm is preserved
+    # under the ``se3_log_norm_*`` keys for backward compatibility).
+    inlier_res = res_6d[list(inliers)] if inliers else res_6d
+    metrics = _metrics_from_norms(inlier_res, norms)
     metrics["lm_converged"] = bool(np.isfinite(res.fun).all())
     metrics["lm_iterations"] = int(getattr(res, "nfev", 0))
 
@@ -250,33 +256,82 @@ def joint_solve(
     return best[1]
 
 
-def _metrics_from_norms(inlier_norms: np.ndarray, all_norms: np.ndarray) -> dict[str, float]:
-    # Residual norm is on the SE(3) log; for a near-zero solve, the
-    # translation part (m) and rotation part (rad) are weighted equally.
-    # Translation rmse in mm and rotation rmse in deg require per-axis
-    # split which we can re-derive on the residuals; for the summary we
-    # report the SE(3) log norm in mm-units (interpret as position drift).
-    if len(inlier_norms) == 0:
-        return {
-            "translation_rmse_mm": float("nan"),
-            "translation_max_err_mm": float("nan"),
-            "rotation_rmse_deg": float("nan"),
-            "rotation_max_err_deg": float("nan"),
-            "se3_log_norm_median": float("nan"),
-            "total_loss": float("inf"),
-        }
-    # Treat the 6-vec norm as a conservative upper bound; the per-axis
-    # split lives in the verify/cross-check stage.
-    rmse = float(np.sqrt(np.mean(inlier_norms ** 2))) * 1000.0
-    mx = float(np.max(inlier_norms)) * 1000.0
+def _metrics_from_norms(
+    inlier_residuals: np.ndarray,
+    all_norms: np.ndarray,
+) -> dict[str, float]:
+    """Compute per-axis RMSE for translation (mm) and rotation (deg) on the
+    inlier residuals, plus a backward-compatible alias of the old combined
+    SE(3) log-norm fields.
+
+    Parameters
+    ----------
+    inlier_residuals
+        ``(n_inliers, 6)`` array of per-sample SE(3) log residuals from
+        ``se3_log_residual``: first 3 columns are translation in meters,
+        last 3 are the rotation vector in radians.
+    all_norms
+        ``(n_samples,)`` L2 norms of the same residuals (used for the
+        deprecated combined-norm fields and the median).
+    """
+    nan_metrics = {
+        "translation_rmse_mm": float("nan"),
+        "translation_max_err_mm": float("nan"),
+        "rotation_rmse_deg": float("nan"),
+        "rotation_max_err_deg": float("nan"),
+        "se3_log_norm_rmse_mm": float("nan"),
+        "se3_log_norm_max_mm": float("nan"),
+        "se3_log_norm_rmse_deg": float("nan"),
+        "se3_log_norm_max_deg": float("nan"),
+        "se3_log_norm_median": float("nan"),
+        "total_loss": float("inf"),
+        "n_inliers": 0,
+    }
+    if len(inlier_residuals) == 0:
+        return nan_metrics
+
+    inlier_res = np.asarray(inlier_residuals, dtype=float)
+    t = inlier_res[:, :3]   # tx, ty, tz  in meters
+    r = inlier_res[:, 3:]   # rx, ry, rz  in radians (rotation vector)
+
+    # Per-axis split -- translation in mm, rotation in deg, with the
+    # ``||t||`` / ``||r||`` Euclidean norm per sample (NOT the raw
+    # component sum, which would mix axes and units within a quantity).
+    t_per_sample_m = np.linalg.norm(t, axis=1)
+    r_per_sample_rad = np.linalg.norm(r, axis=1)
+    t_rmse_m = float(np.sqrt(np.mean(t_per_sample_m ** 2)))
+    r_rmse_rad = float(np.sqrt(np.mean(r_per_sample_rad ** 2)))
+    t_max_m = float(np.max(t_per_sample_m))
+    r_max_rad = float(np.max(r_per_sample_rad))
+
+    # Backward-compat: combined SE(3) log norm in "mm-like" units. The
+    # log residual packs translation (m) and rotation (rad) into one 6-vec
+    # with mixed units, so the L2 norm is dimensionally inconsistent --
+    # treat it as an order-of-magnitude diagnostic, not a physical mm.
+    se3_norms = np.asarray(all_norms, dtype=float)
+    if len(se3_norms):
+        se3_rmse = float(np.sqrt(np.mean(se3_norms ** 2)))
+        se3_max = float(np.max(se3_norms))
+    else:
+        se3_rmse = float("nan")
+        se3_max = float("nan")
+
     return {
-        "translation_rmse_mm": rmse,
-        "translation_max_err_mm": mx,
-        "rotation_rmse_deg": rmse / 100.0,  # very rough proxy (1 mm <-> 0.01 rad)
-        "rotation_max_err_deg": mx / 100.0,
-        "se3_log_norm_median": float(np.median(all_norms)) * 1000.0,
-        "total_loss": float(np.sum(inlier_norms ** 2)),
-        "n_inliers": int(len(inlier_norms)),
+        # New: physically correct per-axis quantities
+        "translation_rmse_mm": t_rmse_m * 1000.0,
+        "translation_max_err_mm": t_max_m * 1000.0,
+        "rotation_rmse_deg": float(np.degrees(r_rmse_rad)),
+        "rotation_max_err_deg": float(np.degrees(r_max_rad)),
+        # Old (kept under explicit ``se3_log_norm_*`` names so callers can
+        # still read the combined-norm diagnostic without confusing it
+        # with the per-axis mm/deg).
+        "se3_log_norm_rmse_mm": se3_rmse * 1000.0,
+        "se3_log_norm_max_mm": se3_max * 1000.0,
+        "se3_log_norm_rmse_deg": se3_rmse / 100.0,
+        "se3_log_norm_max_deg": se3_max / 100.0,
+        "se3_log_norm_median": float(np.median(se3_norms)) * 1000.0 if len(se3_norms) else float("nan"),
+        "total_loss": float(np.sum(se3_norms ** 2)),
+        "n_inliers": int(len(inlier_residuals)),
     }
 
 

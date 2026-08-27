@@ -32,6 +32,31 @@ class ToolCall:
 class LLMResponse:
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # vLLM with --reasoning-parser qwen3 populates this field with the
+    # content inside <think>...</think>. Cloud / non-reasoning models
+    # leave it empty. Reasoning models that emit tool calls inside the
+    # think block fall back to this when content is null.
+    reasoning: str = ""
+
+
+class LLMConfigError(RuntimeError):
+    """Raised by make_llm() when a profile is misconfigured (missing env var,
+    unknown type, etc.). Surfaces at startup so the operator sees the env var
+    name in the error message, not at chat time. See ADR-0008."""
+
+    def __init__(self, profile_name: str | None, env_key: str | None, *, hint: str = ""):
+        self.profile_name = profile_name
+        self.env_key = env_key
+        msg_parts = []
+        if profile_name:
+            msg_parts.append(f"profile {profile_name!r}")
+        if env_key:
+            msg_parts.append(f"env var {env_key!r}")
+        detail = "; ".join(msg_parts) or "LLM client construction"
+        msg = f"{detail}: missing or invalid configuration"
+        if hint:
+            msg += f" — {hint}"
+        super().__init__(msg)
 
 
 class LLMClient:
@@ -64,13 +89,24 @@ class OpenAICompatClient(LLMClient):
     ):
         import os
 
+        import httpx
         from openai import OpenAI
 
         # Local servers (llama.cpp/vLLM) need a dummy key; hosted endpoints
         # fall through to the OPENAI_API_KEY environment variable.
         if api_key is None and base_url is not None and "OPENAI_API_KEY" not in os.environ:
             api_key = "EMPTY"
-        self._client = OpenAI(base_url=base_url, api_key=api_key)
+        # Bypass the host's HTTP/SOCKS proxy env vars -- some demo rigs
+        # have ALL_PROXY=socks://... set globally, and httpx (the OpenAI
+        # SDK's HTTP transport) doesn't support SOCKS proxies, so the
+        # client crashes at construction time. `trust_env=False` on the
+        # httpx client disables env-var-driven proxy detection. The
+        # endpoint URL itself is already explicit via base_url, so we
+        # never want a proxy for direct-API calls.
+        proxy_bypass_http = httpx.Client(trust_env=False)
+        self._client = OpenAI(
+            base_url=base_url, api_key=api_key, http_client=proxy_bypass_http
+        )
         self.model = model
         self.supports_vision = supports_vision
         self.temperature = temperature
@@ -141,7 +177,11 @@ class OpenAICompatClient(LLMClient):
             except json.JSONDecodeError:
                 args = {"_raw": tc.function.arguments}
             calls.append(ToolCall(name=tc.function.name, arguments=args, id=tc.id))
-        return LLMResponse(text=choice.content or "", tool_calls=calls)
+        # choice.reasoning is set by vLLM with --reasoning-parser qwen3;
+        # getattr guards against the OpenAI SDK Message class not exposing
+        # the attribute on cloud/non-reasoning models.
+        reasoning = getattr(choice, "reasoning", None) or ""
+        return LLMResponse(text=choice.content or "", reasoning=reasoning, tool_calls=calls)
 
     def _call_with_param_fallback(self, kwargs: dict):
         """Newer OpenAI models reject max_tokens (want max_completion_tokens);
@@ -296,10 +336,29 @@ def make_llm(cfg: Cfg) -> LLMClient:
             temperature=float(cfg.get("temperature", 0.2)),
         )
     if kind == "openai_compat":
+        # Read api_key from yaml OR from the env var named by `env_key`
+        # (defaults to OPENAI_API_KEY). Avoids putting secrets in yaml.
+        import os as _os
+        _api_key = cfg.get("api_key")
+        _env_var = cfg.get("env_key")  # may be None — treat as "no key required" (local dummy)
+        if _api_key is None and _env_var is not None:
+            _api_key = _os.environ.get(_env_var)
+        elif _api_key is None and _env_var is None:
+            # Default to OPENAI_API_KEY for backward compatibility with profiles
+            # that pre-date ADR-0006 (no env_key declared).
+            _api_key = _os.environ.get("OPENAI_API_KEY")
+        if _env_var and not _api_key:
+            # ADR-0006: profile declares env_key but env is unset → misconfig,
+            # surface at startup not at chat time.
+            raise LLMConfigError(
+                profile_name=cfg.get("profile") or cfg.get("name"),
+                env_key=_env_var,
+                hint=f"export {_env_var}=<your-key> before launching",
+            )
         return OpenAICompatClient(
             model=cfg.model,
             base_url=cfg.get("base_url"),
-            api_key=cfg.get("api_key"),
+            api_key=_api_key or "EMPTY",
             supports_vision=bool(cfg.get("supports_vision", True)),
             temperature=float(cfg.get("temperature", 0.2)),
         )

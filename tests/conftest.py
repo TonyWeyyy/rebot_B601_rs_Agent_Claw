@@ -8,6 +8,12 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
+# wrc_demo ``__init__.py`` injects ``wrc_demo/sdk/`` into ``sys.path`` so
+# ``reBotArm_control_py`` (the vendored motor SDK) is importable. The
+# vendored SDK + ``WrcGripper`` (in ``wrc_demo.control.gripper``) are
+# the only arm-control dependencies — wrc_demo no longer references
+# rebot_grasp at runtime (see ADR-0005).
+
 from wrc_demo.config import load_demo_config  # noqa: E402
 
 URDF = REPO / "assets" / "urdf" / "00-arm-rs_asm-v3" / "urdf" / "00-arm-rs_asm-v3.urdf"
@@ -366,3 +372,33 @@ def fake_orbbec_sdk(monkeypatch):
     """
     monkeypatch.setitem(sys.modules, "pyorbbecsdk", FakeOrbbecSDK())
     return sys.modules["pyorbbecsdk"]
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# WrcGripper + RebotArmEndPose mocks (post-ADR-0005).
+# Tests that exercise SkillRuntime with the rebot_grasp bridge use this
+# fixture to replace the SDK objects without needing real hardware.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def wrc_arm_mocks():
+    """Replace RebotArmEndPose + WrcGripper with MagicMocks.
+
+    Returns ``(fake_controller, fake_gripper)`` so tests can introspect
+    calls. The bridge module imports the SDK under ``if TYPE_CHECKING``
+    only, so the live modules don't need to be mocked at import time.
+
+    Pre-set return values for the typical happy-path call sequence.
+    """
+    fake_controller = MagicMock()
+    fake_controller.move_to_traj.return_value = True
+
+    fake_gripper = MagicMock()
+    fake_gripper.grasp.return_value = True
+    fake_gripper.open_gripper.return_value = None
+    fake_gripper.release_gripper.return_value = None
+    fake_gripper.MAX_DISTANCE_M = 0.09
+    fake_gripper.set_position_target.return_value = None
+
+    return fake_controller, fake_gripper

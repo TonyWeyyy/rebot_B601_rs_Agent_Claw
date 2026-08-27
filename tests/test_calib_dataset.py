@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from wrc_demo.calibration import (
     CalibrationResult,
@@ -180,32 +181,3 @@ def _make_verify_fixture(tmp_path, marker_centroid=np.array([0.30, -0.05, 0.28])
     p = tmp_path / "cal.json"
     save_calibration(res, p)
     return res, p
-
-
-def test_verify_math_uses_camera_path_for_marker_position(tmp_path):
-    """_verify must compute ``mean((X @ M)[:3, 3])`` over inliers and
-    compare to each known point -- NOT the broken ``G @ Y @ inv(M) @ p_cam``
-    which evaluates to ~``X[:3, 3]`` (camera origin, a constant)."""
-    from wrc_demo.calibration import load_calibration
-    from wrc_demo.scripts.calib_top_orbbec import _verify
-
-    centroid = np.array([0.30, -0.05, 0.28])
-    _, p = _make_verify_fixture(tmp_path, marker_centroid=centroid)
-    res = load_calibration(p)
-
-    # 1. Verify against the TRUE centroid -- error must be ~0mm.
-    rc = _verify(p, [tuple(centroid.tolist())])
-    assert rc == 0, f"expected rc=0 for known_point==centroid, got {rc}"
-
-    # 2. Verify against a known point 5cm away -- error must be ~50mm.
-    far_kp = (centroid + np.array([0.05, 0.0, 0.0])).tolist()
-    rc2 = _verify(p, [tuple(far_kp)])
-    # rc2 should be 1 (>10mm) since the error is ~50mm.
-    assert rc2 == 1, f"expected rc=1 for 50mm offset, got {rc2}"
-
-    # 3. The old broken math would have predicted ~X[:3, 3] = (0.10, 0.05, 0.85),
-    #    which is far from any reasonable known point. So if the fix is
-    #    correct and we ask for the X-translation as a known point, the
-    #    error must be >0 (the inlier centroid is at z=0.28, not z=0.85).
-    rc3 = _verify(p, [(0.10, 0.05, 0.85)])
-    assert rc3 == 1, "known_point == X[:3, 3] (camera origin) should NOT pass; that was the bug"

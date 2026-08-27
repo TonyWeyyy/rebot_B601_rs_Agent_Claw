@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 from ..skills.runtime import TOOL_SPECS, SkillRuntime
 from .advisor import Advisor
-from .llm import LLMClient, LLMResponse
+from .llm import LLMClient, LLMResponse, ToolCall
 from .prompts import DECOMPOSE_PROMPT, SYSTEM_PROMPT
 from .reflex import FastPlanner
 
@@ -58,6 +58,8 @@ class AgentOrchestrator:
         decompose: bool = True,
         attach_images: bool = True,
         fast_planner: FastPlanner | None = None,
+        cfg=None,
+        fallback_chain: tuple[str, ...] = (),
     ):
         self.llm = llm
         self.runtime = runtime
@@ -66,6 +68,110 @@ class AgentOrchestrator:
         self.decompose = decompose
         self.attach_images = attach_images and llm.supports_vision
         self.fast_planner = fast_planner
+        # ADR-0008: profile switching + fallback. `cfg` is the live
+        # wrc_demo.config.Cfg (or any object with a writable `_data["llm"]`
+        # dict); `fallback_chain` is an ordered list of profile names tried
+        # when the primary chat() raises a transient SDK error. Both default
+        # to inert values, so existing callers (demo.py, tests) are
+        # backward-compatible.
+        self.cfg = cfg
+        self.fallback_chain = list(fallback_chain)
+
+    # ───────────────────────────────────────────────────────────────────
+    # ADR-0008: profile switching + transient-error fallback
+    # ───────────────────────────────────────────────────────────────────
+
+    def switch_llm(self, profile_name: str) -> "LLMClient":
+        """Swap the live LLM client for a new one built from `cfg`.
+
+        `profile_name` overrides `cfg.llm["profile"]` (or sets it if
+        absent) before re-deriving the client. The new client becomes
+        `self.llm`; the next `chat()` uses it. An `llm_switch` event is
+        recorded in the trace.
+        """
+        from .llm import make_llm
+        if self.cfg is None:
+            raise RuntimeError(
+                "switch_llm requires the orchestrator to be constructed "
+                "with a `cfg` argument (ADR-0008)."
+            )
+        sub_cfg = dict(self.cfg._data["llm"])
+        sub_cfg["profile"] = profile_name
+        new_llm = make_llm(sub_cfg)
+        self.llm = new_llm
+        if getattr(self.runtime, "trace", None) is not None:
+            self.runtime.trace.record_event(
+                "llm_switch", {"profile": profile_name}
+            )
+        return new_llm
+
+    def _chat_with_fallback(
+        self,
+        system: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        max_tokens: int = 1024,
+    ) -> LLMResponse:
+        """Try `self.llm` first; on a transient SDK error, walk
+        `self.fallback_chain` in order. Stops on success or chain
+        exhaustion. `LLMConfigError` (raised from `make_llm` itself)
+        is NOT caught here — misconfiguration is a start-up issue that
+        should surface, not be silently masked by a fallback.
+        """
+        from .llm import LLMConfigError
+        import openai
+        transient = (
+            openai.APIConnectionError,
+            openai.APITimeoutError,
+            openai.RateLimitError,
+            openai.AuthenticationError,
+            openai.InternalServerError,
+            openai.BadRequestError,  # 4xx often means the model can't parse the request — recoverable
+        )
+        last_exc: Exception | None = None
+        chain: list[tuple[str, LLMClient]] = [("primary", self.llm)]
+        for profile_name in self.fallback_chain:
+            try:
+                chain.append((profile_name, self._client_for(profile_name)))
+            except LLMConfigError:
+                # Misconfigured fallback profile — surface immediately
+                raise
+            except Exception as e:
+                # Building the fallback itself failed; record and move on
+                if getattr(self.runtime, "trace", None) is not None:
+                    self.runtime.trace.record_event(
+                        "llm_fallback_build_failed",
+                        {"profile": profile_name, "err": str(e)[:200]},
+                    )
+                continue
+        for label, candidate in chain:
+            try:
+                return candidate.chat(
+                    system, messages, tools=tools, max_tokens=max_tokens
+                )
+            except transient as e:
+                last_exc = e
+                if getattr(self.runtime, "trace", None) is not None:
+                    self.runtime.trace.record_event(
+                        "llm_fallback",
+                        {"from": label, "err": str(e)[:200]},
+                    )
+                continue
+        # Chain exhausted
+        assert last_exc is not None
+        raise last_exc
+
+    def _client_for(self, profile_name: str) -> "LLMClient":
+        """Build an LLMClient for a named profile (used by the fallback chain)."""
+        from .llm import make_llm
+        if self.cfg is None:
+            raise RuntimeError(
+                "fallback_chain requires the orchestrator to be constructed "
+                "with a `cfg` argument (ADR-0008)."
+            )
+        sub_cfg = dict(self.cfg._data["llm"])
+        sub_cfg["profile"] = profile_name
+        return make_llm(sub_cfg)
 
     def run_task(self, task: str) -> TaskReport:
         t_start = time.monotonic()
@@ -85,18 +191,23 @@ class AgentOrchestrator:
         if fast_note:
             intro += f"\n{fast_note}\n"
         intro += (
-            "\nMemory (last 15 s):\n" + self.runtime.memory.digest()
+            "\nMemory (last 15 s):\n" + self.runtime.memory.digest(max_lines=5)
             + "\n\nBegin. Observe first, then act. Call one tool now."
         )
         messages.append({"role": "user", "content": intro})
 
         consecutive_failures = 0
+        # 2026-08-13: track whether pick_and_place has succeeded in this task.
+        # If yes, the next call must be task_done (or move_home + task_done) —
+        # never another pick_and_place. The LLM is prone to "verify by re-placing"
+        # loops when list_objects still shows the object at its destination.
+        self._pick_and_place_succeeded_in_task = False
         for step in range(1, self.max_steps + 1):
-            resp = self.llm.chat(
+            resp = self._chat_with_fallback(
                 system=SYSTEM_PROMPT,
                 messages=self._prune_images(messages),
                 tools=TOOL_SPECS,
-                max_tokens=1024,
+                max_tokens=256,
             )
             if not resp.tool_calls:
                 messages.append({"role": "assistant", "content": resp.text or "(no text)"})
@@ -112,11 +223,54 @@ class AgentOrchestrator:
             # one -- OpenAI-style APIs reject the next request if any
             # tool_call in the assistant message lacks a matching result.
             call = resp.tool_calls[0]
+
+            # 2026-08-13: guard against "verify by re-placing" loops. After a
+            # successful pick_and_place, the object is already at its
+            # destination. Re-running pick_and_place just re-grabs and
+            # re-places the same object. Force task_done.
+            if (
+                self._pick_and_place_succeeded_in_task
+                and call.name == "pick_and_place"
+            ):
+                self.runtime.trace.record_event(
+                    "llm_force_task_done",
+                    {
+                        "reason": (
+                            "pick_and_place already succeeded in this task; "
+                            "calling it again would re-grab an object already "
+                            "at its destination"
+                        ),
+                        "original_call": {
+                            "name": call.name,
+                            "arguments": dict(call.arguments or {}),
+                        },
+                    },
+                )
+                call = ToolCall(
+                    name="task_done",
+                    arguments={
+                        "success": True,
+                        "summary": (
+                            "pick_and_place already succeeded earlier in this "
+                            "task; the object is at its destination. (Re-placing "
+                            "suppressed.)"
+                        ),
+                    },
+                )
+
             messages.append(
                 {"role": "assistant", "content": resp.text, "tool_calls": list(resp.tool_calls)}
             )
             result = self.runtime.execute(call.name, call.arguments)
             tool_log.append({"step": step, "tool": call.name, "args": call.arguments, "result": result})
+
+            # 2026-08-13: flag successful pick_and_place so the guard above can
+            # intercept any subsequent pick_and_place calls.
+            if (
+                call.name == "pick_and_place"
+                and bool(result.get("ok"))
+            ):
+                self._pick_and_place_succeeded_in_task = True
 
             if call.name == "task_done" and result.get("task_complete"):
                 summary = str(call.arguments.get("summary", ""))
@@ -138,6 +292,14 @@ class AgentOrchestrator:
             messages.append(
                 {"role": "tool", "tool_call_id": call.id or "call_0", "name": call.name, "content": content}
             )
+            # Sliding window: keep intro + last N to bound context growth
+            # (default N=8 ~= 4 assistant turns + 4 tool results). Each turn
+            # appends up to 3 entries (assistant w/ tool_calls, tool, extras);
+            # N=8 caps at ~3 turns of history which is plenty for short tasks.
+            _MAX_HISTORY = 8
+            if len(messages) > _MAX_HISTORY:
+                messages = messages[:1] + messages[-( _MAX_HISTORY - 1):]
+
             for extra in resp.tool_calls[1:]:
                 messages.append(
                     {
@@ -175,7 +337,7 @@ class AgentOrchestrator:
                             "Two consecutive failures. Change strategy: re-observe, "
                             "try a different approach, or finish with task_done("
                             "success=false, honest summary).\nMemory:\n"
-                            + self.runtime.memory.digest(max_lines=10)
+                            + self.runtime.memory.digest(max_lines=5)
                         ),
                         **extra,
                     }
@@ -244,7 +406,7 @@ class AgentOrchestrator:
 
     def _decompose(self, task: str) -> list[str]:
         try:
-            resp: LLMResponse = self.llm.chat(
+            resp: LLMResponse = self._chat_with_fallback(
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": DECOMPOSE_PROMPT.format(task=task)}],
                 max_tokens=300,

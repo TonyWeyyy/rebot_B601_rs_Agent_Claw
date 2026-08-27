@@ -62,6 +62,21 @@ class TraceLogger:
     def finish(self, summary: str) -> None:
         (self.run_dir / "summary.txt").write_text(summary + "\n")
 
+    def record_event(self, kind: str, payload: dict[str, Any] | None = None) -> None:
+        """Emit a non-skill event to trace.jsonl (e.g. llm_switch, llm_fallback).
+
+        Added 2026-08-11 for ADR-0008 (runtime profile switching + transient
+        error fallback). Backward-compatible: no caller needed it before.
+        """
+        rec = {
+            "step": self._step,
+            "t": time.time(),
+            "event": kind,
+            "payload": _jsonable(payload or {}),
+        }
+        with open(self._trace_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
 
 def _jsonable(obj: Any) -> Any:
     if isinstance(obj, dict):

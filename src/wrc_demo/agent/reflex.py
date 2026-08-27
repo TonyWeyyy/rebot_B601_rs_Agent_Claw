@@ -77,7 +77,7 @@ _RULES: list[tuple[re.Pattern, str]] = [
             r"(?:\s+(?:to\s+the\s+|a\s+la\s+|hacia\s+)?"
             r"(?P<dir>left|right|forward|back|izquierda|derecha|delante|detras|detrás))?$"
         ),
-        "throw",
+        None,  # throw deleted 2026-08-13
     ),
     # "pick (up) (and place/put) X (in/on Y)" / "coge y coloca el objeto rosa"
     (
@@ -94,7 +94,7 @@ _RULES: list[tuple[re.Pattern, str]] = [
             rf"^(?:push|empuja)\s+{_ART}(?P<obj>.+?)\s+(?:to\s+the\s+)?"
             r"(?P<dir>left|right|forward|back)(?:wards?)?$"
         ),
-        "push",
+        None,  # push deleted 2026-08-13
     ),
     # "stack the red cube on the blue box" == pick A, place on B
     (
@@ -104,32 +104,32 @@ _RULES: list[tuple[re.Pattern, str]] = [
     # "hand me / give me the pink object" -> handover
     (
         re.compile(rf"^(?:hand|give|pass|bring)\s+(?:me\s+|us\s+)?{_ART}(?P<obj>.+?)$|^(?:dame|pasame|traeme)\s+{_ART}(?P<obj2>.+?)$"),
-        "handover",
+        None,  # handover deleted 2026-08-13
     ),
     # "point at/to the pink object" / "señala el objeto rosa"
     (
         re.compile(rf"^(?:point\s+(?:at|to)|show\s+me|senala|señala)\s+{_ART}(?P<obj>.+)$"),
-        "point_at",
+        None,  # point_at deleted 2026-08-13
     ),
-    (re.compile(r"^(?:wave|say\s+hi|say\s+hello|saluda)(?:\s+(?:at|to)\s+\S.*)?$"), "wave"),
+    (re.compile(r"^(?:wave|say\s+hi|say\s+hello|saluda)(?:\s+(?:at|to)\s+\S.*)?$"), None),  # wave deleted 2026-08-13
     (
         re.compile(r"^(?:sort|organize|group|ordena|organiza)\s+.*(?:color|colour)e?s?.*$"),
-        "sort_by_color",
+        None,  # sort_by_color deleted 2026-08-13
     ),
     (
         re.compile(rf"^(?:how\s+many|count|cuantos|cuantas)\s+{_ART}(?P<obj>.+?)"
                    r"(?:\s+(?:do\s+you\s+see|are\s+there|hay))?\??$"),
-        "count",
+        None,  # count deleted 2026-08-13
     ),
     (
         re.compile(rf"^move\s+(?:a\s+(?:bit|little)\s+|slightly\s+)?"
                    r"(?P<dir>forward|back|left|right|up|down)(?:\s+a\s+(?:bit|little))?$"),
-        "move_relative",
+        None,  # move_relative deleted 2026-08-13
     ),
     # Home pose: operational ready position [0.25, 0, 0.35, 0, 0, 0]
     (re.compile(r"^(?:go\s+home|move\s+home|home|park(?:\s+the\s+arm)?|back\s+to\s+home|return\s+to\s+home|ready\s+(?:pose|position))$"), "home"),
     # Mechanical zero: all joints to [0, 0, 0, 0, 0, 0]
-    (re.compile(r"^(?:zero\s+joints?|joints?\s+to\s+zero|all\s+joints?\s+zero|mechanical\s+zero|joint\s+zero|zero\s+position)$"), "zero_joints"),
+    (re.compile(r"^(?:zero\s+joints?|joints?\s+to\s+zero|all\s+joints?\s+zero|mechanical\s+zero|joint\s+zero|zero\s+position)$"), None),  # move_to_joint_zero deleted 2026-08-13
     (
         re.compile(
             r"^(?:look(?:\s+around)?|observe|scan|"
@@ -143,7 +143,7 @@ _RULES: list[tuple[re.Pattern, str]] = [
             r"^(?:what\s+do\s+you\s+see\??|what(?:'s|\s+is)\s+on\s+the\s+table\??|"
             r"describe\s+the\s+(?:scene|table)|que\s+ves\??|describe\s+la\s+mesa)$"
         ),
-        "describe",
+        None,  # describe (describe_scene) deleted 2026-08-13
     ),
     (re.compile(r"^(?:open\s+(?:the\s+)?gripper|let\s+go|release|abre\s+la\s+pinza|suelta(?:lo|la)?)$"), "open_gripper"),
     (re.compile(r"^(?:stop|para|alto)$"), None),  # never a reflex: stop is for e-stop tools

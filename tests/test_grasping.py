@@ -21,8 +21,14 @@ def make_fix(center=(0.3, 0.0), size=(0.10, 0.04, 0.06), yaw=0.0, n=400):
 
 
 def test_grasp_across_short_axis():
+    # Strict top-down: open_axis lives in the table plane (y here).
+    # pitch=1.2 (the production default) tilts it out of plane, so the
+    # old "open_axis[1] ≈ 1" assertion no longer holds; pin π/2 to test
+    # the original geometric property.
     fix = make_fix(size=(0.10, 0.04, 0.06), yaw=0.0)
-    grasps = plan_grasps_from_fix(fix, table_z=0.0, max_width_m=0.09)
+    grasps = plan_grasps_from_fix(
+        fix, table_z=0.0, max_width_m=0.09, approach_pitch_rad=np.pi / 2,
+    )
     assert grasps
     g = grasps[0]
     # Opening axis should be along the box's short side (y here).
@@ -34,9 +40,15 @@ def test_grasp_across_short_axis():
 
 
 def test_grasp_yaw_follows_object():
+    # With strict top-down (π/2), the open_axis lies in the table plane
+    # and atan2 gives a clean yaw. pitch=1.2 tilts the axis out of plane
+    # and the same atan2 comparison diverges; pin π/2 to test the
+    # in-plane property the test was written for.
     yaw = 0.6
     fix = make_fix(size=(0.12, 0.03, 0.05), yaw=yaw)
-    grasps = plan_grasps_from_fix(fix, table_z=0.0)
+    grasps = plan_grasps_from_fix(
+        fix, table_z=0.0, approach_pitch_rad=np.pi / 2,
+    )
     open_axis = grasps[0].rotation[:, 1]
     got = np.arctan2(open_axis[1], open_axis[0])
     # Opening across the short side = perpendicular to the box's long axis.

@@ -8,10 +8,15 @@ approval — the planner never talks to motors directly.
 
 Design notes
 ------------
-* The Pinocchio model (``kin.model``) already has ``joint_signs`` baked
-  in at load time, so the planner speaks the same convention as FK/IK.
-* ``pin.SE3`` ↔ ``4×4 ndarray`` conversions are kept local; callers
-  always pass and receive plain numpy arrays.
+* The model (``kin.model``) is already loaded (with the local frame
+  convention baked in at load time), so the planner speaks the same
+  convention as FK/IK. We deliberately don't import pinocchio here —
+  the harness's :class:`Kinematics` is loaded via the SDK and exposes
+  ``model``/``data`` but no ``_pin`` module handle, so we pass
+  ``4×4 ndarrays`` straight through to the trajectory sampler's
+  ``_se3_interpolate`` (which converts them internally) instead of
+  wrapping them in ``pin.SE3``.
+* Callers always pass and receive plain numpy arrays.
 * CLIK tracking tolerates a configurable fraction of unconverged
   points — near-singular configurations (wrist limits on the B601-RS)
   occasionally fail to converge but the surrounding waypoints are
@@ -62,7 +67,6 @@ class CartesianPlanner:
                 "install reBotArm_control_py or set sdk_path"
             )
         self.kin = kin
-        self._pin = kin._pin
         self._dt = dt
         if profile not in _PROFILES:
             raise ValueError(f"unknown profile {profile!r}; choose from {list(_PROFILES)}")
@@ -70,13 +74,20 @@ class CartesianPlanner:
         self._null_gain = null_gain
 
     # ── SE(3) conversion helpers ─────────────────────────────────────────
+    #
+    # Identity passthroughs: the vendored SDK's ``_se3_interpolate``
+    # (in ``trajectory.sampler``) already promotes ``4×4 ndarray``
+    # inputs to ``pin.SE3`` internally, so we don't need any pinocchio
+    # wrapper here. We deliberately don't import pinocchio in this
+    # module because the harness's :class:`Kinematics` is loaded via
+    # the SDK and exposes ``model``/``data``/``fid`` but no ``_pin``
+    # module handle.
 
-    def _to_se3(self, T: np.ndarray):
-        T = np.asarray(T, dtype=float)
-        return self._pin.SE3(T[:3, :3].copy(), T[:3, 3].copy())
+    def _to_se3(self, T: np.ndarray) -> np.ndarray:
+        return np.asarray(T, dtype=float)
 
-    def _from_se3(self, se3) -> np.ndarray:
-        return np.array(se3.homogeneous)
+    def _from_se3(self, T: np.ndarray) -> np.ndarray:
+        return np.asarray(T, dtype=float)
 
     # ── core planning ────────────────────────────────────────────────────
 
@@ -86,7 +97,7 @@ class CartesianPlanner:
         T_start: np.ndarray,
         T_end: np.ndarray,
         duration: float = 2.0,
-        max_fail_ratio: float = 0.15,
+        max_fail_ratio: float = 0.05,  # 2026-08-13: tighter default; partial-IK-failure trajectories must not silently move the arm short of the target
     ) -> List[np.ndarray]:
         """Plan an SE(3) geodesic trajectory and return joint waypoints.
 
@@ -125,11 +136,17 @@ class CartesianPlanner:
         )
         # Pad q to model.nq if the arm has passive joints (e.g. finger
         # prismatic joints on the RS model: nq=8, n_controlled=6).
-        q_init = np.zeros(self.kin.model.nq)
-        q_init[: self.kin.n] = np.asarray(q_start, dtype=float)[: self.kin.n]
+        # safety.harness.Kinematics 暴露 _model/_n_arm; control.kinematics.Kinematics 暴露 model/n
+        # 兼容两种 Kinematics（safety.harness 是当前用的，control.kinematics 是已废弃）
+        _model = getattr(self.kin, '_model', getattr(self.kin, 'model', None))
+        _n_arm = getattr(self.kin, '_n_arm', getattr(self.kin, 'n', None))
+        if _model is None or _n_arm is None:
+            raise RuntimeError("Kinematics missing required attrs (model/_model and n/_n_arm)")
+        q_init = np.zeros(_model.nq)
+        q_init[:_n_arm] = np.asarray(q_start, dtype=float)[:_n_arm]
         joint_traj = track_trajectory(
-            self.kin.model,
-            self.kin.fid,
+            _model,
+            getattr(self.kin, '_ee_frame_id', getattr(self.kin, 'fid', None)),
             cart_result.trajectory,
             q_init,
             ik_params,
@@ -148,7 +165,7 @@ class CartesianPlanner:
                 f"({ratio:.0%} > {max_fail_ratio:.0%}); trajectory rejected"
             )
 
-        return [pt.q[: self.kin.n].copy() for pt in joint_traj]
+        return [pt.q[:_n_arm].copy() for pt in joint_traj]
 
     def plan_linear(
         self,

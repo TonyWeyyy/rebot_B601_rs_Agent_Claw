@@ -116,10 +116,23 @@ silently vanishes.
 
 | profile | backend | notes |
 |---|---|---|
-| `anthropic` | Claude (cloud) | `ANTHROPIC_API_KEY`; vision + tools |
-| `local_qwen` | local Qwen via llama.cpp / vLLM on the Spark | OpenAI-compatible; MTP speculative decoding (~1.4–2.2× decode) |
-| `openai` | any OpenAI-compatible cloud endpoint | `OPENAI_API_KEY` |
-| `mock` | scripted | tests / wiring checks |
+| `mock` | scripted (no network) | tests / wiring checks; default in `tests/conftest.py` |
+| `anthropic` | Claude (cloud) | `ANTHROPIC_API_KEY` env; vision + tools |
+| `openai` | any OpenAI-compatible cloud endpoint | `OPENAI_API_KEY` env |
+| `minimax` | MiniMax cloud (`api.minimax.chat/v1`, model `MiniMax-M3`) | `MINIMAX_API_KEY` env; text-only (no vision); see `scripts/test_minimax_connectivity.py` |
+| `local_qwen` | local Qwen via llama.cpp / vLLM on the Spark | OpenAI-compatible; MTP speculative decoding (~1.4–2.2× decode). Needs ~24 GB. |
+| `local_cosmos3` | local `nvidia/Cosmos3-Edge` 4B (AWQ W4A16) via vLLM | 8 GB VRAM; Qwen3-Coder XML tool protocol; see `docs/SPEC-local-llm.md` and `scripts/serve_cosmos3_vllm.sh` |
+
+> **Secrets are env vars, never in YAML.** Cloud profiles
+> (`anthropic`/`openai`/`minimax`) read their key from the env var named
+> in `env_key:` (see `.env.example`). The old practice of writing
+> `api_key: sk-…` into the YAML is gone — see `docs/adr/0006-move-secrets-to-env-vars.md`.
+
+> **Cold start** selects via `--llm <profile>`. **Runtime switch** uses
+> the MCP `llm_switch` tool (see `docs/adr/0008-llm-profile-switching.md`).
+> A `fallback_chain: [...]` in the orchestrator walks through other
+> profiles on transient LLM failures; a `LLMConfigError` (missing env
+> var) is **not** masked and propagates immediately.
 
 > **Keep the profile in sync with the server:** `configs/llm/local_qwen.yaml`
 > currently pins `model: Qwen3VL-30B-A3B-Instruct-Q4_K_M` while both serve
@@ -128,7 +141,9 @@ silently vanishes.
 > `supports_vision: true` still holds there); vLLM rejects a mismatched
 > model name and has no vision wiring. Set the profile's `model:` (and
 > `supports_vision:` if your server lacks a vision projector) to whatever
-> the server actually loads.
+> the server actually loads. For a fresh local-only setup on 8 GB
+> VRAM, prefer `local_cosmos3` (ADR-0007) — it's a 4 B model that
+> actually fits and ships with a working tool-calling path.
 
 ## Run it under any MCP agent platform
 

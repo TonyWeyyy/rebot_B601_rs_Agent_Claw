@@ -239,12 +239,7 @@ class McpSkillServer:
                 return _text_result({"ok": True, "stopped": True,
                                      "note": "arm frozen; call reset_stop to resume"})
             if name == "reset_stop":
-                runtime.arm.harness.reset_estop()
-                raw = runtime.arm.raw
-                if hasattr(raw, "resume"):
-                    raw.resume()
-                elif hasattr(raw, "_stopped"):
-                    raw._stopped = False
+                runtime.arm.resume()
                 return _text_result({"ok": True, "stopped": False})
             if name == "pick_and_place":  # narrate on the dashboard
                 obj = (arguments or {}).get("object", "?")

@@ -222,4 +222,41 @@ runs/
 datasets/
 skills_library/
 mobileclip2_b.ts
+mobileclip_blt.ts
+models/*.ts
+models/mobileclip2_b.ts
 models/mobileclip_blt.ts
+*.bak
+*.bak_*
+*.orig
+
+# Local LLM models (large; download via scripts/start_*.sh instead of committing)
+models/cosmos3-edge/
+models/cosmos3-edge-w4a16/
+models/cosmos-reason2-2b*/
+models/qwen3-vl-2b-fp8/
+models/qwen3-vl-2b-awq-4bit/
+
+# yoloe detector + text encoder (YOLOE auto-downloads on first use; see configs/demo.yaml)
+# Comment out to ship weights in-tree.
+# models/yoloe-*.pt
+# models/mobileclip*.ts
+
+# Vendored SDK mirrors upstream — never edit in tree; regen from upstream + re-apply local patches
+# (see sdk/README.md). The current in-tree copy IS the source of truth; if
+# you need a clean re-vendor, delete sdk/reBotArm_control_py/ and re-clone.
+# sdk/reBotArm_control_py/
+
+# Orbbec SDK runtime logs (regenerated on every camera run)
+**/Log/OrbbecSDK.log.txt
+**/Log/Orbbec*.log
+
+# Per-launcher PID + log files (root owns these in dev)
+.vllm_*.pid
+.wrc_*.pid
+
+# Local cleanup backup
+.cleanup_backup/
+
+# Teach-record/replay slot files (JSON recordings, .gitkeep stays tracked)
+data/recordings/*.json
