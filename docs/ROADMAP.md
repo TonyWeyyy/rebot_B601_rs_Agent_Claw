@@ -77,16 +77,7 @@
      `table_z` / workspace AABB for the physical setup.
   5. `pytest -m hardware` (read-only), then first motions with
      `--arm rebot_rs` at low `max_joint_vel`.
-- **Local LLM**: run `scripts/serve_qwen_llamacpp.sh` (Qwen3.6-27B GGUF, MTP
-  speculative decoding) and rehearse with `--llm local_qwen` so the demo has
-  a no-internet fallback. vLLM variant in `serve_qwen_vllm.sh`. **Reconcile
-  first:** `configs/llm/local_qwen.yaml` pins `model:
-  Qwen3VL-30B-A3B-Instruct-Q4_K_M` + `supports_vision: true` while both
-  serve scripts fetch Qwen3.6-27B — llama.cpp ignores the requested model
-  name (and its script wires vision via the mmproj projector, so
-  `supports_vision: true` holds there) but vLLM rejects the mismatched name
-  and has no vision wiring; `supports_vision` gates the advisor and image
-  context.
+- **Local LLM**: the `local_qwen` profile was deleted (2026-08-27) because it was never wired — its model name had no matching serve script. Production path is `local_qwen3_vl` (Qwen3-VL-2B-Instruct AWQ-4bit, served by `scripts/start_cosmos3_server.sh`). If a 30B-A3B Q4_K_M path is needed later, write a fresh `serve_qwen_llamacpp.sh` defaulting to that GGUF.
 - **Visual embedder for memory**: plug a CLIP/SigLIP image encoder into
   `EpisodicMemory(embed_dim=...)` + crops per detection, enabling
   "the thing that looked like X" recall through the TurboQuant index.

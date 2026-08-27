@@ -257,7 +257,7 @@ warnings).
   tip-offset / sweep-volume calibration still open (see ROADMAP).
 - NOT yet exercised: real-arm motion (needs onsite gripper re-verification
   and hand-eye calibration), local Qwen serving (scripts provided; note the
-  `local_qwen.yaml` model-name mismatch flagged in the README and ROADMAP).
+  `local_qwen.yaml` was deleted 2026-08-27 -- see CLAUDE.md.)
 - Orbbec Gemini 2 backend (`perception/orbbec_camera.py`, lazy `pyorbbecsdk`
   import) + hand-eye calibration pipeline (`calibration/` module +
   `scripts/calib_top_orbbec.py` CLI) shipped but NOT yet exercised against
