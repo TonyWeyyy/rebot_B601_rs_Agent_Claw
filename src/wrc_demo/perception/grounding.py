@@ -38,6 +38,7 @@ class Extrinsics:
         source: str = "inline",
         frame_convention: str = "wrc_demo",
         schema_version: int | None = None,
+        hand_eye_compensation_m: dict | None = None,
     ):
         """`T` is T_cam2base (eye_to_hand) or T_cam2gripper (eye_in_hand).
 
@@ -54,6 +55,17 @@ class Extrinsics:
         self.frame_convention = frame_convention
         self.schema_version = schema_version
 
+        # Build T_compensation from hand_eye_compensation_m (or identity).
+        # Mirrors rebot_grasp calibration.hand_eye_compensation_m
+        # (utils/camera_utils.py::compose_cam_to_base_transform). See ADR-0009.
+        comp = hand_eye_compensation_m or {}
+        self._T_compensation = np.eye(4)
+        self._T_compensation[:3, 3] = [
+            float(comp.get("x", 0.0)),
+            float(comp.get("y", 0.0)),
+            float(comp.get("z", 0.0)),
+        ]
+
     @classmethod
     def from_config(cls, cfg, fk_tcp2base=None) -> "Extrinsics":
         mode = cfg.get("mode", "eye_to_hand")
@@ -62,23 +74,30 @@ class Extrinsics:
         json_path = cfg.get("source")
         npz_path = cfg.get("hand_eye_npz")
         profile_serial = cfg.get("camera_serial") or cfg.get("serial")
+        # ADR-0009: optional per-camera manual compensation on top of whatever
+        # the loader produced. Default identity (no compensation).
+        comp = cfg.get("hand_eye_compensation_m")
 
         if json_path:
             jp = Path(str(json_path))
             if jp.exists():
                 return cls._load_new_json(jp, mode=mode, fk_tcp2base=fk_tcp2base,
-                                          profile_serial=profile_serial)
+                                          profile_serial=profile_serial,
+                                          hand_eye_compensation_m=comp)
 
         if npz_path and Path(npz_path).exists():
             return cls._load_npz(Path(npz_path), mode=mode, fk_tcp2base=fk_tcp2base,
-                                 profile_serial=profile_serial)
+                                 profile_serial=profile_serial,
+                                 hand_eye_compensation_m=comp)
 
         mat = cfg.get("T")
         T = np.asarray(mat, dtype=float).reshape(4, 4) if mat is not None else None
-        return cls(mode=mode, T=T, fk_tcp2base=fk_tcp2base, source="inline")
+        return cls(mode=mode, T=T, fk_tcp2base=fk_tcp2base, source="inline",
+                   hand_eye_compensation_m=comp)
 
     @classmethod
-    def _load_new_json(cls, jp: Path, *, mode: str, fk_tcp2base, profile_serial) -> "Extrinsics":
+    def _load_new_json(cls, jp: Path, *, mode: str, fk_tcp2base, profile_serial,
+                          hand_eye_compensation_m=None) -> "Extrinsics":
         with open(jp) as f:
             data = json.load(f)
         schema_version = int(data.get("schema_version", 1))
@@ -103,15 +122,18 @@ class Extrinsics:
                 mode=mode, T=T_marker, fk_tcp2base=fk_tcp2base,
                 source=f"new-json:{jp.name}", frame_convention=fc,
                 schema_version=schema_version,
+                hand_eye_compensation_m=hand_eye_compensation_m,
             )
         return cls(
             mode=mode, T=T, fk_tcp2base=fk_tcp2base,
             source=f"new-json:{jp.name}", frame_convention=fc,
             schema_version=schema_version,
+            hand_eye_compensation_m=hand_eye_compensation_m,
         )
 
     @classmethod
-    def _load_npz(cls, npz_path: Path, *, mode: str, fk_tcp2base, profile_serial) -> "Extrinsics":
+    def _load_npz(cls, npz_path: Path, *, mode: str, fk_tcp2base, profile_serial,
+                       hand_eye_compensation_m=None) -> "Extrinsics":
         data = np.load(npz_path, allow_pickle=True)
         keys = set(data.files)
         cam_serial = ""
@@ -142,6 +164,7 @@ class Extrinsics:
                 mode=mode, T=T_use, fk_tcp2base=fk_tcp2base,
                 source=f"curobo-npz:{npz_path.name}", frame_convention=fc,
                 schema_version=schema_version,
+                hand_eye_compensation_m=hand_eye_compensation_m,
             )
         if "T_result" in keys:
             T = np.asarray(data["T_result"], dtype=float)
@@ -152,6 +175,7 @@ class Extrinsics:
                 mode=saved_mode, T=T, fk_tcp2base=fk_tcp2base,
                 source=f"legacy-npz:{npz_path.name}", frame_convention=fc,
                 schema_version=schema_version,
+                hand_eye_compensation_m=hand_eye_compensation_m,
             )
         raise ValueError(
             f"{npz_path}: NPZ has neither T_cam2base nor T_result; "
@@ -159,12 +183,20 @@ class Extrinsics:
         )
 
     def cam_to_base(self) -> np.ndarray:
-        """T_cam2base at this instant (uses live FK for eye-in-hand)."""
+        """T_cam2base at this instant (uses live FK for eye-in-hand).
+
+        Composition mirrors rebot_grasp compose_cam_to_base_transform
+        (utils/camera_utils.py) plus our _T_compensation from
+        hand_eye_compensation_m (ADR-0009):
+            ETH: T_cam2base = T_compensation @ T_hand_eye
+            EIH: T_cam2base = T_compensation @ T_tcp2base @ T_hand_eye
+        T_compensation defaults to identity (no compensation).
+        """
         if self.mode == "eye_to_hand":
-            return self.T
+            return self._T_compensation @ self.T
         if self._fk is None:
             raise SkillError("eye_in_hand extrinsics need a FK callback")
-        return self._fk() @ self.T
+        return self._T_compensation @ self._fk() @ self.T
 
 
 def mask_to_points_cam(

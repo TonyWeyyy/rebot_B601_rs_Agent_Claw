@@ -17,8 +17,11 @@ safety:
 grasp:
   # Grasp planner: "obb" (analytic, always available) or "graspgenx"
   # (learned 6-DoF via the ZMQ server -- scripts/serve_graspgenx.sh; falls
-  # back to OBB automatically if the server is down).
-  backend: graspgenx
+  # back to OBB automatically if the server is down)
+  # 2026-07-28: temporarily flipped to "obb" while the graspgenx server is
+  # offline (port 5556 not listening; ~/Projects/demo/.graspgenx missing).
+  # Revert to "graspgenx" once the server is back up.
+  backend: obb
   graspgenx:
     host: 127.0.0.1
     port: 5556
@@ -42,12 +45,26 @@ grasp:
       fingertip_depth: 0.0225
   # NOTE: strict top-down tool poses are only IK-reachable below z~0.15 on
   # the B601-RS (wrist limits); keep grasp_z + offset under that.
-  pregrasp_offset_m: 0.04   # hover height above the grasp along -approach.
+  pregrasp_offset_m: 0.08   # hover height above the grasp along -approach.
                             # Kept small: tall (12 cm) blocks are grasped near
                             # z~0.10, and a larger hover pushes the pregrasp
                             # pose above z~0.15 where top-down IK fails on the
                             # B601-RS.
-  depth_fraction: 0.15      # grasp this far down from the object's TOP. Low
+  # Camera-frame planner (rebot_grasp-style, primary when segmentation
+  # mask + depth are available): the approach direction aligns with the
+  # camera's line of sight, so a tilted camera doesn't bias the grasp
+  # geometry.
+  #
+  # insertion_depth_m adds an extra TCP offset along tool-x on top of
+  # rebot_grasp's ``hand_eye_compensation_m`` (which is already baked
+  # into ``data/calibration/hand_eye_top.json`` as a z=-0.02 camera-
+  # frame shift). rebot_grasp's own ``scripts/main.py:320`` does NOT
+  # pass insertion_depth_m to ``transform_grasp_pose_to_base`` -- it
+  # relies on the 2 cm compensation alone, which gives the equivalent
+  # of a 20 mm gripper-finger offset. Set to 0 here to match rebot_grasp;
+  # raise if your gripper has a longer tip-to-TCP offset.
+  insertion_depth_m: 0.0    # matches rebot_grasp; see calibration file
+  depth_fraction: 0.35      # grasp this far down from the object's TOP. Low
                             # value = grasp near the top face, which keeps the
                             # gripper fingers (they extend ~5cm below the TCP)
                             # above the table on tall blocks.
@@ -69,6 +86,13 @@ grasp:
   home_after_place: true    # clear the camera view after each pick_and_place
   topdown_z_max: 0.15       # strict top-down poses are IK-unreachable above
                             # this on the B601-RS (wrist limits)
+  # Approach pitch (rad) from +z for the grasp vector. rebot_grasp uses
+  # 1.2 (~69°); pure top-down (π/2 = 90°) is geometrically awkward from
+  # the elbow-up ``home_q`` and the DLS IK can't cross into the elbow-down
+  # basin needed for strict top-down. Lower this to ~0.6 for a more
+  # "vertical" pose; raise toward π/2 to push toward strict top-down
+  # (only succeeds if arm is in an elbow-down basin to start).
+  approach_pitch_rad: 1.2
   # Persistence: pick_and_place keeps retrying (re-home, re-scan, fresh
   # grasp plan) until it succeeds or one of these budgets runs out.
   persist_seconds: 120
@@ -103,11 +127,21 @@ detector:
   # the weights into ${repo}/models on first use if absent, so the demo is
   # object-agnostic out of the box (any visitor object localizes by name).
   # Override with $WRC_DETECTOR_MODEL for a hand-tuned checkpoint.
+  # 2026-08-07: switched to yoloe-26l-seg from rebot_grasp/models/ --
+  # the 26L is the same model rebot_grasp uses and matches its banana /
+  # cyan-toy detection performance. 2x slower per frame but worth the
+  # recognition quality on first deployment. YOLOE-26L expects
+  # mobileclip2_b.ts in models/ (already present).
   type: yoloe
   model: ${repo}/models/yoloe-11s-seg.pt
-  device: cuda:0
-  conf: 0.10
+  device: cpu
+  conf: 0.20
 
 # Default vocabulary scanned during get_observation (the agent can localize
 # anything by name on top of this).
-detect_classes: ["cup", "mug", "bottle", "bowl", "box", "cube", "fruit", "toy", "cylinder", "tube", "glass", "container", "object"]
+detect_classes: ["banana", "yellow banana", "box","pen","toy","red cube"]
+
+# ADR-0009 per-camera hand-eye manual compensation lives in each camera
+# profile's extrinsics.hand_eye_compensation_m (see configs/cameras/*.yaml).
+# No demo.yaml-level global -- every camera must declare its own value
+# explicitly to avoid silent inheritance when new cameras are added.

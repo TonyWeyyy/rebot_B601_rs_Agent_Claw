@@ -22,6 +22,15 @@ extrinsics:
     - [0, 1, 0, 0]
     - [0, 0, 1, 0]
     - [0, 0, 0, 1]
+  # ADR-0009: hand-eye compensation (meters, default [0,0,0] = identity).
+  # Mirrors rebot_grasp cfg.calibration.hand_eye_compensation_m;
+  # tune when grasp pose drifts. Per-camera only -- no demo.yaml global.
+  #   ETH: T_cam2base = T_compensation @ T_hand_eye
+  #   EIH: T_cam2base = T_compensation @ T_tcp2base @ T_hand_eye
+  hand_eye_compensation_m:
+    x: 0.00
+    y: 0.00
+    z: 0.00
 
 # 该 profile 表示一台必须经过 hand-eye 标定才允许 3D 融合的相机:
 # - 标定文件存在: fuse_beliefs 由 profile 显式设为 true
