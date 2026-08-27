@@ -37,7 +37,7 @@ except Exception:
 if os.environ.get("ANTHROPIC_API_KEY"):
     llm_profile = "anthropic"
 elif qwen_up:
-    llm_profile = "local_qwen"
+    llm_profile = "local_qwen3_vl"  # was "local_qwen" (deleted: 30B-A3B profile was never wired)
 print(f"LLM TIER: {llm_profile}", flush=True)
 
 cfg = load_demo_config(cameras=["isaac", "isaac_side", "isaac_wrist"],
@@ -45,7 +45,7 @@ cfg = load_demo_config(cameras=["isaac", "isaac_side", "isaac_wrist"],
 if qwen_up:
     # VLM grounding: 2nd perception filter when YOLOE misses (slow path only)
     cfg._data["grounder"] = {"base_url": "http://127.0.0.1:8080/v1",
-                             "model": "qwen3.6-27b"}
+                             "model": "qwen3-vl-2b-awq-4bit"}  # matches local_qwen3_vl server (was "qwen3.6-27b", wrong)
 cfg._data["detector"]["conf"] = 0.12  # pastel cubes on RTX renders sit ~0.15
 # name the booth objects explicitly: beliefs are stored under DETECTOR
 # labels, and "banana" cannot resolve a belief labeled "fruit"
