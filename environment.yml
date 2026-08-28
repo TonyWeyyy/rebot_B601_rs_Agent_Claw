@@ -1,0 +1,84 @@
+# wrc-demo conda environment
+#
+# Single-source-of-truth install. Clone the repo and run:
+#
+#     conda env create -f environment.yml
+#     conda activate wrc-demo
+#
+# That's it. You get a fully-functional wrc-demo runtime:
+#   - mock tests (no hardware needed)
+#   - real hardware (Orbbec / reBot Arm B601-RS) once USB + CAN are connected
+#   - every LLM profile (`local_qwen3_vl` needs a separate vLLM process
+#     started via `scripts/start_cosmos3_server.sh --bg`; the rest just
+#     need their API keys exported)
+#
+# What's installed:
+#   - Python 3.10 + numpy + pyyaml + pytest + opencv-python-headless
+#   - wrc-demo package itself, editable, with ALL extras:
+#       [perception] ultralytics (YOLOE / YOLO-World)
+#       [llm]        openai + anthropic clients (covers llama.cpp / vLLM too)
+#       [kinematics] pin (Pinocchio FK/IK)
+#       [arm]        motorbridge (RobStride over SocketCAN)
+#       [dev]        pytest + pytest-cov
+#   - pyorbbecsdk2 (Orbbec Gemini 2 SDK; not in pyproject because it's
+#     optional on a per-camera basis)
+#   - fashionstar-uart-sdk (PiPER Mate master arm, optional; only needed
+#     if you use teach_record / teach_replay skills)
+#   - huggingface-hub (for the manual download path in
+#     `scripts/setup_models.py`)
+#
+# Why not `requirements.txt`?
+#   wrc-demo uses PEP 621 standard + 4 optional dep groups (perception / llm /
+#   kinematics / arm); pure requirements.txt can't express optional
+#   dependencies. environment.yml + pyproject.toml is the canonical pair.
+#
+# Notes:
+#   - System deps (libusb-1.0-0-dev for Orbbec cameras, ffmpeg for video,
+#     can-utils for the SocketCAN bus) are NOT installed by conda here.
+#     On Ubuntu/Debian run:
+#         sudo apt install -y libusb-1.0-0-dev ffmpeg can-utils
+#   - torch is intentionally NOT a dependency: ultralytics pins the right
+#     torch version for you at install time (CPU by default; install the
+#     CUDA build with `pip install torch --index-url https://download.pytorch.org/whl/cu121`
+#     before the `conda env create` if you need GPU detection).
+#   - Orbbec cameras on Linux need udev rules; run once after install:
+#         bash scripts/install_udev_rules.sh
+#         sudo udevadm control --reload-rules && sudo udevadm trigger
+
+name: wrc-demo
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # ── Core scientific stack (conda-forge keeps these up to date) ───────
+  - python=3.10
+  - numpy>=1.26
+  - pyyaml>=6.0
+  - pytest>=8.0
+  - pytest-cov>=4.0
+  # NOTE: opencv is intentionally NOT installed by conda — pyproject pins
+  # `opencv-python-headless` so cv2.imshow can never silently crash on a
+  # headless server. Letting the pip-installable -e .[...] provide it
+  # avoids the conda-forge opencv ↔ opencv-python-headless conflict.
+
+  # ── Everything else via pip (most hardware SDKs are pip-only anyway) ──
+  - pip:
+      # wrc-demo package itself, editable, with all four extras + dev.
+      # This single line covers: ultralytics (perception), openai +
+      # anthropic (llm), pin (kinematics), motorbridge (arm),
+      # pytest + pytest-cov (dev), plus numpy/opencv-python-headless/pyyaml.
+      - -e ".[perception,llm,kinematics,arm,dev]"
+
+      # Orbbec Gemini 2 SDK — pip-only (no conda-forge package).
+      # Skippable if you only use RealSense / OpenCV UVC / mock cameras.
+      - pyorbbecsdk2>=2.1.1
+
+      # PiPER Mate master-arm SDK (only needed for the teach_record /
+      # teach_replay skills that do master-slave teleop from PiPER Mate →
+      # reBot B601-RS). Skippable if you don't use teleop.
+      - fashionstar-uart-sdk
+
+      # HuggingFace CLI for the manual-download path in setup_models.py.
+      - huggingface-hub
