@@ -260,3 +260,27 @@ models/qwen3-vl-2b-awq-4bit/
 
 # Teach-record/replay slot files (JSON recordings, .gitkeep stays tracked)
 data/recordings/*.json
+
+# Open-source release hygiene (2026-08-27)
+# ----------------------------------------
+# The checked-in hand-eye calibration is the DEMO default; it has been
+# anonymized (camera_serial -> "REDACTED", samples_for_repro stripped).
+# Local recalibration output goes to a *.local.json sidecar so the
+# private camera_serial never lands in git history again:
+data/calibration/hand_eye_top.local.json
+data/calibration/hand_eye_wrist.local.json
+
+# Blanket-ignore the bundled-models directory. The downloader script
+# (scripts/setup_models.py) is the only blessed entry point.
+# Files in models/ are tracked only if explicitly added (none expected).
+models/*
+!models/.gitkeep
+!models/README.md
+
+# Recursive SDK mirrors — never edit in tree; see sdk/README.md.
+sdk/reBotArm_control_py/
+
+# Editor / IDE scratch files
+.vscode/
+.idea/
+*.swp
