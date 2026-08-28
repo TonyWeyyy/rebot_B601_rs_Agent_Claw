@@ -61,6 +61,9 @@ cd wrc
 ### 2. Create and activate the conda env (one shot)
 
 ```bash
+# If a previous install attempt left a broken partial env, remove it first:
+# conda env remove -n wrc-demo -y
+
 conda env create -f environment.yml
 conda activate wrc-demo
 ```
@@ -68,6 +71,7 @@ conda activate wrc-demo
 `environment.yml` gives you:
 
 - **Python 3.10 + numpy + pyyaml + pytest** (conda-forge)
+- **`pandas>=2.0,<3` pin** (pip) — read the warning below before removing this
 - **`wrc-demo` package editable with every extras**:
   - `[perception]` → `ultralytics` (YOLOE / YOLO-World detector)
   - `[llm]` → `openai` + `anthropic` (covers llama.cpp / vLLM local servers too)
@@ -80,6 +84,16 @@ conda activate wrc-demo
 
 That's a single conda env that supports **all four run modes** (mock,
 real cameras, real arm, real everything) — no tier switching needed.
+
+> **⚠ Why `pandas>=2.0,<3` is pinned** — `pyorbbecsdk2` transitively pulls
+> `open3d==0.18.0` which wants `pandas>=1.0,<2`. If pip resolver picks any
+> pandas 1.x, that version's sdist triggers building `numpy==1.19.3` from
+> source, whose C code calls Python 3.10+`'s renamed
+> `_Py_HashDouble(PyObject*, double)` with the old signature. **The build
+> fails with `incompatible type for argument 1 of '_Py_HashDouble'`.**
+> Forcing `pandas>=2.0` makes pip pick a prebuilt wheel (no source compile)
+> and open3d 0.18 accepts it. **Don't delete this pin** unless every
+> transitive dep is upgraded to a pandas-2-compatible release.
 
 > **Why `opencv` is not in the conda deps**: `pyproject.toml` pins
 > `opencv-python-headless` (so `cv2.imshow` can never silently crash on a

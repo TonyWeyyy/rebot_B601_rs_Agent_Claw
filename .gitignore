@@ -284,3 +284,4 @@ sdk/reBotArm_control_py/
 .vscode/
 .idea/
 *.swp
+condaenv.*.requirements.txt

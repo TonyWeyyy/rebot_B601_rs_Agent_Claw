@@ -49,7 +49,6 @@ name: wrc-demo
 
 channels:
   - conda-forge
-  - defaults
 
 dependencies:
   # ── Core scientific stack (conda-forge keeps these up to date) ───────
@@ -65,15 +64,36 @@ dependencies:
 
   # ── Everything else via pip (most hardware SDKs are pip-only anyway) ──
   - pip:
+      # ---- Dependency pin: pandas (do NOT remove without testing) ----
+      # Even with `pyorbbecsdk2` moved to a post-install step, pip
+      # may still resolve `pandas<2` from other transitive deps. If pip
+      # resolver picks any pandas 1.x, that version's source distribution
+      # has a setup.py that triggers building `numpy==1.19.3` from source.
+      # numpy 1.19.3 is broken on Python 3.10+ (its C code calls
+      # `_Py_HashDouble(double)` but Python 3.10+ changed the signature
+      # to `_Py_HashDouble(PyObject*, double)`, so the build fails with an
+      # incompatible-type error). Forcing pandas>=2.0 makes pip pick
+      # pandas 2.2.x (already a wheel, no source build).
+      - pandas>=2.0,<3
+
+      # ---- Explicit torch (ultralytics marks it as optional) ----
+      # ultralytics' pyproject marks `torch>=1.8.0` as an optional
+      # dependency, so a bare `pip install ultralytics` skips torch
+      # entirely. But `from ultralytics import ...` triggers `import
+      # torch` at the top of `ultralytics/utils/__init__.py`, which
+      # fails with ModuleNotFoundError on the wrc-demo env. Adding
+      # torch here makes preflight tests + OpenVocabDetector init work
+      # out of the box (CPU build by default; for GPU detection:
+      #   pip install torch --index-url
+      #     https://download.pytorch.org/whl/cu121
+      #   BEFORE the `conda env create`, or in-place after).
+      - torch>=2.0
+
       # wrc-demo package itself, editable, with all four extras + dev.
       # This single line covers: ultralytics (perception), openai +
       # anthropic (llm), pin (kinematics), motorbridge (arm),
       # pytest + pytest-cov (dev), plus numpy/opencv-python-headless/pyyaml.
       - -e ".[perception,llm,kinematics,arm,dev]"
-
-      # Orbbec Gemini 2 SDK — pip-only (no conda-forge package).
-      # Skippable if you only use RealSense / OpenCV UVC / mock cameras.
-      - pyorbbecsdk2>=2.1.1
 
       # PiPER Mate master-arm SDK (only needed for the teach_record /
       # teach_replay skills that do master-slave teleop from PiPER Mate →
@@ -82,3 +102,21 @@ dependencies:
 
       # HuggingFace CLI for the manual-download path in setup_models.py.
       - huggingface-hub
+
+  # ---- NOTE: pyorbbecsdk2 (Orbbec Gemini 2 SDK) is NOT installed here. ----
+  # It transitively pulls `open3d==0.18.0`, which has a deep dep chain
+  # (`dash → flask → plotly → ipywidgets → jupyter → traitlets → ...`)
+  # that frequently overflows the resolver to "resolution-too-deep"
+  # (>1000 packages). The open3d extras are NOT required for headless
+  # camera capture (which is what wrc_demo needs from pyorbbecsdk2).
+  #
+  # If you're using an Orbbec Gemini 2 camera, install pyorbbecsdk2 AFTER
+  # the conda env is set up, from inside the env:
+  #
+  #   conda activate wrc-demo
+  #   pip install pyorbbecsdk2>=2.1.1
+  #
+  # The pyorbbecsdk2 wheel bundles its own `libOrbbecSDK` (a C extension
+  # compiled against Python 3.10 + numpy 2.x) so it doesn't conflict with
+  # the wrc-demo env's numpy. If you don't use Orbbec (RealSense, OpenCV
+  # UVC, or mock cameras only), you can skip this step entirely.
