@@ -142,6 +142,49 @@ python -m wrc_demo.apps.demo --task "wave"
 If both run, your install is healthy. Pick a tier in the next section and
 go.
 
+### 6. Hardware SDKs (post-install — install only what you use)
+
+The conda `wrc-demo` env does **not** install every hardware SDK. Two
+components are intentionally post-install because their pip-resolver
+behavior conflicts with the conda-managed dependency chain. See
+[CLAUDE.md §Dependency install gotchas](../CLAUDE.md) for the full
+diagnosis; here are the two commands:
+
+#### a) Orbbec Gemini 2 SDK (Orbbec camera users only)
+
+```bash
+conda activate wrc-demo
+PYTHONNOUSERSITE=1 pip install pyorbbecsdk2
+```
+
+Without `PYTHONNOUSERSITE=1`, conda env's pip falls through to
+`~/.local/lib/python3.10/site-packages/` (your user-level
+site-packages), which silently fails to install into the env.
+
+RealSense D435i / D405 users: install `pyrealsense2` from source per
+the [Intel RealSense SDK docs](https://github.com/realsenseai/librealsense).
+
+#### b) PyTorch CUDA build (GPU detection users only)
+
+```bash
+conda activate wrc-demo
+PYTHONNOUSERSITE=1 pip install --force-reinstall \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
+```
+
+Use `cu121` for Ada / RTX 4090, `cu128` for Blackwell / RTX 5070, or
+omit `--index-url` for CPU-only. `PYTHONNOUSERSITE=1` is mandatory
+because conda env's pip otherwise picks up the user-level torch at
+`~/.local/...` and reports "Requirement already satisfied" — leaving
+the env empty for a real install.
+
+For nightly: `--pre` + `--index-url
+https://download.pytorch.org/whl/nightly/cu128`. **Caveat**: nightly
+torch and torchvision must be from the same date (e.g. both
+`20260408`); cross-date combos fail with "No matching distribution
+found".
+
 ### Fallback: a uv venv for mock-only work
 
 If you can't or won't install conda (e.g. on a strict CI runner), you can

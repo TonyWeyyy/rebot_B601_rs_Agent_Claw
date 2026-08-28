@@ -121,6 +121,55 @@ All layers produce the same `Grasp` dataclass; `GraspOutcomeMemory` re-ranks/z-n
   scripts/setup_agents.py --host claude --python <interpreter> --write`.
   New runner scripts should take the interpreter from an env var/flag
   like `setup_agents.py` does.
+
+## Dependency install gotchas (v6.5+)
+
+Three things **are not** installed by `conda env create -f environment.yml`
+and must be installed separately as `post-install` steps:
+
+1. **`pyorbbecsdk2` (Orbbec Gemini 2 SDK)** — its dep chain
+   `pyorbbecsdk2 → open3d==0.18.0 → dash → flask → plotly →
+   ipywidgets → jupyter → traitlets` frequently pushes pip's
+   resolver to `resolution-too-deep` (>1000 packages). The
+   `open3d` extras (`jupyter`, `jupyterlab`, `dash`) are nice-to-have
+   but **not** required for headless camera capture, which is all
+   wrc_demo needs. Orbbec users run:
+
+       conda activate wrc-demo
+       PYTHONNOUSERSITE=1 pip install pyorbbecsdk2
+
+   See the desktop tutorial §安装步骤 步骤 3a for the full
+   procedure + git/gitee mirror URLs. **Don't** add `pyorbbecsdk2`
+   back to `environment.yml` — it re-introduces the resolver
+   failure.
+
+2. **`torch` (CUDA build)** — ultralytics marks `torch` as an
+   optional dependency in its `pyproject.toml`, so `pip install
+   ultralytics` skips it. But `import ultralytics` does `import
+   torch` at module load. Two ways the install goes wrong:
+
+   a. conda env create's pip subprocess sees
+      `~/.local/lib/python3.10/site-packages/torch/` (user
+      site-packages) and reports "Requirement already satisfied:
+      torch" — leaving the conda env's
+      `site-packages/torch/` empty. Tests then fail with
+      `ModuleNotFoundError: No module named 'torch'` even though
+      the user's `pip list` shows torch installed.
+
+   b. On systems where the user's torch has libcudart.so.<N> but
+      the conda env doesn't have that CUDA runtime, `import torch`
+      fails with `OSError: libcudart.so.13: cannot open shared
+      object file`.
+
+   The fix is `PYTHONNOUSERSITE=1 pip install ...` from inside the
+   `wrc-demo` env. For RTX 5070 / Blackwell sm120 use the cu128
+   index; for RTX 4090 / Ada use cu121. See desktop tutorial
+   §安装步骤 步骤 3b.
+
+3. **Don't add `torch` to `environment.yml`** — its CUDA wheel
+   pulls in ~3 GB of nvidia-cu12 packages that conflict with the
+   conda-managed openblas / cudnn chain. The two-step install (conda
+   env create → manual `pip install torch`) is intentional.
 - **Persistent learned state outside the run dir** changes behavior between otherwise-identical sessions: `~/.wrc_demo/grasp_memory.json` and `runs/experience.json` (tier-2 habits replay stored call lists verbatim at cosine ≥ 0.9). Delete both for deterministic/fresh demo behavior.
 - YOLOE's text encoder (`mobileclip*.ts`) resolves relative to the CWD — wrong launch directory makes all detections silently vanish. In this checkout the encoder lives at `models/mobileclip2_b.ts` (or `mobileclip_blt.ts` for the larger variant), so launch from `models/` or copy the `.ts` into your launch directory; the detector weights themselves are fine anywhere (`${repo}/models/...` is absolute). Set `YOLO_OFFLINE=True` or ultralytics phones GitHub and stalls the watcher.
 - Never use `==`/`list.remove()` on `ObjectBelief` — its numpy fields make dataclass `__eq__` raise ("truth value of an array is ambiguous"); remove by identity as `BeliefStore.mark_removed` does.
