@@ -28,6 +28,11 @@ wrc-demo = "wrc_demo.apps.demo:main"
 wrc-record = "wrc_demo.apps.record:main"
 wrc-mcp = "wrc_demo.apps.mcp_server:main"
 wrc-view = "wrc_demo.apps.viewer:main"
+# Hand-eye calibration (top = ETH, wrist = EIH). Need root for USB on most
+# systems; entry points let users do `sudo wrc-calib-top` instead of
+# `sudo PYTHONPATH=src python -m wrc_demo.scripts.calib_top_orbbec`.
+wrc-calib-top = "wrc_demo.scripts.calib_top_orbbec:main"
+wrc-calib-wrist = "wrc_demo.scripts.calib_wrist:main"
 
 [build-system]
 requires = ["setuptools>=68"]
