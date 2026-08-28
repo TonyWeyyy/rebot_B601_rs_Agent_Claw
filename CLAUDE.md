@@ -6,25 +6,57 @@ LLM-orchestrated tabletop manipulation on the Seeed reBot DevArm B601 (RobStride
 
 ## Environment & commands
 
-There is no bare `python` on this rig and `python3` has no pytest. Everything runs through the shared uv venv:
+The project's standard environment is the conda env **`wrc-demo`**, created
+from `environment.yml`. Everything (mock tests + real hardware + LLM
+clients) is installed there; you should never need another Python.
 
 ```bash
-source /home/johnny/Projects/demo/.demo/bin/activate   # or use .demo/bin/python directly
+conda activate wrc-demo                              # the only env you need
 
-python -m pytest tests/ -q                             # full suite (~139 tests; 2 hardware tests auto-deselected)
-python -m pytest tests/test_safety.py::test_velocity_cap -q    # single test
-python -m pytest tests/ -m hardware -q                 # live-rig tests (L515 + can0, read-only)
+# Mock tests (~30s, all pass on a clean checkout)
+pytest tests/test_extrinsics_loader.py \
+        tests/test_hand_eye_compensation_per_camera.py \
+        tests/test_demo_yaml_llm_profile.py -v
 
-# offline wiring check: mock camera + mock arm + scripted LLM, no hardware
+# Full mock suite
+pytest tests/ -q                                      # ~290 tests; 2 hardware tests auto-deselected
+
+# Single test
+pytest tests/test_safety.py::test_velocity_cap -v
+
+# Live-rig tests (L515 + can0, read-only)
+pytest tests/ -m hardware -q
+
+# Offline wiring check: mock camera + mock arm + scripted LLM, no hardware
 python -m wrc_demo.apps.demo --task "pick and place pink object"
 python -m wrc_demo.apps.demo --interactive --no-view --no-serve   # REPL, no GUI/dashboard
 ```
 
-- Tests need no `PYTHONPATH` (`tests/conftest.py` inserts `src/`). The package is installed editable in the shared venv, so apps run without it too; `PYTHONPATH=src` (as in the README) is only needed with an interpreter that lacks the editable install.
-- `addopts = "-m 'not hardware'"` in pyproject applies even to explicitly named files: `pytest tests/test_hardware_smoke.py` runs **zero tests silently** — you must add `-m hardware`.
-- Pinocchio-dependent tests skip via `needs_pin` from conftest when `pin` or the RS URDF under `assets/` is missing.
-- CI is exactly `uv sync --extra dev --extra kinematics && uv run pytest tests/ -q` (Python 3.12). There is no lint step.
-- `scripts/setup_env.sh` defaults its interpreter to a stale `/home/spark/...` path — run it as `PY=/home/johnny/Projects/demo/.demo/bin/python scripts/setup_env.sh`. The venv has no `pip` module; use `uv pip`.
+### Legacy: conda `DM` + uv `.venv`
+
+This repo was originally developed against a hand-built conda env named
+`DM` (`/home/seeed/miniforge3/envs/DM/`) plus a sibling uv venv at
+`./.venv`. As of 2026-08-28 that split is **deprecated** — the conda
+`wrc-demo` env from `environment.yml` carries every package both of those
+environments had (motorbridge, ultralytics, pyorbbecsdk, pin, anthropic,
+openai, wrc-demo editable, etc.). New checkouts and CI use `wrc-demo`
+only. The `DM` env still works for existing rigs but will not be
+updated; the `.venv` is kept as a mock-only fallback (see
+`scripts/setup_env.sh`).
+
+### Things to know about the conda env
+
+- Tests need no `PYTHONPATH` (`tests/conftest.py` inserts `src/`). The
+  package is installed editable in `wrc-demo`, so apps run without it
+  too; `PYTHONPATH=src` (as in the README) is only needed with an
+  interpreter that lacks the editable install.
+- `addopts = "-m 'not hardware'"` in pyproject applies even to
+  explicitly named files: `pytest tests/test_hardware_smoke.py` runs
+  **zero tests silently** — you must add `-m hardware`.
+- Pinocchio-dependent tests skip via `needs_pin` from conftest when
+  `pin` or the RS URDF under `assets/` is missing.
+- CI is exactly `conda env create -f environment.yml && conda run -n
+  wrc-demo pytest tests/ -q` (Python 3.10). There is no lint step.
 
 ## Architecture
 
@@ -78,23 +110,33 @@ All layers produce the same `Grasp` dataclass; `GraspOutcomeMemory` re-ranks/z-n
 
 ## Gotchas
 
-- **Stale `/home/spark/...` absolute paths** (this checkout lives under `/home/johnny`): `.mcp.json` (its interpreter/PYTHONPATH don't exist here — regenerate with `python scripts/setup_agents.py --host claude --python <interpreter> --write`), `configs/arms/rebot_rs.yaml` `sdk_path`, `setup_env.sh`, `hermes_demo.sh`, `dashboard_runner.py`. New runner scripts should take the interpreter from an env var/flag like `setup_agents.py` does.
+- **Stale absolute paths**: prior revisions of `scripts/hermes_demo.sh`,
+  `scripts/dashboard_runner.py`, and `scripts/setup_agents.py` hardcoded
+  `/home/spark/Projects/demo/...` paths from the original 2026 rig layout.
+  As of 2026-08-28 all four scripts resolve their Python interpreter and
+  repository root from `Path(__file__).resolve().parents[...]` plus
+  env-var overrides (`WRC_DEMO_PY`, `WRC_DETECTOR_MODEL`, etc.) — see
+  the comments at the top of each script for the exact fallback chain.
+  `.mcp.json` is still regen-per-machine; use `python
+  scripts/setup_agents.py --host claude --python <interpreter> --write`.
+  New runner scripts should take the interpreter from an env var/flag
+  like `setup_agents.py` does.
 - **Persistent learned state outside the run dir** changes behavior between otherwise-identical sessions: `~/.wrc_demo/grasp_memory.json` and `runs/experience.json` (tier-2 habits replay stored call lists verbatim at cosine ≥ 0.9). Delete both for deterministic/fresh demo behavior.
-- YOLOE's text encoder (`mobileclip*.ts`) resolves relative to the CWD — wrong launch directory makes all detections silently vanish. In this checkout the encoder lives at `models/mobileclip_blt.ts`, so launch from `models/` (see `scripts/record_demo.py`) or copy the `.ts` into your launch directory; the detector weights themselves are fine anywhere (`${repo}/models/...` is absolute). Set `YOLO_OFFLINE=True` or ultralytics phones GitHub and stalls the watcher.
+- YOLOE's text encoder (`mobileclip*.ts`) resolves relative to the CWD — wrong launch directory makes all detections silently vanish. In this checkout the encoder lives at `models/mobileclip2_b.ts` (or `mobileclip_blt.ts` for the larger variant), so launch from `models/` or copy the `.ts` into your launch directory; the detector weights themselves are fine anywhere (`${repo}/models/...` is absolute). Set `YOLO_OFFLINE=True` or ultralytics phones GitHub and stalls the watcher.
 - Never use `==`/`list.remove()` on `ObjectBelief` — its numpy fields make dataclass `__eq__` raise ("truth value of an array is ambiguous"); remove by identity as `BeliefStore.mark_removed` does.
 - Accessing any backend-specific attribute on a LazyArm-backed `SafeArm.raw` — anything not on LazyArm's own surface, including `hasattr` probes for extras like `close_gripper_two_stage` — materializes the arm and **powers the motors** via `__getattr__`. LazyArm's own members (`connected`, `stop`, `disconnect`, `resume`) are safe to touch; never probe backend capabilities outside a motion context.
 - Beliefs are keyed by DETECTOR labels, not user-query words — `WRC_DETECT_CLASSES` must name what users will ask for ("banana" can't resolve a belief labeled "fruit").
 - `DepthProvider.ensure_depth` mutates the shared `Frame` in place; plane-cast depth is only valid for pixels on the table (tall-object heights are wrong on RGB-only cameras).
 - Ctrl+C in the demo CLI is a soft stop (freeze + e-stop latch, no free-fall); the second Ctrl+C exits. Park the arm (`move_home`) before disconnecting the RS arm — `disconnect()` disables torque and a loaded arm falls.
-- Isaac: `isaac_bridge.py` must run under Isaac Sim's `python.sh`, `SimulationApp` before any omni import, engine stays `physx` (Newton NaNs at grasp contact); `WRC_PHYSICS_DEVICE=cpu` is the escape hatch for GPU-PhysX boot NaNs. The bridge binds 127.0.0.1 because its `exec` op is arbitrary code execution.
-- Base deps pin `opencv-python-headless` — `cv2.imshow` viewers only work because the rig venv has full opencv; in a fresh install they silently degrade.
+- Base deps pin `opencv-python-headless` — `cv2.imshow` viewers only work because the conda `wrc-demo` env installs full opencv (conda's `opencv` package includes the GUI build); in a CI/minimal install they silently degrade.
+- The Isaac Sim backend was removed 2026-08-28 — see the `IsaacSim` references in `master_arm.py`'s old docstring for what NOT to do (don't re-add `sim/bridge_client.py`, `isaac_arm.py`, etc.; see git history pre-`de9703a` if you need to peek at the old code).
 
 ## Doc status (README/ARCHITECTURE/ROADMAP synced to code on 2026-07-20)
 
 - Counts go stale fast — before citing them, re-derive: test count via `pytest tests/ -q --collect-only`, skill count via `len(TOOL_SPECS)` in `skills/runtime.py` (6 specs = 5 skills + `task_done`; MCP = 5 + 5 extras = 10 tools). `_MOTION_SKILLS` has 18 string literals (pauses WorldWatcher belief fusion during motion).
 - Still true and easy to be misled by: `skills/library.py` (markdown skill library) and episodic-memory embeddings (`embed_dim`) are written and tested but **not wired** into the shipped demo; the only live TurboQuant user is tier-2 ExperienceMemory. Both docstrings/docs now say so — keep them updated if you wire them.
 - (Resolved 2026-08-27) The `local_qwen` profile was deleted because it was never wired: its model name (`Qwen3VL-30B-A3B-Instruct-Q4_K_M`) had no matching serve script, and `serve_qwen_*.sh` fetched a different model. The actual production LLM is `local_qwen3_vl` (Qwen3-VL-2B-Instruct AWQ-4bit, served by `scripts/start_cosmos3_server.sh`).
-- The shipped `.mcp.json` stays pinned to the demo rig (`/home/spark/...` venv, Isaac profiles) on purpose — regenerate locally with `setup_agents.py --host claude --python <interpreter> --write` instead of editing the docs or the file to match this machine.
+- The shipped `.mcp.json` stays pinned to the demo rig on purpose — regenerate locally with `setup_agents.py --host claude --python <interpreter> --write` instead of editing the docs or the file to match this machine.
 
 ## Recent fixes (2026-07-24)
 
@@ -105,9 +147,9 @@ All layers produce the same `Grasp` dataclass; `GraspOutcomeMemory` re-ranks/z-n
 ## Recent additions (2026-08-11)
 
 - **`local_cosmos3` profile** (`configs/llm/local_cosmos3.yaml`): runs `nvidia/Cosmos3-Edge` 4B via an external vLLM server on `localhost:8080`. See `docs/adr/0007-local-llm-strategy.md` for the design and `docs/SPEC-local-llm.md` for ops. Architecture is two-env:
-    - **wrc_demo (conda `DM` env)** runs unchanged — `OpenAICompatClient` just hits `http://127.0.0.1:8080/v1`.
-    - **cosmos3-llm (uv venv at `~/cosmos3-venv`, Python 3.13)** runs `vllm serve` with `torch 2.13+cu130` + `transformers 5.15`. The two envs are deliberately separate because the vLLM/transformers/cu13 stack (2026-07+) is incompatible with the wrc_demo DM env stack (cu12, older torch). Communication is HTTP only.
-  - **Don't** try to put vLLM into the DM env; it breaks DM's pinned deps. Use `scripts/start_cosmos3_server.sh` (auto-patches + auto-detects driver CUDA + manages PID).
+    - **wrc_demo (conda `wrc-demo` env)** runs unchanged — `OpenAICompatClient` just hits `http://127.0.0.1:8080/v1`.
+    - **cosmos3-llm (uv venv at `~/cosmos3-venv`, Python 3.13)** runs `vllm serve` with `torch 2.13+cu130` + `transformers 5.15`. The two envs are deliberately separate because the vLLM/transformers/cu13 stack (2026-07+) is incompatible with the wrc_demo `wrc-demo` env stack (cu12, older torch). Communication is HTTP only.
+  - **Don't** try to put vLLM into the `wrc-demo` env; it breaks pinned deps. Use `scripts/start_cosmos3_server.sh` (auto-patches + auto-detects driver CUDA + manages PID).
   - **Don't** use docker — the cu13 + RTX 5070 + vLLM combination works fine in a plain `uv` venv. ADR-0007 lists docker as the fallback path; we got the uv path working first.
 - **8 GB VRAM tuning** (RTX 5070 / Blackwell sm120):
     - `--max-model-len 8192 --gpu-memory-utilization 0.85` (BF16 4.87 GB + KV 0.94 GB + vision 0.83 GB + 8 GB total budget — see script for details).
@@ -136,7 +178,7 @@ All layers produce the same `Grasp` dataclass; `GraspOutcomeMemory` re-ranks/z-n
   - **Master→slave mapping** is **hardcoded** in `master_arm.py::master_to_slave()` (no calibration, per user decision 2026-08-14): joint1/4/6 方向取反 + URDF joint limits clip + gripper × `GRIPPER_RATIO=6`. Joint limits in `JOINT_ANGLE_LIMITS` derived from **URDF** (`sdk/urdf/00-arm-rs_asm-v3/...`), not the demo's mismatched values.
   - Added to `_MOTION_SKILLS` (16 → 18 string literals) and `TOOL_SPECS` (4 → 6 entries, descriptions updated to mention "master-slave teleoperation" + "PiPER Mate"). Current counts (2026-08-27): `len(TOOL_SPECS) == 6`, `len(_MOTION_SKILLS) == 18`, MCP tools = 10 (6 - 1 + 5 extras). Re-derive via these expressions before citing.
   - Bypasses `SafeArm` harness by reaching `self.arm.raw` → vendored `RebotArm` directly, because teach needs an external-event-triggered control loop (SafeArm only exposes `move_joints` trajectory streaming). Acceptable because slave uses POS_VEL mode (motor PID handles trajectory, not SafeArm).
-  - **New dependency**: `fashionstar-uart-sdk` for PiPER Mate. Install: `uv pip install fashionstar-uart-sdk --python /home/seeed/miniforge3/envs/DM/bin/python`.
+  - **New dependency**: `fashionstar-uart-sdk` for PiPER Mate. Already installed by `environment.yml` (see `[perception,llm,kinematics,arm,dev]` extras + the standalone `fashionstar-uart-sdk` pin in the pip block). If installing manually outside the standard env: `pip install fashionstar-uart-sdk`.
   - Examples: `examples/teach_record.py` and `examples/teach_replay.py` — both thin wrappers over `teach.py` business logic, support `--dry-run` mode for logic testing without hardware.
   - Tests: `tests/test_master_arm.py` (23 tests, 100% line coverage of `master_arm.py::master_to_slave`) + `tests/test_teach_logic.py` (27 tests, ≥ 80% coverage of `teach.py` business logic) + `tests/test_teach_skills.py` (17 tests, 100% coverage of skill entry points). **Total: 67 new tests, all passing**. Pre-existing 29 failures unchanged — no regression introduced.
   - Spec: `docs/specs/teach_record_replay.md`. Plan: `tasks/plan.md` + `tasks/todo.md`. **Do not modify `wrc_demo/sdk/reBotArm_control_py/`** — vendored in-tree snapshot, upstream merge would overwrite.
