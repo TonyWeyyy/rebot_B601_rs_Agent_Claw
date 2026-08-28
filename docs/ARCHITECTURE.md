@@ -93,7 +93,6 @@ src/wrc_demo/
 │   ├── opencv_camera.py      RGB-only UVC
 │   ├── orbbec_camera.py      Orbbec Gemini 2 (pyorbbecsdk, lazy import)
 │   ├── mock_camera.py        synthetic tabletop + npz replay (wrc-record)
-│   ├── isaac_camera.py       Isaac Sim bridge frames (RGB-D + per-frame T_base_cam)
 │   ├── depth_provider.py     sensor → mono plugin → table-plane ray-cast
 │   ├── detector.py           open-vocab YOLOE/YOLO-World + MockDetector
 │   ├── grounding.py          Extrinsics + localize_object (color/near-aware);
@@ -115,12 +114,10 @@ src/wrc_demo/
 │   └── grasp_memory.py persisted per-object grasp-outcome prior
 │                       (re-ranks candidates + nudges grasp z)
 ├── control/
-│   ├── kinematics.py   Pinocchio FK/IK, explicit URDF/USD (assets/), DLS+restarts
-│   ├── usd_model.py    USD-physics → URDF translation (no aarch64 usd-core)
+│   ├── kinematics.py   Pinocchio FK/IK on the RS URDF (assets/), DLS+restarts
 │   ├── arm_base.py     min-jerk streaming, feedback-based settling + make_arm
 │   ├── mock_arm.py     kinematic sim + gripper object-stop emulation
 │   ├── lazy_arm.py     defer motor bring-up until the first motion command
-│   ├── isaac_arm.py    Isaac Sim articulation over the TCP bridge
 │   └── rebot_rs_arm.py real RS arm: motorbridge CAN, mechPos param reads,
 │                       stall-aware two-stage gripper close
 ├── safety/harness.py   fail-closed gate for every waypoint + SafeArm wrapper
@@ -143,7 +140,6 @@ src/wrc_demo/
 │   │                   20 skills incl. pick_and_place + social skills,
 │   │                   plus the loop-terminator task_done)
 │   └── library.py      learned-skill markdown store (loading loop: ROADMAP)
-├── sim/bridge_client.py  newline-JSON TCP client for scripts/isaac_bridge.py
 └── apps/               demo.py CLI (build_runtime = the composition root),
                         record.py capture, viewer.py (wrc-view live RGB+D),
                         live_view.py (RigViewer window + draw helpers),
@@ -250,9 +246,8 @@ warnings).
 - Live L515 streaming through the full camera stack (hardware-marked test).
 - Live RobStride mechPos param reads for all 7 motors over can0 (read-only).
 - Live YOLO inference (CUDA, GB10) on L515 frames with metric depth lookup.
-- Isaac Sim bridge exercised live on PhysX (scripted picks via
-  `scripts/dashboard_runner.py` / `night_runner.sh`; `physics_probe.py`
-  battery green). Newton engine blocked upstream — see ROADMAP.
+- Isaac Sim backend removed 2026-08-28 (the upstream bridge was never
+  productionized; no replacement in tree).
 - GraspGen-X backend integrated with first-light verification in sim;
   tip-offset / sweep-volume calibration still open (see ROADMAP).
 - NOT yet exercised: real-arm motion (needs onsite gripper re-verification

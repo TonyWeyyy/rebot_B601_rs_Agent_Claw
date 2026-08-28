@@ -3,10 +3,8 @@
 Self-contained on purpose: reBotArm_control_py's kinematics module reads its
 own global config/rebotarm.yaml (ignoring the hw_yaml passed to RebotArm), so
 using it with the RS arm silently loads the DM model. Here the model path
-comes from the arm profile explicitly. Both .urdf and .usd/.usda paths load:
-USD goes through usd_model's in-memory USD-physics -> URDF translation
-(Pinocchio has no USD reader), so the exact asset Newton/Isaac Sim simulates
-can be checked against the host model (see tests/test_usd_model.py).
+comes from the arm profile explicitly. Only .urdf paths are supported (USD
+support was dropped together with the Isaac Sim backend on 2026-08-28).
 
 Both shipped RS assets are authored in the MIRRORED joint convention
 (q_asset = -q_local); the SDK, the real arm and every q constant in this
@@ -20,6 +18,7 @@ command the first 6 and zero-pad the rest, same convention as the SDK.
 
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,15 +48,34 @@ class Kinematics:
         if not path.exists():
             raise FileNotFoundError(f"robot model not found: {model_path}")
         if path.suffix in (".usd", ".usda"):
-            from .usd_model import urdf_xml_from_usd
-
-            xml = urdf_xml_from_usd(path)
-        else:
-            xml = path.read_text()
+            raise ValueError(
+                f"USD model assets are no longer supported (path: {model_path}); "
+                f"use the shipped URDF under assets/urdf/ instead."
+            )
+        xml = path.read_text()
         if joint_signs and any(int(s) == -1 for s in joint_signs):
-            from .usd_model import apply_joint_signs
-
-            xml = apply_joint_signs(xml, joint_signs)
+            # Bake joint_signs into the URDF XML: a -1 entry negates that
+            # joint's axis and mirrors its limits, which is an exact
+            # reparameterization of the same physical joint. Inlined here
+            # (formerly usd_model.apply_joint_signs) because the only caller
+            # is this loader and the dependency is now gone with the USD
+            # backend removal (2026-08-28).
+            root = ET.fromstring(xml)
+            movable = [j for j in root.iter("joint")
+                       if j.get("type") in ("revolute", "prismatic", "continuous")]
+            for sign, joint in zip(joint_signs, movable):
+                if int(sign) != -1:
+                    continue
+                axis = joint.find("axis")
+                if axis is not None:
+                    axis.set("xyz", " ".join(f"{-float(v):.9g}"
+                                             for v in axis.get("xyz").split()))
+                limit = joint.find("limit")
+                if limit is not None:
+                    lo, hi = float(limit.get("lower", 0)), float(limit.get("upper", 0))
+                    limit.set("lower", f"{-hi:.9g}")
+                    limit.set("upper", f"{-lo:.9g}")
+            xml = ET.tostring(root, encoding="unicode")
         self.model = pin.buildModelFromXML(xml)
         self.data = self.model.createData()
         self.ee_frame = ee_frame

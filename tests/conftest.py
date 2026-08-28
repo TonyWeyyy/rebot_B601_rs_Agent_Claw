@@ -17,9 +17,10 @@ sys.path.insert(0, str(REPO / "src"))
 from wrc_demo.config import load_demo_config  # noqa: E402
 
 URDF = REPO / "assets" / "urdf" / "00-arm-rs_asm-v3" / "urdf" / "00-arm-rs_asm-v3.urdf"
-USD = REPO / "assets" / "usd" / "RS-rebot-dev-arm" / "00-arm-rs_asm-v3.usda"
-# Assets are authored in the mirrored joint convention; the SDK and every q
-# constant in this repo are local (q_local = -q_asset). See usd_model.
+# The shipped URDF is authored in the mirrored joint convention (q_asset = -q_local);
+# the SDK and every q constant in this repo are local. The flip is baked into
+# the model at load time (see Kinematics.__init__), so every downstream
+# consumer (FK, IK, limits, safety) speaks local convention.
 JOINT_SIGNS = [-1, -1, -1, -1, -1, -1]
 
 

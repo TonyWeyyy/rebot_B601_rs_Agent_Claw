@@ -4,10 +4,8 @@ After the SDK migration (2026-07-24) this package contains:
 
 - ``MockArm`` — perfect-tracking test double; the harness is real so
   per-waypoint approval exercises the same code as production.
-- ``IsaacArm`` — Isaac Sim bridge (legacy path; not wired to ``SafeArm``
-  yet, see module docstring).
 - ``make_arm(cfg, kinematics)`` — single factory used by ``demo.py`` /
-  ``mcp_server.py``: returns the right arm type (MockArm, IsaacArm, or
+  ``mcp_server.py``: returns the right arm type (MockArm or
   a ``SafeArm`` wrapping the vendored SDK).
 
 Real hardware (``rebot_rs``) is now driven by the vendored SDK at
@@ -15,6 +13,10 @@ Real hardware (``rebot_rs``) is now driven by the vendored SDK at
 ``wrc_demo.safety.harness``. There is no ``ArmBase`` ABC here anymore
 — the SDK is the single source of truth for the motion surface, and
 ``MockArm`` / ``SafeArm`` are duck-typed to share it.
+
+Note (2026-08-28): the Isaac Sim backend and its TCP bridge have been
+removed — the upstream project was never productionized and we no
+longer ship it. ``make_arm`` only accepts ``mock`` and ``rebot_rs``.
 """
 
 from __future__ import annotations
@@ -26,26 +28,17 @@ import numpy as np
 
 from ..config import Cfg, SDK_DIR
 from ..safety.harness import Kinematics, SafeArm, SafetyHarness, SafetyLimits
-from .isaac_arm import IsaacArm
 from .mock_arm import MockArm
-from .usd_model import (
-    apply_joint_signs,
-    urdf_xml_from_usd,
-)
 
-# Union of every "arm the skill runtime can hold" type. All three
-# expose the same public surface (move_joints / move_cartesian /
-# set_gripper / close_gripper_two_stage / stop / resume / disconnect /
-# harness).
-Arm = Union[MockArm, IsaacArm, SafeArm]
+# Union of every "arm the skill runtime can hold" type. Both expose the
+# same public surface (move_joints / move_cartesian / set_gripper /
+# close_gripper_two_stage / stop / resume / disconnect / harness).
+Arm = Union[MockArm, SafeArm]
 
 __all__ = [
     "Arm",
-    "IsaacArm",
     "MockArm",
-    "apply_joint_signs",
     "make_arm",
-    "urdf_xml_from_usd",
 ]
 
 
@@ -63,9 +56,6 @@ def make_arm(cfg: Cfg, kinematics: Kinematics | None = None) -> Arm:
 
     For ``mock`` it returns a ``MockArm`` (perfect tracking, real
     harness — exercises every gating code path used in production).
-
-    For ``isaac`` it returns ``IsaacArm`` directly (legacy bridge path;
-    not wrapped by ``SafeArm`` yet — that's a follow-up).
     """
     arm_type = str(cfg.arm.get("type", "mock"))
 
@@ -75,8 +65,6 @@ def make_arm(cfg: Cfg, kinematics: Kinematics | None = None) -> Arm:
         arm.grasp_bridge = None
         return arm
 
-    if arm_type == "isaac":
-        arm = IsaacArm(cfg.arm, kinematics=kinematics)
         arm.connect()
         arm.grasp_bridge = None
         return arm
@@ -142,5 +130,5 @@ def make_arm(cfg: Cfg, kinematics: Kinematics | None = None) -> Arm:
 
     raise ValueError(
         f"unknown arm type {arm_type!r}; "
-        f"expected one of: mock, isaac, rebot_rs"
+        f"expected one of: mock, rebot_rs"
     )

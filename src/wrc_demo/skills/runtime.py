@@ -99,7 +99,7 @@ class SkillRuntime:
         #: optional WorldWatcher (set by the app wiring); paused during motion
         self.watcher = None
         #: optional rebot_grasp motion/gripper bridge (set by make_arm for
-        #: ``rebot_rs``; None for mock / isaac). Skill methods read this to
+        #: ``rebot_rs``; None for mock). Skill methods read this to
         #: decide between the new set.py-aligned flow and the legacy
         #: SafeArm.move_joints pipeline.
         self.bridge = getattr(safe_arm, "grasp_bridge", None)
@@ -792,7 +792,7 @@ class SkillRuntime:
         # Bridge path: when a rebot_grasp bridge is wired (rebot_rs backend),
         # mirror set.py / main.py ``G`` flow exactly — open → pre(2.0) →
         # grasp(1.5) → grasp(force=1.0) → home(3.0). The legacy v5 path
-        # below stays for mock / isaac runs and for tests that don't set
+        # below stays for mock runs and for tests that don't set
         # ``self.bridge``.
         if self.bridge is not None:
             return self._skill_grasp_object_bridge(label, spatial_hint)
