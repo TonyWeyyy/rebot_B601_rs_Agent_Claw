@@ -25,7 +25,7 @@ from ..agent.llm import make_llm
 from ..agent.orchestrator import AgentOrchestrator
 from ..agent.reflex import ExperienceMemory, FastPlanner
 from ..agent.trace import TraceLogger
-from ..config import Cfg, PACKAGE_ROOT, load_demo_config
+from ..config import CONFIG_DIR, Cfg, PACKAGE_ROOT, load_demo_config
 from ..control import make_arm
 from ..memory import BeliefStore, EpisodicMemory
 from ..perception.camera_base import make_camera
@@ -35,6 +35,32 @@ from ..perception.stream import CameraRig, CameraStream
 from ..perception.world import LockedDetector, WatchedCamera, WorldWatcher
 from ..safety.harness import Kinematics, SafetyHarness, SafetyLimits
 from ..skills.runtime import SkillRuntime
+
+
+
+def _resolve_llm_profile(args_llm):
+    """Determine the effective LLM profile name.
+
+    Priority: CLI --llm (if provided) > demo.yaml llm.profile > "mock".
+
+    This lets users switch the demo's brain by editing one line of
+    configs/demo.yaml (e.g. ``profile: minimax`` for the cloud API)
+    instead of remembering the --llm CLI flag. CLI flag still wins
+    for ad-hoc overrides and tests.
+    """
+    if args_llm:
+        return args_llm
+    # Look up at call time so tests can monkeypatch wrc_demo.config.CONFIG_DIR
+    from .. import config as _config
+    demo_yaml_path = _config.CONFIG_DIR / "demo.yaml"
+    if demo_yaml_path.exists():
+        import yaml as _yaml
+        with open(demo_yaml_path) as f:
+            demo_yaml = _yaml.safe_load(f) or {}
+        profile = (demo_yaml.get("llm") or {}).get("profile")
+        if profile:
+            return str(profile)
+    return "mock"
 
 
 def _camera_cfgs(cfg) -> list[Cfg]:
@@ -57,7 +83,7 @@ def build_runtime(
         ee_frame=str(cfg.arm.get("ee_frame", "gripper_end")),
         arm_joint_count=int(cfg.arm.get("n_joints", 6)),
     )
-    # ``make_arm`` returns the right arm type (MockArm / IsaacArm / SafeArm
+    # ``make_arm`` returns the right arm type (MockArm / SafeArm
     # wrapping the vendored SDK) and connects it. For real arms this
     # powers the motors immediately; the ``lazy_arm`` flag is now a
     # no-op (kept in the signature for back-compat with the MCP server).
@@ -241,7 +267,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="comma-separated camera profiles; first = manipulation "
                         "camera (e.g. l515,uvc). Overrides --camera.")
     p.add_argument("--arm", default="mock", help="arm profile (mock|rebot_rs)")
-    p.add_argument("--llm", default="mock", help="llm profile (mock|anthropic|local_qwen|openai)")
+    p.add_argument("--llm", default=None,
+               help="llm profile (overrides demo.yaml llm.profile); "
+                    "one of: mock|local_qwen3_vl|minimax|anthropic|openai")
     p.add_argument("--max-steps", type=int, default=30)
     p.add_argument("--run-dir", default=None, help="trace output dir")
     p.add_argument("--interactive", action="store_true", help="multi-task REPL")
@@ -252,7 +280,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     cameras = [c.strip() for c in args.cameras.split(",")] if args.cameras else None
-    cfg = load_demo_config(camera=args.camera, cameras=cameras, arm=args.arm, llm=args.llm)
+    llm_profile = _resolve_llm_profile(args.llm)
+    cfg = load_demo_config(camera=args.camera, cameras=cameras, arm=args.arm, llm=llm_profile)
     run_dir = Path(args.run_dir) if args.run_dir else (
         PACKAGE_ROOT / "runs" / time.strftime("%Y%m%d_%H%M%S")
     )
@@ -260,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
 
     view = not args.no_view and bool(os.environ.get("DISPLAY"))
     print(f"[wrc-demo] cameras={cameras or [args.camera]} arm={args.arm} "
-          f"llm={args.llm} view={view}")
+          f"llm={llm_profile} view={view}")
     print(f"[wrc-demo] traces -> {run_dir}")
 
     runtime, arm = build_runtime(cfg, run_dir, view=view, serve=not args.no_serve)

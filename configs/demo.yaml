@@ -1,6 +1,16 @@
 # Main demo configuration. Camera/arm/llm profiles are merged in at load
 # time (see wrc_demo.config.load_demo_config).
 
+# Active LLM profile (CLI --llm overrides). Change to switch models; no
+# fallback cascade -- others edit this single field to pick their backend:
+#   local_qwen3_vl  -> local 4-bit Qwen3-VL via start_cosmos3_server.sh
+#   minimax         -> MiniMax cloud API (needs MINIMAX_API_KEY env var)
+#   anthropic       -> Anthropic Claude (needs ANTHROPIC_API_KEY env var)
+#   openai          -> OpenAI / OpenAI-compat (needs OPENAI_API_KEY)
+#   mock            -> scripted mock (offline / smoke test)
+llm:
+  profile: local_qwen3_vl
+
 safety:
   # Base-frame workspace AABB for the TCP (meters). Verified against the RS
   # URDF top-down IK reachability probe (x 0.15..0.45, y +-0.25).
