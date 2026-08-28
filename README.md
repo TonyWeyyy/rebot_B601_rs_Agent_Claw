@@ -31,6 +31,116 @@ get_observation localize   grasp_object        place_at/on    push_object  recal
 └──────────────────┘   └────────────┘      └──────────────┘ └──────────┘ └──────────────┘
 ```
 
+## Install
+
+wrc_demo is a pip-installable Python package distributed with a single
+conda environment file that bundles everything (core stack + LLM clients +
+every hardware SDK). The standard env name is **`wrc-demo`**.
+
+### 0. One-time system deps (Ubuntu/Debian/WSL2)
+
+```bash
+sudo apt update
+sudo apt install -y libusb-1.0-0-dev ffmpeg git can-utils
+```
+
+* `libusb-1.0-0-dev` — Orbbec Gemini 2 / Femto Bolt depth cameras
+* `ffmpeg` — UVC4K / RealSense2 RGB streams + `video_stream` tool
+* `can-utils` — SocketCAN bring-up for the reBot Arm (`sudo ip link set can0 up type can bitrate 1000000`)
+* `git-lfs` is only required if you clone a sibling project that LFS-tracks
+  its own weights; wrc-demo's own weights are downloaded by
+  `scripts/setup_models.py` (see step 4 below), not via LFS.
+
+### 1. Clone the repo
+
+```bash
+git clone https://github.com/TheMoonAstronaut/wrc.git
+cd wrc
+```
+
+### 2. Create and activate the conda env (one shot)
+
+```bash
+conda env create -f environment.yml
+conda activate wrc-demo
+```
+
+`environment.yml` gives you:
+
+- **Python 3.10 + numpy + pyyaml + pytest** (conda-forge)
+- **`wrc-demo` package editable with every extras**:
+  - `[perception]` → `ultralytics` (YOLOE / YOLO-World detector)
+  - `[llm]` → `openai` + `anthropic` (covers llama.cpp / vLLM local servers too)
+  - `[kinematics]` → `pin` (Pinocchio FK/IK)
+  - `[arm]` → `motorbridge` (RobStride over SocketCAN)
+  - `[dev]` → `pytest` + `pytest-cov`
+- **`pyorbbecsdk2`** (Orbbec Gemini 2 SDK; pip-only)
+- **`fashionstar-uart-sdk`** (PiPER Mate master arm; optional)
+- **`huggingface-hub`** (for the manual-download path in `setup_models.py`)
+
+That's a single conda env that supports **all four run modes** (mock,
+real cameras, real arm, real everything) — no tier switching needed.
+
+> **Why `opencv` is not in the conda deps**: `pyproject.toml` pins
+> `opencv-python-headless` (so `cv2.imshow` can never silently crash on a
+> headless server). Letting the pip-installable `-e .[...]` provide it
+> avoids the conda-forge opencv ↔ opencv-python-headless conflict.
+
+### 3. (Real hardware only) set up USB + CAN permissions
+
+```bash
+# Orbbec udev rules (one-time after install)
+bash scripts/install_udev_rules.sh
+sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# CAN bus for the reBot Arm (each session, or persist via systemd)
+sudo ip link set can0 up type can bitrate 1000000
+```
+
+### 4. Model weights
+
+The `models/` directory is gitignored. After install, fetch the weights
+your config needs:
+
+```bash
+python scripts/setup_models.py                # list what's there / missing
+python scripts/setup_models.py --fetch        # auto-download what we can
+python scripts/setup_models.py --fetch --profile all   # everything
+```
+
+The script prints manual-instruction hints for weights that can't be
+auto-downloaded (custom-trained YOLOE from the sibling `rebot_grasp`
+project, MobileCLIP torchscript exports, etc.). See
+[`models/README.md`](models/README.md) for the full manifest.
+
+### 5. Verify the install
+
+```bash
+# ~30s mock test suite (17+ tests, all pass on a clean checkout)
+python -m pytest tests/test_extrinsics_loader.py \
+                 tests/test_hand_eye_compensation_per_camera.py \
+                 tests/test_demo_yaml_llm_profile.py -v
+
+# Mock demo (no hardware, no LLM — exercises wiring + reflex path)
+python -m wrc_demo.apps.demo --task "wave"
+```
+
+If both run, your install is healthy. Pick a tier in the next section and
+go.
+
+### Fallback: a uv venv for mock-only work
+
+If you can't or won't install conda (e.g. on a strict CI runner), you can
+use a uv-managed venv at `./.venv` for mock testing:
+
+```bash
+bash scripts/setup_env.sh           # mock-only (pytest + wrc-demo[dev])
+bash scripts/setup_env.sh --all     # full install (perception + llm + arm + dev)
+```
+
+This is a mock-friendly environment only — for real hardware always use
+the conda `wrc-demo` env above.
+
 ## The four challenges, addressed
 
 1. **Depth** — every camera backend yields `Frame` objects with float32
@@ -66,7 +176,12 @@ optional TurboQuant-compressed embeddings, arXiv:2504.19874) and an
 object-permanence belief store, so "the mug you saw 10 seconds ago" is still
 actionable after occlusion. `src/wrc_demo/memory/`.
 
-## Quick start
+## Quick start — three tiers
+
+Pick the tier that matches your hardware. Every tier expects the install
+section above to be done first.
+
+### Tier 1 — Mock (laptop, no USB, no GPU)
 
 ```bash
 # offline wiring check: mock camera + mock arm + scripted LLM, no hardware.
@@ -82,23 +197,52 @@ python -m pytest tests/ -m hardware -q     # needs L515 + can0 up (read-only)
 # without it grasping silently falls back to the analytic OBB planner
 scripts/serve_graspgenx.sh
 
+```
+
+### Tier 2 — Real rig (cameras + arm + cloud LLM)
+
+```bash
 # real rig, N cameras (first = manipulation camera), cloud LLM fallback
 sudo ip link set can0 up type can bitrate 1000000
 python -m wrc_demo.apps.demo --interactive \
     --cameras l515,uvc4k --arm rebot_rs --llm anthropic
 
-# Isaac Sim instead of hardware (same demo, simulated reBot):
-#   1. inside Isaac Sim's python:  python.sh scripts/isaac_bridge.py --usd <rebot.usd>
-#   2. then:
-python -m wrc_demo.apps.demo --cameras isaac --arm isaac --interactive
-
-# real rig, local Qwen3.6 on the Spark (start the server first)
-scripts/serve_qwen_llamacpp.sh          # or serve_qwen_vllm.sh (MTP spec decoding)
-python -m wrc_demo.apps.demo --task "..." --cameras l515 --arm rebot_rs --llm local_qwen
 ```
 
-Setup on this rig: `scripts/setup_env.sh` (installs into the shared `.demo`
-uv venv). pyrealsense2 comes from the local
+### Tier 3 — Real rig + local LLM
+
+```bash
+# real rig, local Qwen3-VL on the Spark (start the server first)
+scripts/start_cosmos3_server.sh --bg                # vLLM serves Qwen3-VL-2B-AWQ-4bit
+python -m wrc_demo.apps.demo --task "..." \
+    --cameras l515 --arm rebot_rs --llm local_qwen3_vl
+```
+
+> **Switching the LLM profile** (no fallback cascade — pick one):
+>
+> ```bash
+> # edit configs/demo.yaml: llm.profile: minimax | anthropic | openai | local_qwen3_vl | mock
+> # or override ad-hoc:
+> python -m wrc_demo.apps.demo --llm minimax --task wave
+> ```
+>
+> See [`configs/demo.yaml`](configs/demo.yaml) for the full profile list
+> and the LLM-resolution priority (CLI > demo.yaml > mock). ADR-0008 in
+> the docs covers the optional `llm.fallback` chain.
+
+### Handy entry points (after `pip install -e .`)
+
+```bash
+wrc-demo                # main demo CLI (= python -m wrc_demo.apps.demo)
+wrc-record              # episode recorder
+wrc-mcp                 # MCP server (for Codex / Hermes / Claude Code / etc.)
+wrc-view                # camera dashboard
+wrc-calib-top           # top-camera hand-eye calibration (= sudo wrc-calib-top)
+wrc-calib-wrist         # wrist-camera hand-eye calibration
+```
+
+On this contributor rig, `scripts/setup_env.sh` (legacy uv venv installer) is
+kept for history; new users should use `environment.yml` as shown above. pyrealsense2 comes from the local
 [librealsense L515 fork](https://github.com/johnnynunez/librealsense) build.
 Open-vocabulary text prompts (YOLOE/YOLO-World) additionally need
 `uv pip install git+https://github.com/ultralytics/CLIP.git`; the closed-set
@@ -168,7 +312,7 @@ python scripts/setup_agents.py --camera l515 --arm rebot_rs --write
 | platform | mechanism | setup |
 |---|---|---|
 | **Hermes** | `~/.hermes/config.yaml` `mcp_servers` | `./scripts/hermes_demo.sh` (interactive: register + test + chat) |
-| **Claude Code** | project `.mcp.json` (ships in this repo, pinned to the demo rig's venv paths and the Isaac profiles) | regenerate for your machine first: `setup_agents.py --host claude --python <venv python> --write`; user-scope: `--host claude` prints the `claude mcp add` one-liner |
+| **Claude Code** | project `.mcp.json` (ships in this repo, pinned to the demo rig's venv paths) | regenerate for your machine first: `setup_agents.py --host claude --python <venv python> --write`; user-scope: `--host claude` prints the `claude mcp add` one-liner |
 | **Claude Desktop** | `claude_desktop_config.json` | paste the JSON block from `setup_agents.py --host claude` |
 | **Codex CLI** | `~/.codex/config.toml` `[mcp_servers.wrc-demo]` | `setup_agents.py --host codex --write`, verify with `codex mcp list` |
 | **OpenClaw** | native `mcp.servers` (2026+) or [mcporter](https://docs.openclaw.ai/cli/mcp) | `setup_agents.py --host openclaw` prints the `openclaw mcp set` one-liner + JSON block |
@@ -180,10 +324,7 @@ model) while the ARM stays unpowered until the first motion command
 `WRC_CAMERAS` (comma list, first = manipulation camera), `WRC_CAMERA`
 (single-camera fallback), `WRC_ARM`, `WRC_DETECTOR_MODEL`,
 `WRC_DETECT_CLASSES`, `WRC_VIEW`, `WRC_PREWARM`, `WRC_STREAM`,
-`WRC_STREAM_PORT`, `WRC_RUN_DIR` (trace dir), `DISPLAY`. The Isaac bridge
-side has its own knobs (`WRC_USD`, `WRC_PHYSICS_DEVICE` — `cpu` is the
-escape hatch for GPU-PhysX boot NaNs —, `WRC_BRIDGE_BIND`,
-`WRC_BRIDGE_NO_TARGETS`, `WRC_COMPANION_EXTS`); see `scripts/isaac_bridge.py`.
+`WRC_STREAM_PORT`, `WRC_RUN_DIR` (trace dir), `DISPLAY`.
 
 ## Safety notes for the live rig
 
