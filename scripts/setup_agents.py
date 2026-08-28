@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -31,7 +33,25 @@ sys.path.insert(0, str(REPO / "scripts"))
 from setup_hermes import upsert as hermes_upsert  # noqa: E402
 from setup_hermes import yaml_block as hermes_yaml_block  # noqa: E402
 
-DEFAULT_PY = "/home/spark/Projects/demo/.demo/bin/python"
+# Default Python interpreter for the registered MCP servers.
+# Resolution order:
+#   1. Explicit --python flag (always wins)
+#   2. $WRC_DEMO_PY env var
+#   3. $CONDA_PREFIX/bin/python (active conda env, if any)
+#   4. Whatever `python` is first on $PATH
+# Mirrors the same fallback chain used by start_all.sh / hermes_demo.sh so
+# "I just activated the wrc-demo env" works out of the box.
+def _default_python() -> str:
+    conda_py = os.environ.get("CONDA_PREFIX", "")
+    if conda_py:
+        candidate = os.path.join(conda_py, "bin", "python")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    on_path = shutil.which("python")
+    return on_path or "python"
+
+
+DEFAULT_PY = os.environ.get("WRC_DEMO_PY") or _default_python()
 SERVER = "wrc-demo"
 
 
