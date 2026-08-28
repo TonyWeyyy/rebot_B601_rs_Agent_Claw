@@ -4,7 +4,13 @@ Run this on the wrc_demo rig (with rebot_rs + Orbbec Gemini2 connected)
 BEFORE the actual demo. Fails fast on any missing dependency / config.
 
 Run with:
-    /home/seeed/miniforge3/envs/DM/bin/python -m pytest tests/test_phase6_preflight.py -v --no-header
+    # Conda env (recommended — has every hardware SDK):
+    conda activate wrc-demo
+    pytest tests/test_phase6_preflight.py -v --no-header
+
+    # OR any Python with the required packages (motorbridge + ultralytics +
+    # pyorbbecsdk + pinocchio):
+    python -m pytest tests/test_phase6_preflight.py -v --no-header
 
 Hardware checks (can0 UP, orbbec serial) FAIL on non-rig machines —
 that's expected. The tests still tell you which config-side items
@@ -29,18 +35,28 @@ def _ok(cond, msg):
 # ──────────── Python env ────────────
 
 
-def test_python_is_conda_DM_env():
-    """The 'DM' conda env carries motorbridge + pyorbbecsdk — see README §Setup.
+def test_hardware_packages_present():
+    """motorbridge + pyorbbecsdk + ultralytics + pinocchio are required
+    for any real-hardware run.
 
-    Accepts any prefix that resolves to a conda env named 'DM' (the project
-    convention; install location doesn't matter for new checkouts)."""
-    # sys.executable looks like '<prefix>/envs/DM/bin/python' on conda; 'DM'
-    # may appear in the basename too. We check for the env-name suffix.
-    exe = Path(sys.executable).resolve()
-    parts = exe.parts
-    assert "envs" in parts and "DM" in parts, (
-        f"Wrong Python: {sys.executable}. Activate the DM conda env "
-        f"(`conda activate DM` or `conda run -n DM python ...`) and re-run."
+    The conda `wrc-demo` env (from environment.yml) carries all four. Any
+    equivalent Python with the same packages installed will also pass.
+    """
+    missing = []
+    for pkg, label in (
+        ("motorbridge", "RobStride over SocketCAN"),
+        ("pyorbbecsdk", "Orbbec Gemini 2"),
+        ("ultralytics", "YOLOE / YOLO-World detector"),
+        ("pinocchio", "FK/IK"),
+    ):
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(f"{pkg} ({label})")
+    assert not missing, (
+        f"Missing packages for real hardware: {missing}. "
+        "Either activate the conda 'wrc-demo' env (`conda activate wrc-demo`) "
+        "or install the four packages with pip."
     )
 
 
@@ -93,30 +109,48 @@ def test_orbbec_overhead_camera_yaml_exists():
     assert (REPO / "configs/cameras/orbbec_overhead.yaml").exists()
 
 
-def test_hand_eye_top_z_baked_negative_0_02():
-    """Verify the -0.02 compensation is still baked into T_cam2base.
+def test_hand_eye_top_z_in_reasonable_range():
+    """The shipped hand_eye_top.json is a *redacted reference* for format
+    verification only (camera_serial="REDACTED", samples_for_repro
+    stripped; see `anonymization_note` in the JSON). The exact z value
+    does NOT correspond to a real camera setup on the user's rig.
 
-    The full 4x4 matrix is stored under the ``T_cam2base`` key; the z
-    translation should be ~0.609 (= 0.629 nominal camera height − 0.02
-    compensation). If this is off, the v5 calibration that produces
-    xy < 1 mm is broken and the demo will visibly mismatch set.py.
+    What we DO check: the z translation is in a plausible range for an
+    overhead camera (0.3 - 0.8 m above the table). On the real rig the
+    -0.02 m compensation is added on top of the calibration height
+    (~0.629 m nominal → ~0.609 m); the shipped reference sits slightly
+    below that range because it's been redacted to a generic placeholder.
+
+    To verify your own calibration, re-run
+    `wrc-calib-top --verify --json <your .json>` and look for RMSE
+    < 10 mm.
     """
     data = json.loads((REPO / "data/calibration/hand_eye_top.json").read_text())
     T = data["T_cam2base"]
     z = T[2][3]
-    assert abs(z - 0.609) < 0.001, (
-        f"T_cam2base z = {z}, expected ~0.609 (baked -0.02). "
-        f"See docs/adr/0003-hand-eye-compensation-delta.md."
+    assert 0.3 < z < 0.8, (
+        f"T_cam2base z = {z}, expected in (0.3, 0.8) for an overhead camera. "
+        f"The shipped JSON is a redacted reference — re-run wrc-calib-top "
+        f"to get a real calibration."
     )
 
 
-def test_hand_eye_compensation_recorded():
-    """The JSON should record the -0.02 compensation as documentation."""
+def test_hand_eye_top_is_anonymized_reference():
+    """The shipped hand_eye_top.json must be safe to publish:
+    - camera_serial is "REDACTED" (was the actual Orbbec serial)
+    - samples_for_repro is stripped (was 37 calibration samples + outliers)
+    - schema_version is 2 with an anonymization_note
+    """
     data = json.loads((REPO / "data/calibration/hand_eye_top.json").read_text())
-    comp = data.get("hand_eye_compensation_m_applied", {})
-    assert comp.get("z") == -0.02, (
-        f"hand_eye_compensation_m_applied.z = {comp.get('z')}, "
-        f"expected -0.02. See ADR-0003."
+    assert data.get("camera_serial") == "REDACTED", (
+        "camera_serial must be REDACTED for open-source release; "
+        "real users write their own calibration to hand_eye_top.local.json."
+    )
+    assert data.get("schema_version") == 2, (
+        "schema_version must be 2 (the open-source release schema)."
+    )
+    assert "anonymization_note" in data, (
+        "JSON should carry an anonymization_note explaining the redactions."
     )
 
 
