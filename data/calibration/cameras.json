@@ -2,11 +2,7 @@
   "schema_version": 1,
   "top": {
     "index_when_bound": 0,
-    "serial": "AY3Z331006L"
-  },
-  "updated_at": "2026-07-21T08:13:18Z",
-  "wrist": {
-    "index_when_bound": 1,
     "serial": "AY3794300W4"
-  }
+  },
+  "updated_at": "2026-09-02T09:29:14Z"
 }
