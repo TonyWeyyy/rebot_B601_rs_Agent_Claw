@@ -171,7 +171,11 @@ and must be installed separately as `post-install` steps:
    conda-managed openblas / cudnn chain. The two-step install (conda
    env create → manual `pip install torch`) is intentional.
 - **Persistent learned state outside the run dir** changes behavior between otherwise-identical sessions: `~/.wrc_demo/grasp_memory.json` and `runs/experience.json` (tier-2 habits replay stored call lists verbatim at cosine ≥ 0.9). Delete both for deterministic/fresh demo behavior.
-- YOLOE's text encoder (`mobileclip*.ts`) resolves relative to the CWD — wrong launch directory makes all detections silently vanish. In this checkout the encoder lives at `models/mobileclip2_b.ts` (or `mobileclip_blt.ts` for the larger variant), so launch from `models/` or copy the `.ts` into your launch directory; the detector weights themselves are fine anywhere (`${repo}/models/...` is absolute). Set `YOLO_OFFLINE=True` or ultralytics phones GitHub and stalls the watcher.
+- YOLOE's text encoder (`mobileclip*.ts`) resolves relative to the CWD — wrong launch directory makes all detections silently vanish. The encoders differ in size and model pairing:
+  - `mobileclip2_b.ts` (~253 MB) — used by yoloe-26s / yoloe-26l (**recommended**, already in `models/`)
+  - `mobileclip_blt.ts` (~572 MB) — used by yoloe-11s (legacy; slow download, network-blocking)
+
+  `scripts/start_all.sh` mirrors whichever of these exists in `models/` into CWD automatically (Step 0, added 2026-09-03) — no manual symlink needed. If you bypass the wrapper, either launch from `models/` or copy/symlink the `.ts` into your launch directory. The detector weights themselves are fine anywhere (`${repo}/models/...` is absolute). Set `YOLO_OFFLINE=True` or ultralytics phones GitHub and stalls the watcher.
 - Never use `==`/`list.remove()` on `ObjectBelief` — its numpy fields make dataclass `__eq__` raise ("truth value of an array is ambiguous"); remove by identity as `BeliefStore.mark_removed` does.
 - Accessing any backend-specific attribute on a LazyArm-backed `SafeArm.raw` — anything not on LazyArm's own surface, including `hasattr` probes for extras like `close_gripper_two_stage` — materializes the arm and **powers the motors** via `__getattr__`. LazyArm's own members (`connected`, `stop`, `disconnect`, `resume`) are safe to touch; never probe backend capabilities outside a motion context.
 - Beliefs are keyed by DETECTOR labels, not user-query words — `WRC_DETECT_CLASSES` must name what users will ask for ("banana" can't resolve a belief labeled "fruit").

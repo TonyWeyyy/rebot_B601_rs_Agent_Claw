@@ -285,3 +285,10 @@ sdk/reBotArm_control_py/
 .idea/
 *.swp
 condaenv.*.requirements.txt
+
+
+# Calibration artifacts (ArUco boards)
+*.pdf
+
+# Partial ultralytics downloads
+*.part
