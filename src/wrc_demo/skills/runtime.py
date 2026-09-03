@@ -2077,6 +2077,52 @@ class SkillRuntime:
             raise SkillError("did not settle at home")
         return {"at": "home"}
 
+    def skill_wave(self) -> dict:
+        """Wave hello: oscillate forearm at home position.
+
+        Stays at home_q (TCP at [0.25, 0, 0.35] per FK), oscillates joint 3
+        (forearm roll) by ±0.4 rad for 3 cycles (~3 s total motion). All
+        intermediate poses stay within the safety workspace AABB and URDF
+        joint limits (joint 3 swings between -0.85 and -0.05 rad; URDF
+        limit is ±π - 0.02 rad).
+
+        Added 2026-09-03 to fill the dead-reference in _MOTION_SKILLS
+        (and reflex.py's "wave" regex, which had been dispatching to
+        skill_wave since 2026-08-13 but found no implementation).
+
+        Returns:
+            {"waved": True, "n_cycles": 3, "amplitude_rad": 0.4}
+        """
+        home = np.asarray(
+            self.cfg.arm.get("home_q", [0.0, 0.1684, 0.6226, -0.4543, 0.0, 0.0]),
+            dtype=float,
+        )
+        amplitude = 0.4  # rad on joint 3 (forearm roll)
+        n_cycles = 3
+        half_period_s = 0.5
+
+        # Park at home first (idempotent — SafeArm.move_joints is a no-op
+        # if already at target; otherwise moves us into the safe starting pose).
+        if not self.arm.move_joints(home, duration_s=2.0):
+            raise SkillError("could not reach home before waving")
+
+        for i in range(n_cycles * 2):
+            q = home.copy()
+            q[3] = home[3] + (amplitude if i % 2 == 0 else -amplitude)
+            if not self.arm.move_joints(q, duration_s=half_period_s):
+                raise SkillError(
+                    f"wave trajectory failed at step {i + 1}/{n_cycles * 2}"
+                )
+
+        if not self.arm.move_joints(home, duration_s=2.0):
+            raise SkillError("could not return home after waving")
+
+        return {
+            "waved": True,
+            "n_cycles": n_cycles,
+            "amplitude_rad": amplitude,
+        }
+
     def skill_teach_record(self, slot: int) -> dict:
         """Enter master-slave teleoperation, capture trajectory.
 
@@ -2190,6 +2236,14 @@ TOOL_SPECS: list[dict] = [
     {
         "name": "move_home",
         "description": "Park the arm at home pose. Use to reset between tasks or after failures.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "wave",
+        "description": (
+            "Wave hello: oscillate the forearm at home position to greet. "
+            "Use for 'wave hello' / 'say hi' / '打招呼' / '挥手'. No parameters."
+        ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     {

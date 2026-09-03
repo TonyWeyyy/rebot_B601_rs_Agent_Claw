@@ -268,8 +268,11 @@ class AnthropicClient(LLMClient):
             system=system,
             messages=anth_msgs,
             max_tokens=max_tokens,
-            temperature=self.temperature,
         )
+        # anthropic SDK 1.3.0+ removed `temperature` from the typed signature;
+        # route via `extra_body` (universal pass-through) to keep this
+        # client working without pinning an older SDK.
+        kwargs["extra_body"] = {"temperature": self.temperature}
         if tools:
             kwargs["tools"] = [
                 {

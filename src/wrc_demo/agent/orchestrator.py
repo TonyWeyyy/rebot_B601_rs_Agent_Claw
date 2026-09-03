@@ -197,19 +197,82 @@ class AgentOrchestrator:
         messages.append({"role": "user", "content": intro})
 
         consecutive_failures = 0
-        # 2026-08-13: track whether pick_and_place has succeeded in this task.
+# 2026-08-13: track whether pick_and_place has succeeded in this task.
         # If yes, the next call must be task_done (or move_home + task_done) —
         # never another pick_and_place. The LLM is prone to "verify by re-placing"
         # loops when list_objects still shows the object at its destination.
         self._pick_and_place_succeeded_in_task = False
+        # 2026-09-03: same shape for failures. Small local LLMs (Qwen3-VL-2B
+        # AWQ-4bit) sometimes ignore the "if pick_and_place fails, call
+        # task_done" rule in prompts.py and re-issue the same failing call
+        # until max_steps (30) is hit (~2 min of wasted GPU). Cap consecutive
+        # pick_and_place failures and force task_done instead.
+        # Also: some small LLMs stop calling tools and just emit text
+        # ("I see a red cube...") over and over. Track consecutive text-only
+        # turns and force task_done.
+        self._consecutive_pick_failures = 0
+        self._consecutive_text_only = 0
+        PICK_AND_PLACE_FAILURE_LIMIT = 3
+        # Bumped 2026-09-03: minimax-M3 cloud LLM does more reasoning per turn
+        # than local Qwen3-VL did; 3 turns was too tight — the LLM was on
+        # the verge of correctly calling task_done(success=false, "no wave
+        # tool") when the counter fired. 5 gives one more thinking turn
+        # of headroom without losing the runaway-loop protection.
+        TEXT_ONLY_LIMIT = 5
         for step in range(1, self.max_steps + 1):
             resp = self._chat_with_fallback(
                 system=SYSTEM_PROMPT,
                 messages=self._prune_images(messages),
                 tools=TOOL_SPECS,
-                max_tokens=256,
+                # Tool calls are structured JSON; ~128 tokens is plenty
+                # (largest spec is `pick_and_place` at ~80 tokens). 256 was
+                # the historical value but it leaves no headroom on 8 GB
+                # VRAM RTX 5070 (model_len=2048, system prompt ~1.8 k tokens
+                # after a few turns).
+                max_tokens=128,
             )
             if not resp.tool_calls:
+                # 2026-09-03: small local LLMs sometimes forget to emit
+                # tool calls and just chat. Track consecutive text-only
+                # turns and force task_done after TEXT_ONLY_LIMIT (=5).
+                self._consecutive_text_only += 1
+                if self._consecutive_text_only >= TEXT_ONLY_LIMIT:
+                    last_text = (resp.text or "(no text)")[:200]
+                    if self.runtime.trace is not None:
+                        self.runtime.trace.record_event(
+                            "llm_force_task_done",
+                            {
+                                "reason": (
+                                    f"LLM emitted no tool calls for "
+                                    f"{self._consecutive_text_only} consecutive turns"
+                                ),
+                                "last_text": last_text,
+                            },
+                        )
+                    forced_call = ToolCall(
+                        name="task_done",
+                        arguments={
+                            "success": False,
+                            "summary": (
+                                f"LLM did not emit any tool call for "
+                                f"{self._consecutive_text_only} consecutive turns; aborting. "
+                                f"(last text: {last_text[:80]})"
+                            ),
+                        },
+                    )
+                    forced_result = self.runtime.execute(
+                        forced_call.name, forced_call.arguments
+                    )
+                    tool_log.append({
+                        "step": step, "tool": forced_call.name,
+                        "args": forced_call.arguments, "result": forced_result,
+                        "forced_after_text_only": self._consecutive_text_only,
+                    })
+                    return TaskReport(
+                        task, False, forced_call.arguments["summary"],
+                        str(step), milestones, tool_log,
+                        duration_s=round(time.monotonic() - t_start, 2),
+                    )
                 messages.append({"role": "assistant", "content": resp.text or "(no text)"})
                 messages.append(
                     {
@@ -218,6 +281,8 @@ class AgentOrchestrator:
                     }
                 )
                 continue
+            # Reset text-only counter when LLM does emit a tool call.
+            self._consecutive_text_only = 0
 
             # Execute only the first call, but echo ALL calls and answer each
             # one -- OpenAI-style APIs reject the next request if any
@@ -271,6 +336,58 @@ class AgentOrchestrator:
                 and bool(result.get("ok"))
             ):
                 self._pick_and_place_succeeded_in_task = True
+                self._consecutive_pick_failures = 0
+            elif call.name == "pick_and_place" and not bool(result.get("ok")):
+                self._consecutive_pick_failures += 1
+                if self._consecutive_pick_failures >= PICK_AND_PLACE_FAILURE_LIMIT:
+                    # Force task_done: small local LLMs ignore the
+                    # "fail-then-task_done" rule in prompts.py and retry
+                    # pick_and_place until max_steps is hit (~2 min waste).
+                    last_err = str(result.get("error", ""))[:200]
+                    if self.runtime.trace is not None:
+                        self.runtime.trace.record_event(
+                            "llm_force_task_done",
+                            {
+                                "reason": (
+                                    f"pick_and_place failed "
+                                    f"{self._consecutive_pick_failures} times "
+                                    "consecutively; forcing task_done"
+                                ),
+                                "last_result_error": last_err,
+                            },
+                        )
+                    # Actually execute task_done (the prior pick_and_place
+                    # has already run; the result var holds its outcome).
+                    forced_call = ToolCall(
+                        name="task_done",
+                        arguments={
+                            "success": False,
+                            "summary": (
+                                f"pick_and_place failed "
+                                f"{self._consecutive_pick_failures} times in a row "
+                                f"(last: {last_err[:80]}); aborting."
+                            ),
+                        },
+                    )
+                    forced_result = self.runtime.execute(
+                        forced_call.name, forced_call.arguments
+                    )
+                    tool_log.append({
+                        "step": step, "tool": forced_call.name,
+                        "args": forced_call.arguments, "result": forced_result,
+                        "forced_after_failures": self._consecutive_pick_failures,
+                    })
+                    if forced_result.get("task_complete"):
+                        return TaskReport(
+                            task, False, forced_call.arguments["summary"],
+                            str(step), milestones, tool_log,
+                            duration_s=round(time.monotonic() - t_start, 2),
+                        )
+                    # If task_done itself errored, fall through to next step
+                    # (rare; we trust max_steps as the final backstop).
+            elif call.name == "move_home":
+                # moving home between attempts resets the failure streak
+                self._consecutive_pick_failures = 0
 
             if call.name == "task_done" and result.get("task_complete"):
                 summary = str(call.arguments.get("summary", ""))

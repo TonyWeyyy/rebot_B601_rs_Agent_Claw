@@ -111,7 +111,26 @@ _RULES: list[tuple[re.Pattern, str]] = [
         re.compile(rf"^(?:point\s+(?:at|to)|show\s+me|senala|señala)\s+{_ART}(?P<obj>.+)$"),
         None,  # point_at deleted 2026-08-13
     ),
-    (re.compile(r"^(?:wave|say\s+hi|say\s+hello|saluda)(?:\s+(?:at|to)\s+\S.*)?$"), None),  # wave deleted 2026-08-13
+(re.compile(r"^(?:wave|say\s+hi|say\s+hello|saluda)(?:\s+(?:at|to)\s+\S.*)?$"), None),  # wave re-implemented 2026-09-03 (see skill_wave in runtime.py)
+    (
+        # "go home" / "park the arm" / "回到 home" / "请到初始的原点位置" / "ve a casa"
+        # — single move_home() call, never goes through LLM (cheap, deterministic).
+        # The downstream switch case `intent == "home"` builds
+        # ReflexPlan([("move_home", {})]).
+        re.compile(
+            rf"^(?:go|park|return|move)\s+(?:to\s+)?(?:home|the\s+home\s*pose|the\s+home\s*position)"
+            rf"(?:\s+(?:please|now))?$"
+            rf"|^(?:请)?\s*(?:回)?(?:到|去)\s*(?:初始|home|原点|原位)"
+            rf"(?:的\s*)?(?:原点|原位|初始)?(?:\s*位置|\s*pose|\s*那个|\s*位置)?"
+            rf"\s*[。.!]?$"
+            rf"|^(?:回(?:到|去)?\s*(?:家|原位|原点|home)|回家|回原位|归位|复位)"
+            rf"(?:的\s*)?(?:原点|原位|初始)?(?:\s*位置|\s*pose|\s*那个)?"
+            rf"\s*[。.!]?$"
+            rf"|^(?:ve|regresa|vuelve)\s+(?:a\s+)?(?:casa|inicio|origen)\s*[.!]?$",
+            re.IGNORECASE,
+        ),
+        "home",
+    ),
     (
         re.compile(r"^(?:sort|organize|group|ordena|organiza)\s+.*(?:color|colour)e?s?.*$"),
         None,  # sort_by_color deleted 2026-08-13
