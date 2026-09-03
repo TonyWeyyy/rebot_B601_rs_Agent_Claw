@@ -56,8 +56,10 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VLLM_VENV_BIN="${VLLM_VENV_BIN:-$HOME/cosmos3-venv/bin}"
 VLLM_MODEL="${VLLM_MODEL:-$REPO_DIR/models/qwen3-vl-2b-awq-4bit}"
 VLLM_PORT="${VLLM_PORT:-8080}"
-VLLM_MAX_LEN="${VLLM_MAX_LEN:-2560}"        # 8 GB VRAM: longer KV explodes; raise on bigger GPUs
-VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.65}"      # X server / gnome reserve ~2 GB
+VLLM_MAX_LEN="${VLLM_MAX_LEN:-2560}"        # 8 GB VRAM: need headroom for system prompt (1.9 k tokens after turns) + max_tokens 128
+VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.55}"      # X server / gnome reserve ~2 GB + smaller model fit
+VLLM_ATTN_BACKEND="${VLLM_ATTN_BACKEND:-FLASH_ATTN}"  # TORCH_SDPA / FLASHINFER / FLASH_ATTN
+VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"  # 0 避开 flashinfer sampling kernel JIT（CCCL 头文件冲突 RTX 5070 sm120）
 VLLM_LOG_FILE="${VLLM_LOG_FILE:-/tmp/vllm_cosmos3.log}"
 VLLM_PID_FILE="${VLLM_PID_FILE:-/tmp/vllm_cosmos3.pid}"
 
@@ -91,14 +93,30 @@ case "${1:-start}" in
         exit 0
         ;;
     --status|status)
-        if [[ -f "$VLLM_PID_FILE" ]] && kill -0 "$(cat "$VLLM_PID_FILE")" 2>/dev/null; then
-            echo "[status] vllm running, PID $(cat "$VLLM_PID_FILE")"
-            curl -sf "http://localhost:$VLLM_PORT/v1/models" 2>&1 | head -c 200
-            echo
-        else
+        # 1) prefer PID file (set by --bg) — true kill target for --stop
+        _pid=""
+        if [[ -f "$VLLM_PID_FILE" ]]; then
+            _pid=$(cat "$VLLM_PID_FILE")
+        fi
+        # 2) fall back to pgrep (covers foreground exec / typo like --bage)
+        if [[ -z "$_pid" ]] && command -v pgrep >/dev/null 2>&1; then
+            _pid=$(pgrep -f 'vllm.entrypoints.openai.api_server' | head -n1 || true)
+        fi
+        # 3) no PID at all → truly not running
+        if [[ -z "$_pid" ]]; then
             echo "[status] vllm not running"
             exit 1
         fi
+        # 4) PID alive AND serving HTTP — true positive. Otherwise stale.
+        if ! kill -0 "$_pid" 2>/dev/null || ! curl -sf --max-time 3 \
+                "http://localhost:$VLLM_PORT/v1/models" >/dev/null 2>&1; then
+            echo "[status] vllm not running (PID $_pid stale; cleaning up)"
+            rm -f "$VLLM_PID_FILE"
+            exit 1
+        fi
+        echo "[status] vllm running, PID $_pid"
+        curl -sf "http://localhost:$VLLM_PORT/v1/models" 2>&1 | head -c 200
+        echo
         exit 0
         ;;
 esac
@@ -201,9 +219,11 @@ VLLM_FLAGS=(
     --enable-auto-tool-choice
     --tool-call-parser hermes
     --limit-mm-per-prompt '{"image": 0, "video": 0}'
-    --attention-backend FLASH_ATTN
+    --attention-backend "$VLLM_ATTN_BACKEND"
     --host 0.0.0.0
 )
+
+export VLLM_USE_FLASHINFER_SAMPLER  # disable flashinfer sampling JIT (sm120 incompat)
 
 echo "[start] vllm serve $VLLM_MODEL (max_len=$VLLM_MAX_LEN, gpu_util=$VLLM_GPU_UTIL)"
 echo "[log]   $VLLM_LOG_FILE"
@@ -212,9 +232,27 @@ if [[ "${1:-}" == "--bg" ]]; then
     nohup "$VLLM_VENV_BIN/python" -m vllm.entrypoints.openai.api_server \
         "${VLLM_FLAGS[@]}" \
         > "$VLLM_LOG_FILE" 2>&1 &
-    echo $! > "$VLLM_PID_FILE"
-    echo "[bg] PID $(cat "$VLLM_PID_FILE")"
-    echo "[bg] wait ~60s, then: bash $0 --status"
+    _pid=$!
+    echo "$_pid" > "$VLLM_PID_FILE"
+    echo "[bg] PID $_pid"
+    echo "[bg] wait ~60s for model load; then: bash $0 --status"
+
+    # Best-effort: wait for API to come up so the user sees the real outcome.
+    # 90s budget (vLLM model load + CUDA graph capture on RTX 5070 is slow).
+    for _i in $(seq 1 90); do
+        if ! kill -0 "$_pid" 2>/dev/null; then
+            echo "[bg] vLLM died during startup; see $VLLM_LOG_FILE"
+            rm -f "$VLLM_PID_FILE"
+            exit 1
+        fi
+        if curl -sf --max-time 1 "http://localhost:$VLLM_PORT/v1/models" >/dev/null 2>&1; then
+            echo "[bg] API ready after ${_i}s"
+            exit 0
+        fi
+        sleep 1
+    done
+    echo "[bg] API not ready after 90s; check $VLLM_LOG_FILE"
+    exit 1
 else
     exec "$VLLM_VENV_BIN/python" -m vllm.entrypoints.openai.api_server \
         "${VLLM_FLAGS[@]}"

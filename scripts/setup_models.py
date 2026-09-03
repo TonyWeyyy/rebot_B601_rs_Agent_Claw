@@ -40,14 +40,10 @@ MANIFEST = [
         "use": "local LLM (default profile local_qwen3_vl); vLLM auto-downloads if missing",
         "auto": None,
         "manual": (
-            "Either let vLLM auto-pull on first start_cosmos3_server.sh, or:
-"
-            "  huggingface-cli download QwenLM/Qwen3-VL-2B-Instruct-AWQ-4bit \
-"
-            "    --local-dir models/qwen3-vl-2b-awq-4bit \
-"
-            "    --local-dir-use-symlinks False
-"
+            "Either let vLLM auto-pull on first start_cosmos3_server.sh, or:\n"
+            "  hf download QwenLM/Qwen3-VL-2B-Instruct-AWQ-4bit \\\n"
+            "    --local-dir models/qwen3-vl-2b-awq-4bit \\\n"
+            "    --local-dir-use-symlinks False\n"
             "~2.4 GB total."
         ),
     },
@@ -71,23 +67,44 @@ MANIFEST = [
         "manual": "Same source as 11s; pick one or the other.",
     },
     {
+        "path": "mobileclip2_b.pt",
+        "min_mb": 500,
+        "use": "YOLOE text encoder source (Apple MobileCLIP2-B; ~571 MB .pt; must trace to .ts)",
+        "auto": "https://huggingface.co/apple/MobileCLIP2-B/resolve/main/mobileclip2_b.pt",
+        "manual": (
+            "Apple's official MobileCLIP2-B checkpoint on HuggingFace "
+            "(https://huggingface.co/apple/MobileCLIP2-B). After this .pt is "
+            "on disk, export to torchscript (.ts) using ``torch.jit.trace`` "
+            "against YOLOE's expected input shape (1, 3, 224, 224) — see "
+            "desktop tutorial §4.2 步骤 B. Note: the earlier ``qualcomm/"
+            "MobileCLIP2`` URL used here is a gated repo (401 Unauthorized); "
+            "Apple's mirror is public."
+        ),
+    },
+    {
         "path": "mobileclip2_b.ts",
         "min_mb": 200,
-        "use": "YOLOE text encoder (torchscript)",
-        "auto": "https://huggingface.co/qualcomm/MobileCLIP2/resolve/main/mobileclip2_b.pt?download=true",
+        "use": "YOLOE text encoder (torchscript; produced by tracing mobileclip2_b.pt)",
+        "auto": None,
         "manual": (
-            "If the auto-fetch fails, download manually from the Qualcomm "
-            "MobileCLIP2 HuggingFace repo. The .pt source must be exported "
-            "to torchscript (.ts) using ``torch.jit.trace`` against YOLOE's "
-            "expected input shape."
+            "Run ``torch.jit.trace`` against ``models/mobileclip2_b.pt`` with "
+            "dummy input (1, 3, 224, 224). See desktop tutorial §4.2 步骤 B "
+            "for the exact open_clip recipe. The .pt alone is not enough — "
+            "YOLOE loads the .ts at runtime."
         ),
     },
     {
         "path": "mobileclip_blt.ts",
         "min_mb": 500,
-        "use": "Larger YOLOE text encoder variant",
+        "use": "Larger YOLOE text encoder variant (MobileCLIP-B-LT, v1)",
         "auto": None,
-        "manual": "Same provenance as mobileclip2_b.ts; export from .pt.",
+        "manual": (
+            "Source: https://huggingface.co/apple/MobileCLIP-B-LT/resolve/main/"
+            "mobileclip_blt.pt (~571 MB). Trace to .ts the same way as "
+            "mobileclip2_b (see desktop tutorial §4.2 步骤 B); the open_clip "
+            "model name is ``MobileCLIP-B`` with pretrained tag "
+            "``datacompdr_lt`` (registered in open_clip ≥ 2.30)."
+        ),
     },
 ]
 

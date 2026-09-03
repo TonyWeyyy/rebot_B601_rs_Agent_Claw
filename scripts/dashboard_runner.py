@@ -64,21 +64,33 @@ def main() -> int:
     # Auto-detect the deliberation tier when not explicitly overridden.
     # Reflex/experience tiers work the same either way; only the LLM tier
     # needs a real backend to actually plan novel tasks.
+    # Priority: CLI --llm > configs/demo.yaml llm.profile > env-detect fallback.
     if args.llm:
         llm_profile = args.llm
     else:
-        llm_profile = "mock"
-        qwen_up = False
+        # Try configs/demo.yaml first (the user's source of truth).
+        llm_profile = None
         try:
-            urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2)
-            qwen_up = True
+            import yaml as _yaml
+            _demo_yaml = _yaml.safe_load((REPO / "configs" / "demo.yaml").read_text()) or {}
+            llm_profile = (_demo_yaml.get("llm") or {}).get("profile")
         except Exception:
             pass
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            llm_profile = "anthropic"
-        elif qwen_up:
-            llm_profile = "local_qwen3_vl"
-    print(f"LLM TIER: {llm_profile}", flush=True)
+        if not llm_profile:
+            # Fallback: env-detect
+            qwen_up = False
+            try:
+                urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2)
+                qwen_up = True
+            except Exception:
+                pass
+            if os.environ.get("ANTHROPIC_API_KEY"):
+                llm_profile = "anthropic"
+            elif qwen_up:
+                llm_profile = "local_qwen3_vl"
+            else:
+                llm_profile = "mock"
+    print(f"LLM TIER: {llm_profile} (source: {'cli/demo-yaml' if args.llm else 'auto'})", flush=True)
 
     cameras = [c.strip() for c in args.cameras.split(",")]
     cfg = load_demo_config(cameras=cameras, arm=args.arm, llm=llm_profile)
