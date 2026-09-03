@@ -2,7 +2,7 @@
 type: orbbec
 # serial 由 `python -m wrc_demo.scripts.calib_top_orbbec --bind` 自动回填,
 # 或在 calibration 完成后手工写入。空串 = 选第一台可用设备 (bring-up 期间允许)。
-serial: "AY3Z331006L"
+serial: "AY3794300W4"
 width: 1280
 height: 720
 fps: 30

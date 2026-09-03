@@ -137,13 +137,14 @@ detector:
   # the weights into ${repo}/models on first use if absent, so the demo is
   # object-agnostic out of the box (any visitor object localizes by name).
   # Override with $WRC_DETECTOR_MODEL for a hand-tuned checkpoint.
-  # 2026-08-07: switched to yoloe-26l-seg from rebot_grasp/models/ --
-  # the 26L is the same model rebot_grasp uses and matches its banana /
-  # cyan-toy detection performance. 2x slower per frame but worth the
-  # recognition quality on first deployment. YOLOE-26L expects
-  # mobileclip2_b.ts in models/ (already present).
+  # 2026-09-03: switched from yoloe-11s-seg → yoloe-26s-seg (session 2).
+  # Reason: yoloe-11s needs mobileclip_blt.ts (572 MB, slow download, often
+  # blocked by network). yoloe-26s uses mobileclip2_b.ts which we already
+  # have. Same backbone family as yoloe-26l; 26l is ~2x slower per frame
+  # but marginally better on first deployment. 26s is the recommended
+  # default; switch back to 11s only if a specific detection task needs it.
   type: yoloe
-  model: ${repo}/models/yoloe-11s-seg.pt
+  model: ${repo}/models/yoloe-26s-seg.pt
   device: cpu
   conf: 0.20
 
