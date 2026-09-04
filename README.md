@@ -49,7 +49,7 @@ wrc_demo 是 [reBot Arm B601-RS](https://wiki.seeedstudio.com/cn/rebot_b601_rs_g
 
 ## 0. 速查表
 
-### 0.1 系统要求
+### 系统要求
 
 | 项目 | 要求 |
 |------|------|
@@ -58,19 +58,7 @@ wrc_demo 是 [reBot Arm B601-RS](https://wiki.seeedstudio.com/cn/rebot_b601_rs_g
 | 内存 | ≥ 16 GB（mock 8 GB 起） |
 | 磁盘 | ≥ 10 GB |
 | GPU（可选）| NVIDIA RTX 5070 / 4090 / H100 等 |
-
-### 0.2 命令速查
-
-| 任务 | 命令 |
-|------|------|
-| **激活环境** | `conda activate wrc-demo` |
-| **跑 mock 测试** | `pytest tests/test_extrinsics_loader.py tests/test_hand_eye_compensation_per_camera.py tests/test_demo_yaml_llm_profile.py -q` |
-| **跑完整 preflight** | `pytest tests/test_phase6_preflight.py -v` |
-| **跑 mock demo** | `wrc-demo --task "wave" --no-view --no-serve` |
-| **切换 LLM** | CLI：`--llm <profile>`；YAML：编辑 `configs/demo.yaml` 的 `llm.profile` |
-| **启动本地 LLM** | `bash scripts/start_cosmos3_server.sh --bg` |
-| **顶部相机标定** | `wrc-calib-top --n 30 --out data/calibration/hand_eye_top.local.json` |
-| **下载模型权重** | `python scripts/setup_models.py --fetch` |
+| 显存 | ≥ 8 GB  |
 
 ---
 
@@ -78,15 +66,6 @@ wrc_demo 是 [reBot Arm B601-RS](https://wiki.seeedstudio.com/cn/rebot_b601_rs_g
 
 - **项目目标**：把视觉语言模型（VLM）接到 reBot Arm B601-RS 上，让自然语言指令自动变抓取动作——VLM 选物体、Pinocchio 反解 IK、`SafetyHarness` 每个 50 Hz waypoint fail-closed 校验。
 - **适用读者**：有 NVIDIA GPU + Ubuntu 22.04 + Python 3.10 基础，想跑 demo / 改 detector / 加 skill 的开发者。
-- **阅读路径**：
-  - **5 分钟**：直接看 §3.0（mock 测试 + mock demo）→ 验证 conda env 能跑就够。
-  - **1-2 小时**：按 §3 → §4 → §5 → §6 → §7 顺序读，能从零到真机抓取。
-  - **改 detector / 加 skill**：先读完 §9，再看 §10.3 关键设计决策。
-- **本文档不覆盖**：
-  - RobStride 电机底层协议（详见 vendored SDK `wrc_demo/sdk/reBotArm_control_py/`）
-  - Pinocchio 数值算法（详见上游 docs）
-  - YOLOE 模型训练（详见 [ultralytics 官方文档](https://docs.ultralytics.com/models/yoloe/)）
-
 ---
 
 ## 2. 项目概览
@@ -206,7 +185,7 @@ sudo ip link set can0 up
 
 ---
 
-## 3. 环境配置（核心 1）
+## 3. 环境配置
 
 ### 3.0 最小路径：5 分钟跑通 mock
 
@@ -254,7 +233,7 @@ sudo apt install -y libusb-1.0-0-dev ffmpeg git can-utils
 
 ### 3.3 post-install：单独装 PyTorch（CUDA 版本）
 
- **📌 工作目录**：从本节起，所有命令都假设你在 `wrc` 仓库根目录里。如果开了新 shell，先 `cd wrc`。
+ **工作目录**：从本节起，所有命令都假设你在 `wrc` 仓库根目录里。如果开了新 shell，先 `cd wrc`。
 
 ```bash
 # 你现在应该已经 cd wrc 了；如果不是：
@@ -330,7 +309,9 @@ PYTHONNOUSERSITE=1 pip install -e .
 cd -
 ```
 
-> **中国大陆用户**可以用 gitee 镜像加速：`git clone https://gitee.com/orbbecdeveloper/pyorbbecsdk.git`
+:::tip
+**中国大陆用户**可以用 gitee 镜像加速：`git clone https://gitee.com/orbbecdeveloper/pyorbbecsdk.git`
+:::
 
 #### RealSense D435i / D405
 
@@ -373,21 +354,19 @@ PYTHONNOUSERSITE=1 python -c "import torch; m=torch.jit.load('models/mobileclip2
 # 预期：torch.Size([2, 512]) [1.0, 1.0]
 ```
 
-### 4.1.1 ℹ️ 关于 YOLOE 文本编码器的查找路径
+#### 4.1.1 关于 YOLOE 文本编码器的查找路径
 
 ultralytics 加载 `mobileclip*.ts` **只看当前工作目录（CWD），不会去 `models/` 找**。
 
 如果直接 `python -m wrc_demo.apps.demo ...`，CWD 不在 `models/` 下就会报 "Download failure for ... mobileclip_*.ts"。
 
-**好消息**：`scripts/start_all.sh`（以及任何用它的 wrapper）在启动前会自动把 `models/*.ts` 软链接到 CWD，**你不需要手动建 symlink**。这一段只在你绕过 wrapper 直接跑 python 时才需要管：
+可以执行一下命令解决上述报错问题
 
 ```bash
 # 直接跑 python 时的两种处理方式（任选）
-ln -sf models/mobileclip2_b.ts mobileclip2_b.ts     # A. 项目根 symlink
-cd models && python -m wrc_demo.apps.demo ...      # B. 在 models/ 下跑
+ln -sf models/mobileclip2_b.ts mobileclip2_b.ts     # 项目根 symlink
 ```
 
-> 2026-09-03 session 2 补丁：`start_all.sh` 增加 `Step 0` 自动 symlink（见 §4.3 速查表的"启动器"行）。
 
 ### 4.2 下载Qwen3-VL 本地 LLM 权重
 
@@ -420,9 +399,6 @@ cd models/qwen3-vl-2b-awq-4bit && git lfs pull
 | `mobileclip2_b.ts` | ~253 MB | YOLOE 26s/l 文本编码（运行时实际加载）| 手动 trace（见 §4.1）；已下载后**必须放在 `models/` 或 CWD**——见 §4.1.1 |
 | `mobileclip_blt.ts` | ~572 MB | YOLOE 11s 文本编码（**不推荐**，来源难下）| 手动 trace，源 `apple/MobileCLIP-B-LT`；只在用 11s 时才需要 |
 | `pyrealsense2` | 编译产物 | 仅 RealSense 用户 | Intel 官方文档编译 |
-
-> **2026-09 变更**：`configs/demo.yaml` 默认 `model:` 从 `yoloe-11s-seg.pt` 切到 `yoloe-26s-seg.pt`（session 2 改动，待 commit）。如果你已经有仓库 checkout + models/，**不需要任何重新下载**——只是改了一行 demo.yaml。
-
 ---
 
 ## 5. 手眼标定
@@ -433,7 +409,7 @@ cd models/qwen3-vl-2b-awq-4bit && git lfs pull
 
 #### 1. 打印 ArUco 棋盘
 
-打印一张 Aruco 4x4 字典、ID = 0、边长 = 0.10 m（10 cm）的棋盘格。推荐来源：~/wrc/aruco100x100.pdf
+打印一张 Aruco 4x4 字典、ID = 0、边长 = 0.10 m（10 cm）的棋盘格。推荐来源：`~/wrc/aruco100x100.pdf`
 
 打印后**精确测量**边长（打印机会缩放），把测量值用作 `--marker-size` 参数。
 
@@ -456,7 +432,9 @@ wrc-calib-top --list
 # 预期：列出 Orbbec 设备索引 + 序列号
 
 #写入相机序列号
-wrc-calib-top --bind top --serial `更改为扫描到的序列号`
+wrc-calib-top --bind top --serial `xxxx`
+# 将 serial `xxxx`中的内容更改为列出的相机序列号
+
 ```
 
 ### 5.2 顶部相机 ETH 标定
@@ -474,6 +452,10 @@ wrc-calib-top --marker-size 0.10 --manual --n 30 \
 ```
 
 `hand_eye_top.local.json` 文件**自动被 .gitignore 忽略**（不会污染仓库），是真机标定结果。
+
+:::tip
+因为本demo设定有机械臂的安全工作区域，如果在大面积区域在抓取放置问题时出现IK求解失败，那么则需要调整相机的固定位置并重新进行标定（稳定的相机固定位置在距离机械臂底座36cm*36cm的位置左右）
+:::
 
 #### 标定原理
 
@@ -565,25 +547,21 @@ CLI 临时切：`wrc-demo --llm anthropic --task "..."`
 conda activate wrc-demo
 
 # ⚠ 重要：下面的 `PUT_KEY_HERE` 是**占位符**，必须替换成你的真 key
-#   替换方法：双引键里直接把 PUT_KEY_HERE 删掉、粘上真 key
-#   不要保留任何尖括号、引号、$、空格 — bash 会把它们当字面值
 
 # Claude（Anthropic key 格式: sk-ant-api03-...）
 export ANTHROPIC_API_KEY=PUT_KEY_HERE
 
 # OpenAI（或任何 OpenAI 兼容 endpoint；key 格式: sk-...）
 export OPENAI_API_KEY=PUT_KEY_HERE
-# 可选：换 endpoint（Azure / Together / 自建 vLLM 等）
-# export OPENAI_BASE_URL=https://api.example.com/v1
 
 # MiniMax（key 格式: sk-cp-...）
 export MINIMAX_API_KEY=PUT_KEY_HERE
 
-# 验证env var 真的设上了（看到你的 key 前缀，不是 PUT_KEY_HERE）
+# 验证env var 设置无误
 echo "ANTHROPIC_API_KEY 前缀: ${ANTHROPIC_API_KEY:0:10}..."
 echo "MINIMAX_API_KEY 前缀: ${MINIMAX_API_KEY:0:10}..."
 ```
-使用`export`配置的云端`API_KEY`只有在当前终端有效，如果想要`key`持久化到 `~/.bashrc`**（只 export 当前 shell 有效，新 shell 要重设）：
+使用`export`配置的云端`API_KEY`只有在当前终端有效，如果想要`key`持久化到 `~/.bashrc`（只 export 当前 shell 有效，新 shell 要重设）：
 ```bash
 # 把 PUT_KEY_HERE 替换成你的真 key（一整行）
 echo 'export ANTHROPIC_API_KEY=PUT_KEY_HERE' >> ~/.bashrc
@@ -627,22 +605,25 @@ wrc-demo --llm minimax --task "go to home" --no-view --no-serve
 # 单次跑用本地模型（覆盖 demo.yaml 的 default）
 wrc-demo --llm local_qwen3_vl --task "go to home" --no-view --no-serve
 ```
+
 :::tip
 上面两个测试脚本只是用来测试模型的链路是否连通，并不会实际控制机械臂
 :::
+
 ---
 
-## 7. demo 运行（核心 5）
+## 7. demo 运行
 
-### 7.1 启动 demo（CLI 模式）
+### 7.1 启动 demo
 
 ```bash
 # 启动项目
 bash /home/seeed/wrc/scripts/start_all.sh --repl --real
 
-#启动网页，例如：http://192.168.3.175:8090/ 打开控制界面，即可通过对话完成机械臂控制
-
 ```
+
+运行完成后终端输出示例如下：
+
 ```
 # 输出示例：
 (wrc-demo) seeed@seeed-KUANGSHI-Series:~/wrc$ bash /home/seeed/wrc/scripts/start_all.sh --repl --real
@@ -665,6 +646,14 @@ load extensions from /home/seeed/miniforge3/envs/wrc-demo/lib/python3.10/site-pa
 [wrc-demo] LIVESTREAM dashboard: http://192.168.3.175:8090/
 Type a task (empty line to quit).
 task> 
+
+```
+
+启动网页，点击终端输出的`[wrc-demo] LIVESTREAM dashboard: http:xxxx`，即可通过对话完成机械臂控制
+
+对话命令发送后终端输出内容效果如下：
+
+```
 === task report ===
 task:    go to home
 success: True
@@ -680,100 +669,42 @@ success: True
 path:    llm (14.66s)
 steps:   3
 summary: Robot waved hello three times as requested.
-
 ```
 
-### 7.2.5 完整启动命令（vLLM + wrc-demo 一体化）
+:::tip
+因为本demo设定有机械臂的安全工作区域，如果在大面积区域在抓取放置问题时出现IK求解失败，那么则需要调整相机的固定位置并重新进行标定（稳定的相机固定位置在距离机械臂底座36cm*36cm的位置左右）
+:::
 
-如果想**手动**启动整套（vLLM + wrc-demo + dashboard）而不是用 §7.2 的简化封装，**完整命令**长这样：
 
-#### Mock 全栈（无 sudo，无真机）
+### 7.2 可执行的工作
 
-```bash
-# 1. 启动 vLLM（后台）
-bash scripts/start_cosmos3_server.sh --bg
+通过文本对话控制的共有两个路径，`path:llm & path:reflex`
 
-# 2. 启动 wrc-demo（前台，看实时输出）
-PYTHONNOUSERSITE=1 \
-HOME=/home/seeed \
-YOLO_OFFLINE=True \
-WRC_RUN_DIR=/home/seeed/wrc/runs/live_$(date +%Y%m%d_%H%M%S) \
-WRC_STREAM=1 \
-/home/seeed/miniforge3/envs/wrc-demo/bin/python -u -m wrc_demo.apps.demo \
-  --cameras mock --arm mock \
-  --llm local_qwen3_vl \
-  --interactive --no-view
+`reflex`指预加载的文本(mock模式)，可以保证在没有LLM运行的情况下执行对应的操作，用提前写好的固定文本控制rebot完成不同工作。
+
+稳定的reflex指令如下
+```
+pick up X and put in Y  # 完整 pick+place
+
+open the gripper        # 打开夹爪
+
+look around             # 列出相机识别到的物体
+
+go home                 # 回归原点
 ```
 
-#### 真机全栈（需要 sudo，跑 CAN bus）
+`llm`指经过真正接入的云端模型或本地部署的模型分析，能够更加弹性的理解语言文本，并调用对应的skills。
 
-```bash
-# 0. 一次性：缓存 sudo 凭据（sudo -v 在交互终端跑一次）
-sudo -v
-
-# 1. 启动 vLLM（后台）
-bash scripts/start_cosmos3_server.sh --bg
-
-# 2. 启动 wrc-demo（前台，sudo 拿 CAN bus + USB 设备）
-sudo -E env \
-HOME=/home/seeed \
-PYTHONNOUSERSITE=1 \
-YOLO_OFFLINE=True \
-WRC_RUN_DIR=/home/seeed/wrc/runs/live_$(date +%Y%m%d_%H%M%S) \
-WRC_STREAM=1 \
-/home/seeed/miniforge3/envs/wrc-demo/bin/python -u -m wrc_demo.apps.demo \
-  --cameras orbbec_overhead --arm rebot_rs \
-  --llm local_qwen3_vl \
-  --interactive --no-view
+skills和对应功能如下
 ```
-
-#### 一行封装（推荐）
-
-```bash
-bash scripts/start_all.sh            # mock 全栈
-bash scripts/start_all.sh --real     # 真机全栈（需要 sudo）
-bash scripts/start_all.sh --stop     # 关掉所有（vLLM + wrc-demo）
+skill_get_observation	 # 拍照+识别
+skill_localize_object	 # 单物体定位
+skill_grasp_object	     # 仅抓取
+skill_place_at	         # 放置到坐标
+skill_place_on_object	 # 放置到物体上
+skill_open_gripper	     # 打开夹爪
+skill_close_gripper	     # 关闭夹爪
 ```
-
-#### 关键 env var（完整列表看 `src/wrc_demo/apps/mcp_server.py:14-29`）
-
-| 变量 | 作用 | 默认 |
-|------|------|------|
-| `HOME` | ultralytics / YOLO 缓存路径 | `/root`（可能没 YOLO 缓存权限） |
-| `PYTHONNOUSERSITE=1` | conda env 不读 user site-packages | — |
-| `YOLO_OFFLINE=True` | ultralytics 不联网下载（GFW后也避免 hang）| `False` |
-| `WRC_RUN_DIR` | trace/keyframes 输出目录 | `<repo>/runs/<timestamp>` |
-| `WRC_STREAM=1` | 启用 MJPEG livestream dashboard | `0` |
-| `WRC_STREAM_PORT` | dashboard 端口（默认从 `configs/demo.yaml` 读）| `8090` |
-| `WRC_VIEW=1` | 启用开开真 OpenCV 窗口（需要 DISPLAY）| 有 DISPLAY 自动开 |
-| `WRC_PREWARM=0` | 禁用 perception 预热（cold start 调试用）| `1` |
-| `WRC_DETECT_CLASSES` | YOLOE 默认词汇（逗号分隔）| 从 `configs/demo.yaml` |
-| `WRC_DETECTOR_MODEL` | 覆盖 detector 权重路径 | 从 `configs/demo.yaml` |
-
-Dashboard URL：`http://<your-ip>:8090`
-
-### 7.3 启动 demo（Dashboard 长跑模式）
-
-适合展位 / 演示场景——跑一次脚本化 pick + 持续服务 MJPEG dashboard：
-
-```bash
-python scripts/dashboard_runner.py
-# 或自定义初始任务
-WRC_DASHBOARD_TASK="wave" python scripts/dashboard_runner.py
-```
-
-Dashboard URL：`http://<your-ip>:8090`（默认 `0.0.0.0:8090`）
-
-### 7.4 demo 不工作排查
-
-| 症状 | 原因 | 解决 |
-|------|------|------|
-| `LLMConfigError: ANTHROPIC_API_KEY not set` | 云端 API 没设 env var | `export ANTHROPIC_API_KEY=...` |
-| demo 卡住 30s+ 不响应 | 选择了 cloud LLM 但网络慢 | 切到 `--llm mock` 验证 |
-| `CUDA OOM` | AWQ-4bit + detector 抢显存 | 切 `--device cpu` 在 `configs/demo.yaml` |
-| 物体识别不到 | `mobileclip2_b.ts` 不在 `models/` / ultralytics 的 `clip` fork 没装 | 见 §4.2 步骤 B |
-| `bwrap panic`（Codex CLI 用户）| Codex 沙箱 + 中文 basename | 详见 §11.5 |
-| YOLOE 没有任何检测 | 详见 FAQ `mobileclip2_b.ts` 路径 | 从 `models/` 目录启动；`MobileCLIPTS` 传绝对路径（§4.2 步骤 B）|
 
 ---
 
@@ -781,36 +712,71 @@ Dashboard URL：`http://<your-ip>:8090`（默认 `0.0.0.0:8090`）
 
 ### 8.1 加新 LLM profile
 
-最简单的一步——复制 yml 改字段：
+wrc-demo 的 LLM 后端是**可插拔的**，如果您需要增加新的 LLM profile，`configs/llm/<name>.yaml` 一个文件,就是一个 profile。
 
+`demo.yaml` 里改一行 `profile: <name>` 就切换
+
+**当前内置的 5 个 profile**:
+
+| profile | 用途 | 需要的 env var |
+|---|---|---|
+| `local_qwen3_vl` | **默认**,本地 Qwen3-VL-2B-AWQ-4bit(vLLM 8080) | 不需要 |
+| `mock` | 离线脚本,纯测试(§7.4 排查用过) | 不需要 |
+| `anthropic` | Anthropic Claude | `ANTHROPIC_API_KEY` |
+| `openai` | OpenAI / OpenAI 兼容协议 | `OPENAI_API_KEY` |
+| `minimax` | MiniMax cloud(已迁到 env var) | `MINIMAX_API_KEY` 
+
+如果需要加新 profile 可以执行下面几个步骤
+
+#### 第 1 步:复制 yaml 当模板
+
+（1）大多数国产 LLM(DeepSeek / Moonshot Kimi / DashScope Qwen / 智谱 / SiliconFlow)，都走 OpenAI Chat Completions 协议
+
+可以从 openai.yaml 复制
 ```bash
-# 1. 复制
-cp configs/llm/anthropic.yaml configs/llm/my_llm.yaml
-
-# 2. 编辑 configs/llm/my_llm.yaml
+cp configs/llm/openai.yaml configs/llm/kimi.yaml
 ```
 
-```yaml
-type: openai             # openai / anthropic / mock
-model: my-model-name
-base_url: https://api.example.com/v1
-env_key: MY_LLM_API_KEY
-supports_vision: true
-temperature: 0.0
-max_tokens: 1024
-timeout_s: 30
+（2）Anthropic 协议的从 anthropic.yaml 复制
+
+#### 第 2 步:改 yaml 的 4 个字段
+打开 configs/llm/kimi.yaml,只需要改 4 个字段:
+
+```
+type: openai                # 协议类型(见下方"type 怎么选")
+model: moonshot-v1-8k       # 模型名(查厂商文档)
+base_url: https://api.moonshot.cn/v1   # API endpoint,**末尾 /v1 不要漏**
+env_key: MOONSHOT_API_KEY   # 读哪个 env var
+supports_vision: false      # 是否支持图像(关键,见下方)
+temperature: 0.0            # 一般不用动
+max_tokens: 1024            # 一般不用动
+timeout_s: 30               # 慢网络可调到 60
 ```
 
-```bash
-# 3. 在 demo.yaml 设默认
-vim configs/demo.yaml
-# llm:
-#   profile: my_llm        ← 改这一行
-
-# 4. 设 env var + 重启 demo
-export MY_LLM_API_KEY=...
-wrc-demo --task "..."
+#### 第 3 步:在 demo.yaml 切换 profile
+打开 `configs/demo.yaml`,找到 llm: block,只改一行:
 ```
+llm:
+  profile: kimi    # ← 改成新 profile 名(去掉 .yaml 后缀)
+```
+
+#### 第 4 步:设 env var + 验证
+（1）临时 export(本次 shell 有效)
+```
+export MOONSHOT_API_KEY=sk-...
+```
+（2）验证 env var 生效
+```
+echo "${MOONSHOT_API_KEY:0:8}"
+```
+（3）用 --llm flag 试跑,**不动 demo.yaml**
+```
+conda activate wrc-demo
+python -m wrc_demo.apps.demo --llm kimi --task "list the objects" --no-view --no-serve
+```
+
+（4）看 stdout 是否打印 "[wrc-demo] llm=kimi"，LLM 响应一条消息就算成功(空场景也 OK)
+
 
 ### 8.2 改 grasp 精度
 
@@ -832,6 +798,24 @@ grasp:
 
 更保守（更精确、更慢）→ 调高 `n_samples`（vLLM 思考多）；更激进（更快）→ 调低。
 
+手眼补偿(`hand_eye_compensation_m`)，编辑 `configs/cameras/orbbec_overhead.yaml`的 `extrinsics。
+
+grasp pose 要经过 `T_cam2base` 把相机坐标转到基坐标系——这一步的
+偏差会直接传导到 grasp 落点。微调这条链路上的偏差，可以调整
+`hand_eye_compensation_m`的数值。
+
+```yaml
+# configs/cameras/orbbec_overhead.yaml
+extrinsics:
+  source: "${repo}/data/calibration/hand_eye_top.json"
+  mode: eye_to_hand
+  hand_eye_compensation_m:    # 米;默认 [0, 0, 0] = identity(不起作用)
+    x: 0.00
+    y: 0.00
+    z: 0.00
+```
+X、Y、Z三个数值的作用就是在已标定的 T_hand_eye 之上,叠加一个手动平移补偿，确保能够完成物体的稳定抓取。 
+
 ### 8.3 改 detector 词汇
 
 ```yaml
@@ -845,15 +829,9 @@ detect_classes: ["banana", "cracker box", "soup can", "cube", "box", "pen", "toy
 # ↑ 这列表告诉 YOLOE 在开放词汇模式下去找哪些标签
 ```
 
-或者运行时通过 env var 覆盖：
-
-```bash
-WRC_DETECT_CLASSES="banana,apple,orange" wrc-demo --task "..."
-```
-
 ### 8.4 改安全阈值
 
-> ⚠ **不变量**：`Kinematics.ik` 的 `limit_margin=0.025` 必须**严格大于** harness 的 `joint_margin=0.02`——任一边单独调都会破坏 IK 和安全校验的边界。**两个一起调**！
+不变量**：`Kinematics.ik`（src/wrc_demo/control/kinematics.py） 的 `limit_margin=0.025` 必须**严格大于** harness 的 `joint_margin=0.02`——任一边单独调都会破坏 IK 和安全校验的边界。**两个一起调**！
 
 ```yaml
 # configs/demo.yaml
@@ -873,7 +851,7 @@ safety:
 
 ## 9. 加新技能
 
-> **前提**：熟悉 Python + Pinocchio + ultralytics。本节是 30 分钟 quick start；要理解底层设计看 `src/wrc_demo/skills/runtime.py`。
+**前提**：熟悉 Python + Pinocchio + ultralytics。本节是 30 分钟 quick start；要理解底层设计看 `src/wrc_demo/skills/runtime.py`。
 
 ### 9.1 加新 skill 的 5 步
 
@@ -1177,25 +1155,3 @@ t=N.5s  report.success ── print "✓ done — arm parked at home"
 | `bwrap panic`（Codex CLI）| | 路径含中文 basename 会触发。把工作目录改到纯 ASCII。详见 CLAUDE.md |
 
 ---
-
-## 12. 变更日志
-
-### v6.5（2026-08-28，环境踩坑修复 + 文档重写为操作指南）
-
-**环境修复**：
-- `environment.yml`：加 `pandas>=2.0,<3` pin；channel 列表去掉 `defaults` 只留 `conda-forge`；移除 `pyorbbecsdk2`（依赖链太深）；加 `torch>=2.0` 显式 pin
-- `src/wrc_demo/__init__.py`：ultralytics text-encoder monkey-patch 改 lazy（首次 detector init 才 import）
-
-**文档重写**：
-- 从"开发文档视角"（架构详解 + 配置系统 + 二次开发指南）改为"操作指南视角"（环境配置 → 模型下载 → LLM 切换 → 手眼标定 → demo 运行 → 故障排查）
-- 新增章节：5 分钟快速开始、自定义配置、加新技能、故障排查速查表
-- 删除章节：项目特点 / BOM / 环境要求 / Scripts 总览 / 目录结构 / 架构概览（保留为单独 wiki 章节）/ 配置系统详解 / 技能系统详解 / 测试详解 / 部署 CI / 二次开发指南详解 / FAQ / 联系方式 / 参考文档 / Changelog 详细
-
-**教程使用方式**：
-```bash
-# mock only：~ 5 分钟
-git clone … && conda env create … && pytest … && wrc-demo --task wave
-
-# 真机：~1-2 小时
-mock + §3 系统依赖 + §3.5 Orbbec SDK + §3.6 PyTorch + §4 模型下载 + §5 LLM 配置 + §6 手眼标定 + §7 demo 运行
-```
