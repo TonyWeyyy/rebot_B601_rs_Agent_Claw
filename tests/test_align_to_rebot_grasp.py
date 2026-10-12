@@ -270,6 +270,9 @@ def _make_pick_and_place_runtime(bridge, *, already_held=None):
     arm.harness.vet_pose.return_value = None  # always safe by default
     arm.harness.allow_grasp_descent = MagicMock()
     arm.harness.clear_grasp_exemption = MagicMock()
+    # Real workspace AABB so the place-target precheck can do numeric checks.
+    arm.harness.limits.workspace_min = np.array([0.10, -0.30, -0.01])
+    arm.harness.limits.workspace_max = np.array([0.50, 0.30, 0.55])
     arm.get_state.return_value.q = np.zeros(6)
 
     kin = MagicMock()
@@ -301,14 +304,16 @@ def _make_pick_and_place_runtime(bridge, *, already_held=None):
 
 
 def test_pick_and_place_bridge_path_calls_full_sequence():
-    """Bridge pick_and_place: same-frame detect → grasp → home → place → home."""
+    """Bridge pick_and_place: localize → grasp → ready → place → ready."""
     bridge = MagicMock()
     rt = _make_pick_and_place_runtime(bridge)
 
-    # Stubs: same-frame detect returns banana + box
+    # Stubs: object + destination localized through the fallback chain
     banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
     box_fix = _fix_at([0.35, 0.10, 0.10], label="yellow box")
-    rt._single_localize = MagicMock(side_effect=[banana_fix, box_fix])
+    rt._localize = MagicMock(
+        side_effect=[(_frame(), banana_fix), (_frame(), box_fix)]
+    )
     rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
 
     with _patched_select_grasp(rt):
@@ -325,38 +330,43 @@ def test_pick_and_place_bridge_path_calls_full_sequence():
     bridge.release_with_async_close.assert_called_once_with(timeout=0.5, delay_s=0.8)
 
 
-def test_pick_and_place_bridge_path_uses_same_frame_for_both_targets():
-    """Both banana and box must come from ONE observe() call."""
+def test_pick_and_place_bridge_path_localizes_both_targets_via_fallback_chain():
+    """Both object and destination go through ``_localize`` (multi-frame
+    retry + belief fallback) — the bridge must NOT require live-frame
+    detection, which flickers on open-vocab classes."""
     bridge = MagicMock()
     rt = _make_pick_and_place_runtime(bridge)
 
     banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
     box_fix = _fix_at([0.35, 0.10, 0.10], label="yellow box")
-    rt._single_localize = MagicMock(side_effect=[banana_fix, box_fix])
+    rt._localize = MagicMock(
+        side_effect=[(_frame(), banana_fix), (_frame(), box_fix)]
+    )
     rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
 
     with _patched_select_grasp(rt):
         rt.skill_pick_and_place("banana", destination="yellow box")
 
-    # observe() called exactly once (same-frame detect)
-    rt.observe.assert_called_once()
-    # _single_localize called twice (once for each label) on the same frame
-    assert rt._single_localize.call_count == 2
-    # Both calls received the same frame argument
-    frames_passed = [c.args[0] for c in rt._single_localize.call_args_list]
-    assert frames_passed[0] is frames_passed[1], (
-        "banana and box should be detected on the SAME frame"
-    )
+    # _localize called twice: once for the object, once for the destination
+    assert rt._localize.call_count == 2
+    queries = [c.args[0] for c in rt._localize.call_args_list]
+    assert queries == ["banana", "yellow box"]
+    # The bridge never observes a raw frame itself — localization owns that
+    rt.observe.assert_not_called()
 
 
-def test_pick_and_place_bridge_path_place_uses_hardcoded_z_0_08():
-    """Place move_to_traj z is 0.08 hardcoded (matches set.py)."""
+def test_pick_and_place_bridge_path_place_z_falls_back_to_0_08_without_points():
+    """Place move_to_traj z falls back to 0.08 (set.py parity) when the
+    destination fix carries no point cloud."""
     bridge = MagicMock()
     rt = _make_pick_and_place_runtime(bridge)
 
     banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
     box_fix = _fix_at([0.35, 0.10, 0.10], label="yellow box")
-    rt._single_localize = MagicMock(side_effect=[banana_fix, box_fix])
+    box_fix.points = None  # no point cloud → hardcoded fallback
+    rt._localize = MagicMock(
+        side_effect=[(_frame(), banana_fix), (_frame(), box_fix)]
+    )
     rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
 
     with _patched_select_grasp(rt):
@@ -365,7 +375,7 @@ def test_pick_and_place_bridge_path_place_uses_hardcoded_z_0_08():
     # Call order: ready(0), pre(1), grasp(2), ready(3), place(4), ready(5)
     place_call = bridge.move_to_traj.call_args_list[4]
     assert place_call.args[2] == 0.08, (
-        f"place z must be 0.08 hardcoded, got {place_call.args[2]}"
+        f"place z must fall back to 0.08 without points, got {place_call.args[2]}"
     )
     # rpy=(0, 1.2, 0)
     assert (place_call.args[3], place_call.args[4], place_call.args[5]) == (0.0, 1.2, 0.0)
@@ -373,12 +383,15 @@ def test_pick_and_place_bridge_path_place_uses_hardcoded_z_0_08():
 
 
 def test_pick_and_place_bridge_path_returns_failure_if_no_box():
-    """If box not detected, raise SkillError before grasp."""
+    """If the destination cannot be localized at all, raise SkillError
+    before grasping."""
     bridge = MagicMock()
     rt = _make_pick_and_place_runtime(bridge)
 
     banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
-    rt._single_localize = MagicMock(side_effect=[banana_fix, None])
+    rt._localize = MagicMock(
+        side_effect=[(_frame(), banana_fix), SkillError("no detections")]
+    )
     rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
 
     with pytest.raises(SkillError, match="yellow box"):
@@ -395,7 +408,9 @@ def test_pick_and_place_bridge_path_clears_held_after_release():
 
     banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
     box_fix = _fix_at([0.35, 0.10, 0.10], label="yellow box")
-    rt._single_localize = MagicMock(side_effect=[banana_fix, box_fix])
+    rt._localize = MagicMock(
+        side_effect=[(_frame(), banana_fix), (_frame(), box_fix)]
+    )
     rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
 
     with _patched_select_grasp(rt):
@@ -425,97 +440,214 @@ def test_pick_and_place_bridge_path_skipped_when_legacy_no_destination():
     bridge.move_to_traj.assert_not_called()
 
 
-def test_pick_and_place_bridge_warns_when_box_top_above_release_height():
-    """If box top is higher than the hardcoded release_z=0.08, log a warning."""
-    bridge = MagicMock()
-    rt = _make_pick_and_place_runtime(bridge)
-
-    banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
-    box_fix = _fix_at([0.35, 0.10, 0.10], label="yellow box")
-    # Box top is 0.15 m — well above 0.08 release height
-    box_fix.points = np.array([
-        [0.35, 0.10, 0.10],
-        [0.35, 0.11, 0.15],  # highest point
-    ])
-    rt._single_localize = MagicMock(side_effect=[banana_fix, box_fix])
-    rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
-
-    with _patched_select_grasp(rt):
-        rt.skill_pick_and_place("banana", destination="yellow box")
-
-    # memory.add was called with a "warning" event mentioning the collision risk
-    warning_calls = [
-        c for c in rt.memory.add.call_args_list
-        if c.args[0] == "warning"
-    ]
-    assert len(warning_calls) >= 1, (
-        f"expected at least one warning event, got {rt.memory.add.call_args_list}"
-    )
-    msg = warning_calls[0].args[1]
-    assert "box top_z" in msg
-    assert "0.15" in msg
-
-
-def test_pick_and_place_bridge_no_warning_when_box_top_below_release_height():
-    """If box top is below 0.08 (e.g. flat box), no warning."""
+def test_pick_and_place_bridge_place_z_uses_measured_box_top():
+    """Release height comes from the measured box top: top_z + 0.06."""
     bridge = MagicMock()
     rt = _make_pick_and_place_runtime(bridge)
 
     banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
     box_fix = _fix_at([0.35, 0.10, 0.05], label="yellow box")
-    # Box top is 0.05 m — below 0.08 release height
+    # Box top is 0.05 m → drop z = 0.05 + 0.06 = 0.11
     box_fix.points = np.array([[0.35, 0.10, 0.05]])
-    rt._single_localize = MagicMock(side_effect=[banana_fix, box_fix])
+    rt._localize = MagicMock(
+        side_effect=[(_frame(), banana_fix), (_frame(), box_fix)]
+    )
     rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
 
     with _patched_select_grasp(rt):
         rt.skill_pick_and_place("banana", destination="yellow box")
 
-    # No "warning" event for box top
-    warning_calls = [
-        c for c in rt.memory.add.call_args_list
-        if c.args[0] == "warning" and "box top_z" in c.args[1]
-    ]
-    assert len(warning_calls) == 0
+    place_call = bridge.move_to_traj.call_args_list[4]
+    assert place_call.args[2] == pytest.approx(0.11, abs=1e-6)
 
 
-def test_pick_and_place_bridge_clears_held_on_place_failure():
-    """If the home-after-place motion fails, held_object must NOT be latched.
-
-    The bridge wraps step 4-5 in try/except that reconciles held_object
-    + beliefs so a failed release doesn't leave the runtime thinking it
-    is still holding the banana.
-    """
-    from wrc_demo.types import SafetyViolation
-
+def test_pick_and_place_bridge_place_z_clamped_for_tall_box():
+    """A tall box's release height is clamped to the 0.15 m ceiling instead
+    of colliding with the box wall (the old hardcoded 0.08 failure mode)."""
     bridge = MagicMock()
     rt = _make_pick_and_place_runtime(bridge)
 
     banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
     box_fix = _fix_at([0.35, 0.10, 0.10], label="yellow box")
-    box_fix.points = np.array([[0.35, 0.10, 0.10]])
-    rt._single_localize = MagicMock(side_effect=[banana_fix, box_fix])
+    # Box top is 0.15 m → 0.15 + 0.06 = 0.21 → clamped to 0.15
+    box_fix.points = np.array([
+        [0.35, 0.10, 0.10],
+        [0.35, 0.11, 0.15],  # highest point
+    ])
+    rt._localize = MagicMock(
+        side_effect=[(_frame(), banana_fix), (_frame(), box_fix)]
+    )
     rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
 
-    # First 4 move_to_traj succeed; 5th (home after place) raises.
-    # The IK calls succeed up to that point so the bridge reaches step 5.
+    with _patched_select_grasp(rt):
+        rt.skill_pick_and_place("banana", destination="yellow box")
+
+    place_call = bridge.move_to_traj.call_args_list[4]
+    assert place_call.args[2] == pytest.approx(0.15, abs=1e-6)
+
+
+def _failing_place_bridge(fail_on_call=5):
+    """Bridge whose Nth move_to_traj raises SafetyViolation (the place move)."""
+    from wrc_demo.types import SafetyViolation
+
+    bridge = MagicMock()
     call_count = {"n": 0}
 
     def move_to_traj_with_failure(*args, **kwargs):
         call_count["n"] += 1
-        if call_count["n"] == 5:
-            raise SafetyViolation("home_after_place IK failed")
-        return True  # 2026-08-13: explicit success (was implicit None; new strict return check requires True)
+        if call_count["n"] == fail_on_call:
+            raise SafetyViolation("place target unsafe: outside workspace")
+        return True  # explicit success (strict return check requires True)
 
     bridge.move_to_traj.side_effect = move_to_traj_with_failure
+    return bridge
+
+
+def test_pick_and_place_bridge_keeps_held_when_place_aborts_still_holding():
+    """Place aborts BEFORE release while the jaws still hold the object:
+    held state must be KEPT (next attempt goes straight to place) and the
+    belief store must NOT be poisoned with the planned drop position."""
+    from wrc_demo.types import SafetyViolation
+
+    bridge = _failing_place_bridge(fail_on_call=5)
+    rt = _make_pick_and_place_runtime(bridge)
+
+    banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
+    box_fix = _fix_at([0.35, 0.10, 0.10], label="yellow box")
+    rt._localize = MagicMock(
+        side_effect=[(_frame(), banana_fix), (_frame(), box_fix)]
+    )
+    rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
+    rt._gripper_width_frac = MagicMock(return_value=0.5)  # jaws still hold it
 
     with _patched_select_grasp(rt):
-        with pytest.raises(SafetyViolation, match="home_after_place"):
+        with pytest.raises(SafetyViolation, match="place target unsafe"):
             rt.skill_pick_and_place("banana", destination="yellow box")
 
-    # held_object must be cleared (try/except reconciled)
+    # held state preserved so the retry can go straight to the place stage
+    assert rt.held_object == "banana"
+    # no ghost belief at the planned drop position
+    rt.beliefs.update.assert_not_called()
+
+
+def test_pick_and_place_bridge_clears_held_when_object_slipped_during_abort():
+    """Place aborts and the gripper reports empty: the object slipped out,
+    so the held state must be cleared (or every retry says 'already holding')."""
+    from wrc_demo.types import SafetyViolation
+
+    bridge = _failing_place_bridge(fail_on_call=5)
+    rt = _make_pick_and_place_runtime(bridge)
+
+    banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
+    box_fix = _fix_at([0.35, 0.10, 0.10], label="yellow box")
+    rt._localize = MagicMock(
+        side_effect=[(_frame(), banana_fix), (_frame(), box_fix)]
+    )
+    rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
+    rt._gripper_width_frac = MagicMock(return_value=0.0)  # jaws empty
+
+    with _patched_select_grasp(rt):
+        with pytest.raises(SafetyViolation, match="place target unsafe"):
+            rt.skill_pick_and_place("banana", destination="yellow box")
+
     assert rt.held_object is None
     assert rt._held_det_label is None
     assert rt._held_color is None
+    rt.beliefs.update.assert_not_called()
+
+
+# ──────────────── place-target precheck (fail-fast) ────────────────
+
+
+def test_pick_and_place_bridge_aborts_before_grasp_when_box_outside_workspace():
+    """A destination outside the safety workspace must abort the skill
+    BEFORE any grasp motion — picking first and discovering an unreachable
+    place target strands the object in the jaws."""
+    bridge = MagicMock()
+    rt = _make_pick_and_place_runtime(bridge)
+
+    banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
+    # x=0.55 exceeds workspace_max x=0.50 (margin 0.02 → limit 0.48)
+    box_fix = _fix_at([0.55, 0.10, 0.10], label="yellow box")
+    rt._localize = MagicMock(
+        side_effect=[(_frame(), banana_fix), (_frame(), box_fix)]
+    )
+    rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
+
+    with pytest.raises(SkillError, match="outside the safe workspace"):
+        rt.skill_pick_and_place("banana", destination="yellow box")
+
+    # Nothing moved and nothing was grasped: fail-fast before the pick
+    bridge.move_to_traj.assert_not_called()
+    bridge.open_gripper.assert_not_called()
+    bridge.grasp.assert_not_called()
+    rt._plan_grasps.assert_not_called()
+
+
+def test_pick_and_place_bridge_aborts_before_grasp_when_place_pose_unreachable():
+    """A place pose that fails IK aborts the skill before the grasp."""
+    bridge = MagicMock()
+    rt = _make_pick_and_place_runtime(bridge)
+
+    banana_fix = _fix_at([0.30, -0.10, 0.05], label="banana")
+    box_fix = _fix_at([0.35, 0.10, 0.10], label="yellow box")
+    rt._localize = MagicMock(
+        side_effect=[(_frame(), banana_fix), (_frame(), box_fix)]
+    )
+    rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
+    rt.kin.ik.return_value = MagicMock(success=False, q=None)
+
+    with pytest.raises(SkillError, match="unreachable"):
+        rt.skill_pick_and_place("banana", destination="yellow box")
+
+    bridge.move_to_traj.assert_not_called()
+    bridge.grasp.assert_not_called()
+
+
+# ──────────────── belief fallback integration ────────────────
+
+
+def _belief(label, position, extent=(0.10, 0.10, 0.10), color=None):
+    import time as _time
+
+    b = MagicMock()
+    b.label = label
+    b.conf = 0.6
+    b.color = color
+    b.position = np.array(position, dtype=float)
+    b.extent = np.array(extent, dtype=float)
+    b.points = None
+    b.top_z = position[2] + extent[2] / 2
+    b.last_seen_t = _time.monotonic()
+    return b
+
+
+def test_pick_and_place_bridge_succeeds_with_box_only_in_beliefs():
+    """Regression: the destination is NOT detectable on any fresh frame
+    (occluded / flickering open-vocab class) but the world model remembers
+    it. The bridge must fall back to the belief instead of failing the
+    whole pick-and-place."""
+    bridge = MagicMock()
+    rt = _make_pick_and_place_runtime(bridge)
+
+    beliefs = {
+        "banana": _belief("banana", [0.30, -0.10, 0.05]),
+        "yellow box": _belief("yellow box", [0.35, 0.10, 0.10], color="yellow"),
+    }
+    rt.beliefs.find = MagicMock(side_effect=lambda q: beliefs.get(q))
+    rt._plan_grasps = MagicMock(return_value=[_grasp_pose()])
+
+    # Live detection NEVER finds anything (every fresh frame misses).
+    with patch(
+        "wrc_demo.skills.runtime.localize_object",
+        side_effect=SkillError("no detections"),
+    ):
+        with _patched_select_grasp(rt):
+            result = rt.skill_pick_and_place("banana", destination="yellow box")
+
+    assert result["ok"] is True
+    assert result["placed_at"][0] == pytest.approx(0.35, abs=1e-6)
+    bridge.grasp.assert_called_once_with(force=1.0)
+    bridge.release_with_async_close.assert_called_once_with(timeout=0.5, delay_s=0.8)
     # beliefs.update was called to record the object at the drop point
     rt.beliefs.update.assert_called()

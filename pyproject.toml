@@ -46,4 +46,4 @@ testpaths = ["tests"]
 markers = [
     "hardware: tests that need a live camera/arm (deselected by default)",
 ]
-addopts = "-m 'not hardware'"
+addopts = "-m 'not hardware' -p no:launch_testing"

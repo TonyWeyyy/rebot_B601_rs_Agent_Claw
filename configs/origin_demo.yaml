@@ -1,0 +1,158 @@
+# Main demo configuration. Camera/arm/llm profiles are merged in at load
+# time (see wrc_demo.config.load_demo_config).
+
+# Active LLM profile (CLI --llm overrides). Change to switch models; no
+# fallback cascade -- others edit this single field to pick their backend:
+#   local_qwen3_vl  -> local 4-bit Qwen3-VL via start_cosmos3_server.sh
+#   minimax         -> MiniMax cloud API (needs MINIMAX_API_KEY env var)
+#   anthropic       -> Anthropic Claude (needs ANTHROPIC_API_KEY env var)
+#   openai          -> OpenAI / OpenAI-compat (needs OPENAI_API_KEY)
+#   mock            -> scripted mock (offline / smoke test)
+llm:
+  profile: local_qwen3_vl
+
+safety:
+  # Base-frame workspace AABB for the TCP (meters). Verified against the RS
+  # URDF top-down IK reachability probe (x 0.15..0.45, y +-0.25).
+  workspace:
+    min: [0.10, -0.30, -0.01]
+    max: [0.50, 0.30, 0.55]
+  table_z: 0.0            # table surface height in base frame
+  table_clearance: 0.02   # TCP keeps this far above the table outside grasps
+  max_joint_vel: 1.2      # rad/s, enforced per streamed waypoint
+  joint_margin: 0.02      # rad inside URDF limits
+  watchdog_s: 5.0         # halt motion if perception is staler than this
+  keep_out: []            # e.g. [{min: [x,y,z], max: [x,y,z]}] for the tripod
+
+grasp:
+  # Grasp planner: "obb" (analytic, always available) or "graspgenx"
+  # (learned 6-DoF via the ZMQ server -- scripts/serve_graspgenx.sh; falls
+  # back to OBB automatically if the server is down)
+  # 2026-07-28: temporarily flipped to "obb" while the graspgenx server is
+  # offline (port 5556 not listening; ~/Projects/demo/.graspgenx missing).
+  # Revert to "graspgenx" once the server is back up.
+  backend: obb
+  graspgenx:
+    host: 127.0.0.1
+    port: 5556
+    gripper: franka_panda   # fallback when `sweep` is removed
+    num_grasps: 100
+    topk: 32
+    min_score: 0.0
+    timeout_ms: 8000
+    tip_offset_m: 0.098     # empirical: model keeps its base-frame convention ~10 cm behind the jaw center even with centered sweep boxes
+    # reBot RS parallel-jaw gripper as a swept volume (cross-embodiment
+    # conditioning; frame: origin at jaw center, +Z approach, +X closing).
+    # Derived from the RS URDF finger geometry (max open 0.09 m, pad
+    # ~0.02 x 0.045 m); refine with the sim measurement if regrasping
+    # quality warrants it.
+    sweep:
+      extents_open: [0.090, 0.020, 0.045]
+      offset_open: [0.0, 0.0, 0.0]
+      extents_mid: [0.045, 0.020, 0.045]
+      offset_mid: [0.0, 0.0, 0.0]
+      gripper_type: 0
+      fingertip_depth: 0.0225
+  # NOTE: strict top-down tool poses are only IK-reachable below z~0.15 on
+  # the B601-RS (wrist limits); keep grasp_z + offset under that.
+  pregrasp_offset_m: 0.08   # hover height above the grasp along -approach.
+                            # Kept small: tall (12 cm) blocks are grasped near
+                            # z~0.10, and a larger hover pushes the pregrasp
+                            # pose above z~0.15 where top-down IK fails on the
+                            # B601-RS.
+  # Camera-frame planner (rebot_grasp-style, primary when segmentation
+  # mask + depth are available): the approach direction aligns with the
+  # camera's line of sight, so a tilted camera doesn't bias the grasp
+  # geometry.
+  #
+  # insertion_depth_m adds an extra TCP offset along tool-x on top of
+  # rebot_grasp's ``hand_eye_compensation_m`` (which is already baked
+  # into ``data/calibration/hand_eye_top.json`` as a z=-0.02 camera-
+  # frame shift). rebot_grasp's own ``scripts/main.py:320`` does NOT
+  # pass insertion_depth_m to ``transform_grasp_pose_to_base`` -- it
+  # relies on the 2 cm compensation alone, which gives the equivalent
+  # of a 20 mm gripper-finger offset. Set to 0 here to match rebot_grasp;
+  # raise if your gripper has a longer tip-to-TCP offset.
+  insertion_depth_m: 0.0    # matches rebot_grasp; see calibration file
+  depth_fraction: 0.65      # grasp this far down from the object's TOP. Low
+                            # value = grasp near the top face, which keeps the
+                            # gripper fingers (they extend ~5cm below the TCP)
+                            # above the table on tall blocks.
+  exempt_radius_m: 0.15     # grasp-descent safety cylinder radius. Must
+                            # cover the gripper_end link's horizontal offset
+                            # from the object center during a top-down
+                            # descent, not just the jaw tips -- at 0.07 the
+                            # reBot RS wrist link tripped "link 7 would hit
+                            # the table" (z=0.009) just OUTSIDE the cylinder.
+                            # Only opens during the descent over the target.
+  move_duration_s: 2.5
+  descend_duration_s: 2.0
+  release_height_m: 0.05    # place_at default: this far above the table
+  release_clearance_m: 0.06 # place_on_object: drop height above target top
+  air_grasp_frac: 0.04      # jaw open-fraction below this after close = missed
+  close_settle_s: 0.4       # generic two-stage close dwell (real arm ignores)
+  drop_zone: [0.18, -0.17]  # pick_and_place default target = the bin, inside
+                            # the B601-RS top-down IK envelope (reachable place)
+  home_after_place: true    # clear the camera view after each pick_and_place
+  topdown_z_max: 0.15       # strict top-down poses are IK-unreachable above
+                            # this on the B601-RS (wrist limits)
+  # Approach pitch (rad) from +z for the grasp vector. rebot_grasp uses
+  # 1.2 (~69°); pure top-down (π/2 = 90°) is geometrically awkward from
+  # the elbow-up ``home_q`` and the DLS IK can't cross into the elbow-down
+  # basin needed for strict top-down. Lower this to ~0.6 for a more
+  # "vertical" pose; raise toward π/2 to push toward strict top-down
+  # (only succeeds if arm is in an elbow-down basin to start).
+  approach_pitch_rad: 1.2
+  # Persistence: pick_and_place keeps retrying (re-home, re-scan, fresh
+  # grasp plan) until it succeeds or one of these budgets runs out.
+  persist_seconds: 120
+  max_pick_attempts: 8
+  min_grasp_z_m: 0.008      # learned grasp z a few mm below this above the
+                            # table is clamped up (tip-offset overshoot),
+                            # not aborted
+
+memory:
+  horizon_s: 15.0           # episodic window the agent can consult
+
+# Always-on perception: every rig camera feeds the belief store continuously
+# so commands resolve against an already-warm world model.
+perception_loop:
+  enabled: true
+  rate_hz: 3.0              # detector passes per second across the rig
+  belief_fallback_age_s: 15.0  # grasp-from-memory allowed if the object was
+                              # seen this recently BEFORE the motion started
+  localize_frames: 3        # detector passes per localize before falling
+                            # back to the belief store (single frames flicker)
+
+# MJPEG livestream dashboard (stdlib HTTP; browsers/Hermes users watch here).
+stream:
+  enabled: true
+  host: 0.0.0.0
+  port: 8899
+  fps: 15
+  quality: 80
+
+detector:
+  # Open-vocabulary YOLO (YOLOE / YOLO-World). Ultralytics auto-downloads
+  # the weights into ${repo}/models on first use if absent, so the demo is
+  # object-agnostic out of the box (any visitor object localizes by name).
+  # Override with $WRC_DETECTOR_MODEL for a hand-tuned checkpoint.
+  # 2026-09-03: switched from yoloe-11s-seg → yoloe-26s-seg (session 2).
+  # Reason: yoloe-11s needs mobileclip_blt.ts (572 MB, slow download, often
+  # blocked by network). yoloe-26s uses mobileclip2_b.ts which we already
+  # have. Same backbone family as yoloe-26l; 26l is ~2x slower per frame
+  # but marginally better on first deployment. 26s is the recommended
+  # default; switch back to 11s only if a specific detection task needs it.
+  type: yoloe
+  model: ${repo}/models/yoloe-26s-seg.pt
+  device: cuda
+  conf: 0.1
+
+# Default vocabulary scanned during get_observation (the agent can localize
+# anything by name on top of this).
+detect_classes: ["box", "banana", "toy"]
+
+# ADR-0009 per-camera hand-eye manual compensation lives in each camera
+# profile's extrinsics.hand_eye_compensation_m (see configs/cameras/*.yaml).
+# No demo.yaml-level global -- every camera must declare its own value
+# explicitly to avoid silent inheritance when new cameras are added.

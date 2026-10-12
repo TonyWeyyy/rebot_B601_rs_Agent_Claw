@@ -2,7 +2,7 @@
 type: orbbec
 # serial 由 `python -m wrc_demo.scripts.calib_top_orbbec --bind` 自动回填,
 # 或在 calibration 完成后手工写入。空串 = 选第一台可用设备 (bring-up 期间允许)。
-serial: "AY3794300W4"
+serial: "AY6B95F002P"
 width: 1280
 height: 720
 fps: 30
@@ -28,9 +28,9 @@ extrinsics:
   #   ETH: T_cam2base = T_compensation @ T_hand_eye
   #   EIH: T_cam2base = T_compensation @ T_tcp2base @ T_hand_eye
   hand_eye_compensation_m:
-    x: 0.00
-    y: 0.00
-    z: 0.00
+    x: -0.121
+    y: 0.037
+    z: -0.04
 
 # 该 profile 表示一台必须经过 hand-eye 标定才允许 3D 融合的相机:
 # - 标定文件存在: fuse_beliefs 由 profile 显式设为 true

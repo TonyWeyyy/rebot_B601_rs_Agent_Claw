@@ -58,6 +58,9 @@ def _runtime_with_bridge(bridge, *, vet_pose_returns=None):
     arm.harness.vet_pose.return_value = vet_pose_returns
     arm.harness.allow_grasp_descent = MagicMock()
     arm.harness.clear_grasp_exemption = MagicMock()
+    # Real workspace AABB so the place-target precheck can do numeric checks.
+    arm.harness.limits.workspace_min = np.array([0.10, -0.30, -0.01])
+    arm.harness.limits.workspace_max = np.array([0.50, 0.30, 0.55])
     arm.get_state.return_value.q = np.zeros(6)
 
     kin = MagicMock()
@@ -143,15 +146,8 @@ def test_pick_and_place_bridge_vet_pose_each_move():
     bridge = MagicMock()
     rt = _runtime_with_bridge(bridge)
 
-    banana_fix = _fix()
-    banana_fix.position = np.array([0.30, -0.10, 0.05])
-    box_fix = MagicMock()
-    box_fix.detection.label = "yellow box"
-    box_fix.detection.bbox = np.array([300, 100, 400, 200])
-    box_fix.position = np.array([0.35, 0.10, 0.10])
-    box_fix.points = np.array([[0.35, 0.10, 0.10]])  # single point for top_z check
-
-    rt._single_localize = MagicMock(side_effect=[banana_fix, box_fix])
+    # _localize is already stubbed by the fixture to return (frame, fix)
+    # for both the object and the destination.
 
     with patch(
         "wrc_demo.skills.runtime.select_grasp",

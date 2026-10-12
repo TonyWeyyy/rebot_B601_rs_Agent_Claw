@@ -47,6 +47,37 @@ _MOTION_SKILLS = {
 }
 
 
+#: v4: open-vocab detectors (YOLOE) are sensitive to the exact noun, and the
+#: destination container is variously read as box/bin/basket/crate depending
+#: on shape, angle and lighting. Queries for any family member accept the
+#: WHOLE family as detection prompts, and a detection carrying a family
+#: label is canonicalized back to the queried word before it enters the
+#: belief store -- a "basket" detection must satisfy a later "box" lookup,
+#: or the place stage can never find the destination.
+#: v5: tuned for the actual rig container -- an open-top kraft cardboard
+#: tray. YOLOE matches "cardboard box" / "cardboard tray" far more
+#: reliably than the generic "box", so those lead the family; every key
+#: canonicalizes back to the user's queried word.
+_DESTINATION_FAMILY: dict[str, set[str]] = {
+    "box": {"box", "cardboard box", "cardboard tray", "carton",
+            "kraft box", "open box", "tray", "bin", "basket",
+            "crate", "container"},
+    "cardboard box": {"box", "cardboard box", "cardboard tray", "carton",
+                      "kraft box", "open box", "tray", "bin", "basket",
+                      "crate", "container"},
+    "cardboard tray": {"box", "cardboard box", "cardboard tray", "carton",
+                       "kraft box", "open box", "tray", "bin", "basket",
+                       "crate", "container"},
+    "carton": {"box", "cardboard box", "cardboard tray", "carton",
+               "kraft box", "open box", "tray", "bin", "basket",
+               "crate", "container"},
+    "bin": {"box", "bin", "basket", "crate", "container"},
+    "basket": {"box", "bin", "basket", "crate", "container"},
+    "crate": {"box", "bin", "basket", "crate", "container"},
+    "container": {"box", "bin", "basket", "crate", "container"},
+}
+
+
 def _jpeg(rgb: np.ndarray, quality: int = 85) -> bytes:
     ok, buf = cv2.imencode(".jpg", rgb, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buf.tobytes() if ok else b""
@@ -324,6 +355,15 @@ class SkillRuntime:
         if noun:
             q = query.strip().lower()
             prompts = [noun] if noun == q else [q, noun]
+            # v4: a destination-container query gets the whole synonym
+            # family as prompts, so YOLOE can latch onto whichever noun
+            # reads best in this view ("bin" often scores where "box"
+            # doesn't, and vice versa). The fix's label is canonicalized
+            # back to the queried word in _localize.
+            fam = _DESTINATION_FAMILY.get(noun)
+            if fam:
+                for alt in sorted(fam - {noun}):
+                    prompts.append(alt)
         elif belief is not None and (color is None or belief.color == color):
             # Warm path: the world model already knows the answer. When the
             # class is in the default vocabulary, detect with the WHOLE
@@ -342,6 +382,70 @@ class SkillRuntime:
             "prompts": prompts, "vocab": vocab, "color": color,
             "near_xyz": near, "belief": belief, "prefer_label": prefer,
         }
+
+    def _mask_above_table(self, frame, mask, margin_m: float = 0.004):
+        """Zero out mask pixels whose backprojected base-frame z sits at or
+        below the table plane (plus a small margin).
+
+        Detector masks almost always include some table surface around or
+        under the object; feeding those pixels to the camera-frame grasp
+        planner puts the grasp center on the tabletop instead of on the
+        object, and the descent leg then rams the table and shoves the
+        target out of the jaws' reach -- the classic "grasp missed and the
+        toy slid away" failure. ``np.nonzero`` row-major order matches
+        ``mask_to_points_cam``'s point order; on any inconsistency the
+        ORIGINAL mask is returned (fail-open: a table-contaminated grasp
+        attempt still beats no candidate at all).
+
+        Returns ``(filtered_mask, dz_shaved)``: ``dz_shaved`` (>= 0) is how
+        much the filter raised the mask's lowest 3D point. It is ~margin_m
+        when the object sits on the table (its bottom ring pixels lie AT
+        the table plane and get stripped too), which would shift the
+        planned grasp UP by the same amount -- callers must lower the
+        grasp z by ``dz_shaved`` to put it back (v3 fix for "grasps
+        slightly too high").
+        """
+        table_z = float(self.cfg.safety.get("table_z", 0.0))
+        T = (frame.T_base_cam if frame.T_base_cam is not None
+             else self.extrinsics.cam_to_base())
+        try:
+            pts_cam = mask_to_points_cam(frame, mask)
+            if pts_cam.shape[0] < 30:
+                return mask, 0.0
+            pts_base = transform_points(T, pts_cam)
+            keep = pts_base[:, 2] > table_z + margin_m
+            if int(keep.sum()) < 30:
+                return mask, 0.0  # near-flat object: don't gut the mask
+            ys, xs = np.nonzero(mask)
+            if ys.shape[0] != pts_cam.shape[0]:
+                return mask, 0.0  # ordering assumption broken: fail open
+            out = np.zeros_like(mask)
+            out[ys[keep], xs[keep]] = True
+            dz = float(pts_base[keep][:, 2].min() - pts_base[:, 2].min())
+            return out, float(np.clip(dz, 0.0, 0.05))
+        except Exception:
+            return mask, 0.0
+
+    def _clamp_grasp_z_floor(self, grasps: list) -> None:
+        """Shallow any grasp point that dipped a few mm under the workspace
+        floor (in place -- returns None).
+
+        Mirrors the legacy path's z-floor clamp: a millimetre under the
+        floor must shall the grasp slightly, not abort it, but executing a
+        grasp point below the table plane means the descent rams the
+        tabletop. The bridge paths (grasp_object / pick_and_place) skipped
+        this clamp entirely.
+        """
+        lim = self.arm.harness.limits
+        z_floor = max(
+            float(lim.workspace_min[2]) + 0.002,
+            lim.table_z + float(self.cfg.grasp.get("min_grasp_z_m", 0.008)),
+        )
+        for g in grasps:
+            dz = z_floor - float(g.position[2])
+            if 0.0 < dz <= 0.03:  # bigger misses are garbage; vetting drops them
+                g.position = np.asarray(g.position, dtype=float).copy()
+                g.position[2] = z_floor
 
     def _plan_grasps(self, fix, label: str | None = None) -> list:
         """Grasp candidates: camera-frame planner primary, OBB fallback.
@@ -381,8 +485,18 @@ class SkillRuntime:
         ):
             try:
                 T_cam2base = self.extrinsics.cam_to_base()
+                mask = det.mask
+                dz_shaved = 0.0
+                if getattr(last_frame, "has_depth", False):
+                    # Strip table-plane pixels BEFORE backprojection, or the
+                    # grasp center lands on the tabletop (see
+                    # _mask_above_table). The filter also removes the
+                    # object's own bottom ring (it sits AT the table
+                    # plane), raising the apparent object by dz_shaved --
+                    # compensate below or every grasp lands a few mm high.
+                    mask, dz_shaved = self._mask_above_table(last_frame, mask)
                 cam_grasps = plan_grasp_from_mask(
-                    mask=det.mask,
+                    mask=mask,
                     depth_m=last_frame.depth_m,
                     K=last_frame.K,
                     T_cam2base=T_cam2base,
@@ -393,6 +507,19 @@ class SkillRuntime:
                     label=label or fix.label,
                     confidence=float(getattr(det, "conf", 1.0)),
                 )
+                if cam_grasps and dz_shaved > 1e-4:
+                    # v3: the shave raised the object's apparent bottom by
+                    # dz_shaved and with it every planned grasp height --
+                    # lower them back by the same amount, or each grasp
+                    # lands a few mm ABOVE the toy. ``mask_shave_compensate``
+                    # (default 1.0) tunes the correction: set 0.5 if this
+                    # rig's planner anchors to the OBB CENTER rather than
+                    # the bottom (center only shifts by half the shave).
+                    comp = float(gcfg.get("mask_shave_compensate", 1.0))
+                    for g in cam_grasps:
+                        p = np.asarray(g.position, dtype=float).copy()
+                        p[2] -= dz_shaved * comp
+                        g.position = p
                 if cam_grasps:
                     self.memory.add(
                         "note",
@@ -475,6 +602,19 @@ class SkillRuntime:
         "now" -- the watcher is paused while the arm moves, so beliefs age
         artificially during exactly the retries that need them."""
         r = self._resolve_query(query)
+        # v4: canonicalize family labels (see _DESTINATION_FAMILY). A toy
+        # box detected as "basket" is rewritten to the queried word BEFORE
+        # it reaches the belief store, so later "box" lookups match.
+        qnoun = parse_color_query(query)[1]
+
+        def _canon(fix):
+            fam = _DESTINATION_FAMILY.get((qnoun or "").lower())
+            lbl = getattr(getattr(fix, "detection", None), "label", None)
+            if (fam and lbl and lbl.lower() in fam
+                    and lbl.lower() != qnoun.lower()):
+                fix.detection.label = qnoun
+            return fix
+
         frame = None
         last_err: SkillError | None = None
         tries = int(self.cfg.get("perception_loop", {}).get("localize_frames", 3))
@@ -487,7 +627,7 @@ class SkillRuntime:
                     color=r["color"], near_xyz=r["near_xyz"], vocab=r["vocab"],
                     prefer_label=r["prefer_label"],
                 )
-                return frame, fix
+                return frame, _canon(fix)
             except SkillError as e:
                 last_err = e
         # Second filter: THE OTHER CAMERAS. An object 40 px small (or
@@ -513,7 +653,7 @@ class SkillRuntime:
                     f"localize {query!r}: primary camera missed it; found "
                     f"through {getattr(cam.stream, 'name', 'another camera')}",
                 )
-                return cframe, fix
+                return cframe, _canon(fix)
             except Exception:
                 continue  # a miss or camera hiccup: try the next view
 
@@ -545,13 +685,13 @@ class SkillRuntime:
                 f"world-model fix ({belief.label}, "
                 f"{time.monotonic() - belief.last_seen_t:.1f}s old)",
             )
-            return frame, self._fix_from_belief(query, belief)
+            return frame, _canon(self._fix_from_belief(query, belief))
         # Last filter: VLM grounding. YOLOE's text embeddings miss what a
         # full VLM reads easily; one slow call only ever runs on this
         # failure path.
         fix = self._vlm_ground_fix(frame, query)
         if fix is not None:
-            return frame, fix
+            return frame, _canon(fix)
         raise last_err
 
     def _vlm_ground_fix(self, frame, query: str):
@@ -1072,6 +1212,7 @@ class SkillRuntime:
         grasps = self._plan_grasps(fix, label=label)
         if not grasps:
             raise SkillError(f"no grasp candidates for {label!r}")
+        self._clamp_grasp_z_floor(grasps)
 
         # Seed IK from home_q (elbow-up basin) — matches the legacy comment
         # in the v5 path; rebot_grasp's main.py doesn't seed explicitly
@@ -1110,7 +1251,12 @@ class SkillRuntime:
         self.bridge.open_gripper()
 
         # 2. Pregrasp (set.py uses duration=2.0) — IK + vet_pose first
-        self._safe_bridge_move(pre6d, duration=2.0, where="pregrasp")
+        # v2: tolerance restored to 0.04 — this rig's normal settle error is
+        # 2-4 cm (the original code tried 0.02 and abandoned it), so the
+        # v1 tightening to 0.01/0.02 made every verify falsely fail and the
+        # skill aborted BEFORE the gripper ever closed.
+        self._safe_bridge_move(pre6d, duration=2.0, where="pregrasp",
+                               verify_tol_m=0.04)
 
         # 3. Grasp approach (set.py uses duration=1.5) — IK + vet_pose first
         #
@@ -1129,7 +1275,8 @@ class SkillRuntime:
                 radius=float(self.cfg.grasp.get("exempt_radius_m", 0.07)),
                 z_min=float(self.arm.harness.limits.table_z) - 0.06,
             )
-            self._safe_bridge_move(grasp6d, duration=1.5, where="grasp")
+            self._safe_bridge_move(grasp6d, duration=1.5, where="grasp",
+                                   verify_tol_m=0.04)
 
             # 4. Single-stage close with force=1.0 (override 0.30 default to match v5)
             ok = self.bridge.grasp(force=1.0)
@@ -1178,6 +1325,25 @@ class SkillRuntime:
                 f"ready move after grasp failed ({e}); grasp still succeeded",
             )
 
+        # 5b. v7: closed-loop grasp verification (LLM path). The gripper's
+        # own stall/width feedback is unreliable on this rig (2026-08-11),
+        # so LOOK instead: after the grasp and the lift to ready, the
+        # object must have LEFT its pick location. Still sitting on the
+        # table there = the jaws closed on air -- fail NOW so the caller
+        # retries the grasp instead of carrying an empty gripper to the
+        # place stage and reporting a fake success.
+        try:
+            self._verify_grasp_took_object(fix, label)
+        except SkillError:
+            try:
+                self.grasp_memory.record(
+                    label, fix, grasp, success=False,
+                    reason="air grasp (still visible at pick location)",
+                    z_nudge_applied=getattr(self, "_last_grasp_z_nudge", 0.0))
+            except Exception:
+                pass
+            raise
+
         self.held_object = label
         self._held_det_label = fix.detection.label
         self._held_color = detection_color(frame.rgb, fix.detection)
@@ -1200,6 +1366,7 @@ class SkillRuntime:
         *,
         q_target: np.ndarray | None = None,
         where: str = "",
+        verify_tol_m: float = 0.04,
     ) -> bool:
         """Wrap ``bridge.move_to_traj`` with pre-motion ``harness.vet_pose`` check.
 
@@ -1264,7 +1431,12 @@ class SkillRuntime:
                 final_tcp = self.kin.fk(final_q)
                 T_target = np.asarray(target_6d[:3], dtype=float)
                 err_m = float(np.linalg.norm(final_tcp[:3, 3] - T_target))
-                if err_m > 0.02:
+                # Per-move tolerance (verify_tol_m): 40 mm is fine for the
+                # ready/home rendezvous, but for the pregrasp/grasp/place
+                # legs a 40 mm silent-undershoot still "succeeds" -- and the
+                # jaws then close on empty air NEXT to the object. Tighten
+                # those calls to 10-20 mm instead.
+                if err_m > verify_tol_m:
                     self.memory.add(
                         "note",
                         f"{where} post-move FK verify FAILED: TCP off by "
@@ -1358,6 +1530,84 @@ class SkillRuntime:
         r = self.cfg.arm.get("ready_pose", {}) or {}
         return float(r.get("duration", 3.0))
 
+    def _drop_point(self, box_fix) -> tuple[float, float, float]:
+        """Release point above the destination, from the MEASURED box top.
+
+        ``top_z + 0.06`` clamped to ``[table_z + 0.05, 0.15]``: tall boxes
+        no longer collide with the hardcoded 0.08 m release height and low
+        boxes don't get a high-altitude drop. Falls back to set.py's
+        hardcoded 0.08 when the fix carries no points.
+        """
+        box_pos = box_fix.position
+        z = 0.08  # set.py box_center_base z
+        if box_fix.points is not None and len(box_fix.points) > 0:
+            top_z = float(np.asarray(box_fix.points)[:, 2].max())
+            table_z = float(self.cfg.safety.get("table_z", 0.0))
+            z = float(np.clip(top_z + 0.06, table_z + 0.05, 0.15))
+        return (float(box_pos[0]), float(box_pos[1]), z)
+
+    def _precheck_place_target(
+        self, box_fix, destination: str, *, picked_yet: bool
+    ) -> None:
+        """Fail fast when the place target cannot be used.
+
+        Runs BEFORE the grasp (or before carrying the held object toward
+        the box): a destination outside the safety workspace AABB, or a
+        place pose that fails IK / the harness vet, must abort the skill
+        immediately with an actionable message. Picking first and
+        discovering this at the place stage wastes a full grasp cycle and
+        strands the object in the jaws.
+        """
+        import pinocchio as pin
+
+        drop = self._drop_point(box_fix)
+        action = (
+            "Carry aborted before moving"
+            if picked_yet
+            else "NOT picking, to avoid holding an object with nowhere to go"
+        )
+        harness = getattr(self.arm, "harness", None)
+        margin = 0.02
+        if harness is not None:
+            lim = harness.limits
+            ws_min = np.asarray(lim.workspace_min, dtype=float)
+            ws_max = np.asarray(lim.workspace_max, dtype=float)
+            for axis, name in ((0, "x"), (1, "y")):
+                lo, hi, v = (
+                    float(ws_min[axis]) + margin,
+                    float(ws_max[axis]) - margin,
+                    drop[axis],
+                )
+                if not (lo <= v <= hi):
+                    raise SkillError(
+                        f"place target for {destination!r} is outside the safe "
+                        f"workspace: {name}={v:.3f} not in [{lo:.3f}, {hi:.3f}] "
+                        f"(box at [{drop[0]:.3f}, {drop[1]:.3f}]). Move the box "
+                        f"toward the arm (x≈0.30–0.40) or widen safety.workspace. "
+                        f"{action}."
+                    )
+
+        # Compute-only IK + safety vet of the place pose (same rpy as the
+        # place move below); ~10 ms, no motion.
+        T = make_transform(
+            pin.rpy.rpyToMatrix(0.0, 1.2, 0.0),
+            np.asarray(drop, dtype=float),
+        )
+        ik = self.kin.ik(T, self.arm.get_state().q)
+        if not ik.success:
+            raise SkillError(
+                f"place pose unreachable (IK failed) at "
+                f"{[round(v, 3) for v in drop]}. Move the box closer to the "
+                f"arm. {action}."
+            )
+        if harness is not None:
+            reason = harness.vet_pose(ik.q)
+            if reason:
+                raise SkillError(
+                    f"place pose unsafe: {reason}. Move the box to a clear, "
+                    f"reachable spot. {action}."
+                )
+
     def _skill_pick_and_place_bridge(
         self, object_label: str, destination: str,
         already_held: str | None = None,
@@ -1366,24 +1616,24 @@ class SkillRuntime:
 
         Mirrors ``set.py::_execute_place_sequence`` end to end:
 
-            [Step1] same-frame detect banana + box
+            [Step1] localize banana + box (full fallback chain) + place precheck
             [Step2] open → pregrasp(2.0) → grasp(1.5) → grasp(force=1.0)
             [Step3] lift to ready position  (we use wrc_demo home_q FK)
-            [Step4] move_to box(z=0.08, rpy=0,1.2,0, dur=2.0)
+            [Step4] move_to box(z=measured top+clearance, rpy=0,1.2,0, dur=2.0)
             [Step4b] open_gripper(timeout=0.5) + 0.8 s async close
             [Step5] return to ready  (wrc_demo home_q FK)
 
-        The destination label is resolved via ``_single_localize`` on the
-        SAME frame as the object — set.py's YOLO pass produces both
-        detections in one inference. This sidesteps the WorldWatcher
-        belief-fusion cache (the 3 Hz watcher might serve a stale box
-        position from seconds ago).
+        Both labels are resolved through ``_localize``'s full fallback
+        chain (multi-frame retry → other cameras → belief store → VLM):
+        single-frame open-vocab detection flickers frame to frame, and
+        failing the whole skill because the box blinked out of one frame
+        made pick-and-place unusable. The place target is validated
+        (workspace AABB + IK + safety vet) BEFORE the grasp so the arm
+        never ends up holding an object with nowhere to go.
 
-        box z is **hardcoded** to 0.08 (matches set.py ``box_center_base =
-        np.array([..., 0.08])``); release_clearance_m and z_cap are not
-        consulted. If a box's top is below 0.08 the banana collides; a
-        later ADR / task will address this if real-rig verification
-        shows it's needed.
+        Release z comes from the measured box top (top_z + clearance,
+        clamped to [table_z + 0.05, 0.15]); when the fix carries no
+        points it falls back to set.py's hardcoded 0.08.
         """
         import pinocchio as pin
 
@@ -1395,30 +1645,35 @@ class SkillRuntime:
 
         if already_held:
             # Object is already in the gripper; only need to find the box.
-            frame = self.observe()
-            box_fix = self._single_localize(frame, destination)
-            if box_fix is None:
-                raise SkillError(
-                    f"no {destination!r} detected in current frame "
-                    "(bridge path requires live box detection)"
-                )
+            # Full fallback chain (multi-frame retry → other cameras →
+            # belief store → VLM): after a failed place the box may be
+            # briefly out of the detector's output even though the world
+            # model still knows where it is.
+            _, box_fix = self._localize(destination, spatial_hint=None)
+            self._precheck_place_target(box_fix, destination, picked_yet=True)
             self.memory.add(
                 "note",
                 f"already holding {already_held!r} -- skipping pick, "
                 f"going straight to place on {destination!r}",
             )
         else:
-            # ── Full pick phase (same-frame detect + grasp) ─────────────
-            frame = self.observe()
-            banana_fix = self._single_localize(frame, object_label)
-            if banana_fix is None:
-                raise SkillError(f"no {object_label!r} detected in current frame")
-            box_fix = self._single_localize(frame, destination)
-            if box_fix is None:
+            # ── Full pick phase: localize object AND destination through
+            # the full fallback chain (multi-frame retry → other cameras
+            # → belief store → VLM). Live-frame-only lookups flicker on
+            # open-vocab classes and made pick attempts fail whenever the
+            # box briefly dropped out of the detector's output.
+            frame, banana_fix = self._localize(object_label, spatial_hint=None)
+            try:
+                _, box_fix = self._localize(destination, spatial_hint=None)
+            except SkillError:
                 raise SkillError(
-                    f"no {destination!r} detected in current frame "
-                    "(bridge path requires live box detection)"
+                    f"no {destination!r} detected (even with belief fallback)"
                 )
+
+            # Fail fast: an unreachable or unsafe place target must abort
+            # the skill BEFORE the grasp, or the arm ends up holding an
+            # object with nowhere to go.
+            self._precheck_place_target(box_fix, destination, picked_yet=False)
 
             # ── [Step2] pick the object (use the same grasp pipeline as
             # _skill_grasp_object_bridge, but inline so the held-detection
@@ -1426,6 +1681,7 @@ class SkillRuntime:
             grasps = self._plan_grasps(banana_fix, label=object_label)
             if not grasps:
                 raise SkillError(f"no grasp candidates for {object_label!r}")
+            self._clamp_grasp_z_floor(grasps)
             home_q = self.cfg.arm.get("home_q")
             seed = (
                 np.asarray(home_q, dtype=float)
@@ -1453,7 +1709,8 @@ class SkillRuntime:
                 )
 
             self.bridge.open_gripper()
-            if not self._safe_bridge_move(pre6d, duration=2.0, where="pregrasp"):
+            if not self._safe_bridge_move(pre6d, duration=2.0, where="pregrasp",
+                                          verify_tol_m=0.04):
                 raise SkillError(
                     f"pregrasp move failed (target="
                     f"{[round(pre6d[0],3), round(pre6d[1],3), round(pre6d[2],3)]}, "
@@ -1471,7 +1728,8 @@ class SkillRuntime:
                     radius=float(self.cfg.grasp.get("exempt_radius_m", 0.07)),
                     z_min=float(self.arm.harness.limits.table_z) - 0.06,
                 )
-                if not self._safe_bridge_move(grasp6d, duration=1.5, where="grasp"):
+                if not self._safe_bridge_move(grasp6d, duration=1.5, where="grasp",
+                                              verify_tol_m=0.04):
                     raise SkillError(
                         f"grasp move failed (target="
                         f"{[round(grasp6d[0],3), round(grasp6d[1],3), round(grasp6d[2],3)]}, "
@@ -1517,33 +1775,33 @@ class SkillRuntime:
                 f"ready_after_grasp move failed ({e}); proceeding to place anyway",
             )
 
-        # ── [Step4] place above the box (z=0.08 hardcoded, rpy=0,1.2,0) ─
-        box_pos = box_fix.position
-        drop = (
-            float(box_pos[0]),
-            float(box_pos[1]),
-            0.08,  # set.py box_center_base z is hardcoded 0.08
-        )
-        # box z sanity check: warn if box top is above hardcoded release
-        # height (the banana would collide with the box wall going down).
-        # Phase-6 follow-up: refuse + ask for a different box.
-        if (
-            box_fix.points is not None
-            and len(box_fix.points) > 0
-        ):
-            box_top_z = float(np.asarray(box_fix.points)[:, 2].max())
-            if box_top_z > drop[2]:
-                self.memory.add(
-                    "warning",
-                    f"box top_z={box_top_z:.3f} m exceeds hardcoded release_z="
-                    f"{drop[2]} m; banana may collide with box wall",
-                )
+        # ── [Step3.5] re-localize the destination NOW ───────────────────
+        # The Step-1 box fix is ~10 s old by the time the arm gets here,
+        # and it may have come from a stale-belief fallback taken while
+        # the arm occluded the camera (the user's original bug). The grasp
+        # move can also have nudged the box. From ready the view is clear,
+        # so take a fresh fix and re-validate the drop target. Failure
+        # falls back to the pre-grasp fix (already pre-checked).
+        try:
+            _, box_fix_fresh = self._localize(destination, spatial_hint=None)
+        except SkillError:
+            self.memory.add(
+                "note",
+                f"re-localize of {destination!r} before place failed; "
+                "using the pre-grasp fix",
+            )
+        else:
+            self._precheck_place_target(box_fix_fresh, destination, picked_yet=True)
+            box_fix = box_fix_fresh
+
+        # ── [Step4] place above the box (measured box top, rpy=0,1.2,0) ─
+        drop = self._drop_point(box_fix)
 
         placed_ok = False
         try:
             if not self._safe_bridge_move(
                 (drop[0], drop[1], drop[2], 0.0, 1.2, 0.0),
-                duration=2.0, where="place",
+                duration=2.0, where="place", verify_tol_m=0.04,
             ):
                 raise SkillError(
                     f"place move failed (drop="
@@ -1573,62 +1831,317 @@ class SkillRuntime:
                 )
             release_thread.join()
         except Exception:
-            # Reconcile held state so the object doesn't get stuck as
-            # held forever (especially if the release never happened).
-            # Use the planned drop position as a "best guess" for the
-            # world model; if the arm aborted earlier the object may
-            # still be in the jaws — that's a known recoverable state
-            # for the next pick_and_place retry.
+            # The place failed BEFORE the release. Do NOT write the planned
+            # drop position into the belief store: the object is most likely
+            # still in the jaws, and a ghost belief at the box poisons every
+            # later retry (the watcher then fuses the real held object as a
+            # second, mid-air detection).
             if not placed_ok and self.held_object:
-                self.beliefs.update(
-                    self._held_det_label or object_label,
-                    np.asarray(drop, dtype=float),
-                    conf=0.5, color=self._held_color,
-                )
-                self.held_object = None
-                self._held_det_label = None
-                self._held_color = None
+                try:  # back off so the camera sees the scene again
+                    self._safe_bridge_move(
+                        ready6d, duration=ready_dur, where="abort_retreat",
+                    )
+                except Exception:
+                    pass
+                wf = self._gripper_width_frac()
+                air = float(self.cfg.grasp.get("air_grasp_frac", 0.04))
+                if wf is not None and wf < air:
+                    self.memory.add(
+                        "outcome",
+                        f"{self.held_object!r} slipped out during the aborted "
+                        "place; clearing the held state",
+                    )
+                    self.held_object = None
+                    self._held_det_label = None
+                    self._held_color = None
+                else:
+                    self.memory.add(
+                        "warning",
+                        f"place aborted but {self.held_object!r} is still in "
+                        "the jaws; keeping the held state so the next attempt "
+                        "can go straight to the place stage",
+                    )
             raise
 
-        # ── reconcile held + beliefs before returning ───────────────────
-        self.beliefs.update(
-            self._held_det_label or object_label,
-            np.array(drop, dtype=float),
-            conf=0.8,
-            color=self._held_color,
-        )
+        # ── [Step6] verify the landing BEFORE declaring success ──────────
+        # The trajectory succeeding only proves the ARM moved; it does not
+        # prove the object went into the box. It can bounce off the rim,
+        # miss sideways on a stale drop fix, or never have been in the jaws
+        # at all (the 2026-08-11 "trust the gripper" decision) -- and the
+        # old code reported success in all three cases, then wrote a ghost
+        # "toy is in the box" belief that poisoned every later task. One
+        # fresh look from ready (every camera, since the wrist/side camera
+        # often sees into the box when the primary sees only walls) closes
+        # the loop.
+        #
+        # Tri-state on purpose:
+        #   "confirmed" -- object seen within verify radius of the drop
+        #                 point -> write the belief, report full success.
+        #   "missed"    -- object seen somewhere ELSE -> a confirmed bad
+        #                 landing (bounced out / dropped short) -> ok:false
+        #                 so the retry loop re-picks it from where it
+        #                 actually is.
+        #   "unknown"   -- object not visible on ANY camera. Most often it
+        #                 simply sits inside the box below the rim where no
+        #                 camera can see it; treating that as a failure
+        #                 would re-grasp an object that is already placed.
+        #                 Accept the place but say so, and DON'T write a
+        #                 ghost belief.
+        det_label = self._held_det_label
+        held_color = self._held_color
+        landing = self._verify_place(destination, drop, det_label or object_label)
         placed = self.held_object
         self.held_object = None
         self._held_det_label = None
         self._held_color = None
-
+        if landing == "missed":
+            return {
+                "ok": False,
+                "stage": "place",
+                "error": (
+                    f"released {object_label!r} above {destination!r} but it "
+                    "landed away from the drop point (confirmed by camera)"
+                ),
+                "note": (
+                    "the object is on the table near the box. This skill "
+                    "retries automatically; do NOT call localize_object or "
+                    "grasp_object for it yourself -- the retry already "
+                    "knows where it is from the verification scan"
+                ),
+            }
+        if landing == "confirmed":
+            self.beliefs.update(
+                det_label or object_label,
+                np.array(drop, dtype=float),
+                conf=0.8,
+                color=held_color,
+            )
+            result_note = f"place verified by camera: {object_label!r} is at the drop point"
+        else:  # "unknown": accepted, no ghost belief, and an EXPLICIT
+            # completion instruction -- the object sits inside the box
+            # where no camera can see it (expected on this rig), and an
+            # agent that doubts the result would call
+            # localize_object("toy") next, get "detect no toy", and loop
+            # forever. The note tells it not to.
+            result_note = (
+                f"place accepted: {object_label!r} was released over "
+                f"{destination!r} and is no longer in the gripper; no camera "
+                "can see it now because it sits inside the container (the "
+                "near box wall hides it from the tilted camera). The "
+                "pick-and-place is COMPLETE -- do NOT call localize_object "
+                "or grasp_object for it again, and do NOT report failure."
+            )
+            self.memory.add("note", result_note)
         return {
             "ok": True,
             "picked": placed,
             "placed_at": [drop[0], drop[1], drop[2]],
             "destination": destination,
+            "place_status": landing,
+            "note": result_note,
             "grip_profile": "bridge",
         }
 
-    def _single_localize(self, frame, query: str):
-        """Detect + 3D fix on the supplied frame only (no retry / no cache).
+    def _verify_place(
+        self,
+        destination: str,
+        drop,
+        object_label: str,
+        timeout_s: float | None = None,
+    ) -> str:
+        """Visual check of where the released object actually landed.
 
-        Bypasses :meth:`_localize`'s multi-frame retry and WorldWatcher
-        fallback. Used by :meth:`_skill_pick_and_place_bridge` to detect
-        the object AND destination on the same frame in one YOLO pass.
+        Scans the primary camera AND every fusing camera each cycle (the
+        wrist/side camera often sees into the destination box when the
+        primary view is blocked by its walls), refreshing beliefs from what
+        it sees, so a subsequent retry already knows where the object
+        really is.
 
-        Returns ``None`` on failure (caller decides how to surface).
+        Returns a tri-state string:
+            "confirmed" -- object seen within ``place_verify_radius_m`` of
+                           the drop point;
+            "missed"    -- object seen FAR from the drop point (beyond
+                           2x radius) on at least two separate scan cycles
+                           (one flickering far sighting is NOT enough --
+                           open-vocab detection flickers frame to frame);
+            "unknown"   -- anything else: not visible at all (e.g. it sits
+                           inside the box hidden behind the near wall from
+                           the tilted camera -- the EXPECTED case on this
+                           rig), or only ambiguously near. Accepted by the
+                           caller, NOT a failure.
         """
-        r = self._resolve_query(query)
+        if timeout_s is None:
+            timeout_s = float(self.cfg.grasp.get("place_verify_timeout_s", 4.0))
+        radius = float(self.cfg.grasp.get("place_verify_radius_m", 0.09))
+        drop_xy = np.asarray(drop, dtype=float)[:2]
+        far_hits = 0
+        t_end = time.monotonic() + timeout_s
+        while time.monotonic() < t_end:
+            scanned = False
+            try:
+                frame = self.observe()
+                dets = self.detector.detect(frame, classes=self._default_classes)
+                self._show_detections(dets)
+                self._update_beliefs_from_frame(frame, dets)
+                scanned = True
+            except Exception:
+                pass  # a camera hiccup must not kill the verification
+            for cam in self._other_cams():
+                try:
+                    cframe = cam.depth.ensure_depth(cam.stream.get_frame())
+                    if not cframe.has_depth:
+                        continue
+                    from ..perception.grounding import Extrinsics as _Ext
+                    ext = (_Ext(T=cframe.T_base_cam)
+                           if cframe.T_base_cam is not None
+                           else cam.extrinsics)
+                    dets = self.detector.detect(cframe, classes=self._default_classes)
+                    self._update_beliefs_from_frame(cframe, dets, T=ext.cam_to_base())
+                    scanned = True
+                except Exception:
+                    continue
+            if scanned:
+                belief = self.beliefs.find(object_label)
+                if belief is not None:
+                    d_xy = float(np.linalg.norm(
+                        np.asarray(belief.position, dtype=float)[:2] - drop_xy
+                    ))
+                    if d_xy <= radius:
+                        self.memory.add(
+                            "note",
+                            f"place verified: {object_label!r} seen "
+                            f"{d_xy * 1000:.0f} mm from the drop point",
+                        )
+                        return "confirmed"
+                    if d_xy > 2.0 * radius:
+                        far_hits += 1
+                        self.memory.add(
+                            "note",
+                            f"place verification: {object_label!r} seen "
+                            f"{d_xy * 1000:.0f} mm from the drop point (far)",
+                        )
+                        if far_hits >= 2:
+                            return "missed"
+                    # between radius and 2*radius: ambiguous -- keep scanning
+            time.sleep(0.4)
+        return "unknown"
+
+    def _verify_grasp_took_object(self, fix, label: str) -> None:
+        """v7: visual air-grasp check for the LLM path (grasp_object).
+
+        Raises SkillError('air grasp') if the target is STILL VISIBLE ON
+        THE TABLE at (or very near) its pre-grasp location after close and
+        lift. That is the one unambiguous signature of a missed grasp.
+        Not-visible is accepted as held: a properly held object rides in
+        the gripper at the ready pose (z well above the table), where this
+        check's table-height gate excludes it, and the top camera usually
+        cannot see it anyway. Detection flicker can only cause a false
+        ACCEPT here (a miss read as held), never a false failure: a
+        positive on-table sighting at the exact pick spot is trustworthy.
+        """
+        radius = float(self.cfg.grasp.get("grasp_verify_radius_m", 0.06))
+        table_z = float(self.cfg.safety.get("table_z", 0.0))
+        on_table_z = table_z + 0.12  # held objects ride at ready z ~0.3
+        det_label = getattr(fix.detection, "label", None) or label
+        pick_xy = np.asarray(fix.position, dtype=float)[:2]
+        for _ in range(2):
+            try:
+                frame = self.observe()
+                dets = self.detector.detect(frame, classes=self._default_classes)
+            except Exception:
+                return  # perception hiccup: never fail a possibly-good grasp
+            T = (frame.T_base_cam if frame.T_base_cam is not None
+                 else self.extrinsics.cam_to_base())
+            for d in dets:
+                if d.label != det_label:
+                    continue
+                mask = d.mask
+                if mask is None:
+                    h, w = frame.rgb.shape[:2]
+                    mask = np.zeros((h, w), dtype=bool)
+                    x0, y0, x1, y1 = d.bbox.astype(int)
+                    mask[max(y0, 0):min(y1, h), max(x0, 0):min(x1, w)] = True
+                try:
+                    pts_cam = mask_to_points_cam(frame, mask)
+                except Exception:
+                    continue
+                if pts_cam.shape[0] < 10:
+                    continue
+                pts_base = transform_points(T, pts_cam)
+                center = pts_base.mean(axis=0)
+                if float(center[2]) > on_table_z:
+                    continue  # up in the air = riding in the gripper
+                d_xy = float(np.linalg.norm(center[:2] - pick_xy))
+                if d_xy <= radius:
+                    self.memory.add(
+                        "outcome",
+                        f"air grasp: {label!r} still on the table at its "
+                        f"pick location ({d_xy * 1000:.0f} mm away) after "
+                        "close+lift",
+                    )
+                    raise SkillError(
+                        f"air grasp: {label!r} is still at its pick location; "
+                        "the jaws closed on empty air"
+                    )
+            time.sleep(0.4)
+
+    def _scan_object_xy(self, object_label: str):
+        """One detection pass over the primary AND every fusing camera,
+        refreshing beliefs; returns the object's base-frame XY if seen,
+        else None."""
         try:
-            return localize_object(
-                frame, query, self.detector, self.extrinsics,
-                prompts=r["prompts"], spatial_hint=None,
-                color=r["color"], near_xyz=r["near_xyz"], vocab=r["vocab"],
-                prefer_label=r["prefer_label"],
-            )
-        except SkillError:
+            frame = self.observe()
+            dets = self.detector.detect(frame, classes=self._default_classes)
+            self._show_detections(dets)
+            self._update_beliefs_from_frame(frame, dets)
+        except Exception:
+            pass
+        for cam in self._other_cams():
+            try:
+                cframe = cam.depth.ensure_depth(cam.stream.get_frame())
+                if not cframe.has_depth:
+                    continue
+                from ..perception.grounding import Extrinsics as _Ext
+                ext = (_Ext(T=cframe.T_base_cam)
+                       if cframe.T_base_cam is not None
+                       else cam.extrinsics)
+                dets = self.detector.detect(cframe, classes=self._default_classes)
+                self._update_beliefs_from_frame(cframe, dets, T=ext.cam_to_base())
+            except Exception:
+                continue
+        belief = self.beliefs.find(object_label)
+        if belief is None:
             return None
+        return np.asarray(belief.position, dtype=float)[:2]
+
+    def _verify_landing(self, object_label: str, target, timeout_s: float = 2.5) -> str:
+        """v7: tri-state landing check for skill_place_at (LLM path):
+        "at_target" (within place_verify_radius_m), "elsewhere" (beyond
+        2x radius, confirmed on two scan cycles), or "unknown" (not seen /
+        ambiguous). Never raises -- the object is already released, this
+        only reports the truth to the caller.
+        """
+        near = float(self.cfg.grasp.get("place_verify_radius_m", 0.09))
+        target_xy = np.asarray(target, dtype=float)[:2]
+        far_hits = 0
+        t_end = time.monotonic() + timeout_s
+        while time.monotonic() < t_end:
+            xy = self._scan_object_xy(object_label)
+            if xy is not None:
+                d = float(np.linalg.norm(xy - target_xy))
+                if d <= near:
+                    return "at_target"
+                if d > 2.0 * near:
+                    far_hits += 1
+                    if far_hits >= 2:
+                        self.memory.add(
+                            "note",
+                            f"landing check: {object_label!r} came to rest "
+                            f"{d * 1000:.0f} mm from the place target",
+                        )
+                        return "elsewhere"
+            time.sleep(0.4)
+        return "unknown"
 
     def _close_two_stage(
         self,
@@ -1783,10 +2296,12 @@ class SkillRuntime:
             # the ascent, or an ascent abort leaves held_object latched and a
             # retry descends onto the object we just released.
             placed = self.held_object
+            placed_det_label = self._held_det_label
+            placed_color = self._held_color
             self.beliefs.update(
                 # Re-register under the DETECTOR label so the watcher's next
                 # fusion merges here instead of creating a query-string ghost.
-                self._held_det_label or placed, target, 0.8, color=self._held_color
+                placed_det_label or placed, target, 0.8, color=placed_color
             )
             self.held_object = None
             self._held_det_label = None
@@ -1804,7 +2319,23 @@ class SkillRuntime:
                 self.memory.add("note", f"placed, but the ascent aborted: {e}")
         finally:
             self.arm.harness.clear_grasp_exemption()
-        return {"placed": placed, "at": [round(float(v), 3) for v in target]}
+        # v7: the object is released either way -- but "placed" only ever
+        # meant the ARM moved. Tell the caller (the LLM) where the object
+        # ACTUALLY landed, so the LLM path stops declaring victory over a
+        # drop that missed the target.
+        landing = "unknown"
+        if placed:
+            try:
+                landing = self._verify_landing(
+                    str(placed_det_label or placed), target
+                )
+            except Exception:
+                landing = "unknown"
+        return {
+            "placed": placed,
+            "at": [round(float(v), 3) for v in target],
+            "landing": landing,
+        }
 
     def skill_place_on_object(self, label: str) -> dict:
         self._adopt_unknown_held()
@@ -1871,7 +2402,60 @@ class SkillRuntime:
         # Without a destination we fall back to the legacy flow so
         # ``pick_and_place`` with no destination still uses the drop_zone.
         if self.bridge is not None and destination is not None:
-            return self._skill_pick_and_place_bridge(object, destination, already_held=already_held)
+            # The bridge path used to be ONE-SHOT: any transient hiccup
+            # (one missed detection, one IK convergence failure, one
+            # unconfirmed landing) failed the WHOLE task and left it to the
+            # LLM to pick up the pieces. Give it the same persistence
+            # budget the legacy path has: re-home, re-observe, retry until
+            # max_pick_attempts / persist_seconds run out.
+            # `_skill_pick_and_place_bridge` already skips the pick stage
+            # when `already_held` is set, so a failure that left the object
+            # in the jaws resumes at the place stage on the next attempt.
+            bcfg = self.cfg.grasp
+            b_max = max(int(bcfg.get("max_pick_attempts", 8)), 1)
+            b_deadline = t0 + float(bcfg.get("persist_seconds", 120.0))
+            b_attempts = 0
+            b_err = "unknown"
+            while True:
+                b_attempts += 1
+                try:
+                    res = self._skill_pick_and_place_bridge(
+                        object, destination, already_held=already_held
+                    )
+                    if res.get("ok", True):
+                        return res
+                    b_err = str(res.get("error", "bridge pick_and_place failed"))
+                except (SkillError, SafetyViolation) as e:
+                    b_err = f"{type(e).__name__}: {e}"
+                self.memory.add(
+                    "outcome",
+                    f"pick_and_place attempt {b_attempts} failed: {b_err[:120]}",
+                )
+                if self.arm.harness.estopped:
+                    b_err += " (e-stop latched; not retrying)"
+                    break
+                if b_attempts >= b_max or time.monotonic() > b_deadline:
+                    break
+                resume_held = self.held_object
+                self.memory.add(
+                    "note",
+                    f"not giving up: attempt {b_attempts + 1}/{b_max} -- "
+                    + (f"still holding {resume_held!r}, resuming at the place stage"
+                       if resume_held else
+                       f"re-homing and re-scanning for {object!r}"),
+                )
+                already_held = resume_held  # mid-carry failure resumes at place
+                try:  # park the arm so the re-scan sees a clean scene
+                    self.skill_move_home()
+                except (SkillError, SafetyViolation):
+                    pass
+                self._reobserve()
+            return {
+                "ok": False,
+                "stage": "pick_and_place",
+                "error": f"pick_and_place failed after {b_attempts} attempt(s): {b_err}",
+                "attempts": b_attempts,
+            }
 
         gcfg = self.cfg.grasp
         max_attempts = max(int(gcfg.get("max_pick_attempts", 8)), 1)
