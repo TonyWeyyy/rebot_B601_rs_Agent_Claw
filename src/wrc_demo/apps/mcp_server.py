@@ -214,6 +214,16 @@ class McpSkillServer:
         ]
 
     def call_tool(self, name: str, arguments: dict) -> dict:
+        # emergency_stop must NEVER block on or trigger hardware init.
+        if name == "emergency_stop":
+            with contextlib.redirect_stdout(sys.stderr):
+                rt = self._runtime
+                if rt is not None:
+                    rt.arm.stop()
+                    return _text_result({"ok": True, "stopped": True,
+                                         "note": "arm frozen; call reset_stop to resume"})
+                return _text_result({"ok": True, "stopped": True,
+                                     "note": "runtime not initialized; motors untouched"})
         runtime = self._ensure_runtime()
         with contextlib.redirect_stdout(sys.stderr):
             if name == "camera_snapshot":
@@ -234,10 +244,6 @@ class McpSkillServer:
                               "stderr; set WRC_STREAM_PORT to change it)"},
                     is_error=True,
                 )
-            if name == "emergency_stop":
-                runtime.arm.stop()
-                return _text_result({"ok": True, "stopped": True,
-                                     "note": "arm frozen; call reset_stop to resume"})
             if name == "reset_stop":
                 runtime.arm.resume()
                 return _text_result({"ok": True, "stopped": False})
@@ -383,6 +389,17 @@ def handle_message(server: McpSkillServer, msg: dict) -> dict | None:
         return _response(req_id, error={"code": -32603, "message": f"internal error: {e}"})
 
 
+# Tools that MUST execute immediately on the stdin reader loop even while a
+# long-running motion tool (e.g. pick_and_place) is active in the worker thread.
+_BYPASS_TOOLS = frozenset({
+    "emergency_stop",
+    "reset_stop",
+    "world_state",
+    "live_view_url",
+    "camera_snapshot",
+})
+
+
 def main() -> int:
     server = McpSkillServer()
     # The prewarm thread wraps its build in redirect_stdout(sys.stderr),
@@ -390,6 +407,18 @@ def main() -> int:
     # through a reference captured before that thread starts, or the
     # initialize/tools/list responses land on stderr and the client hangs.
     protocol_out = sys.stdout
+    write_lock = threading.Lock()
+    motion_lock = threading.Lock()
+    workers: list[threading.Thread] = []
+
+    def _emit(resp: dict | None) -> None:
+        if resp is None:
+            return
+        line_out = json.dumps(resp) + "\n"
+        with write_lock:
+            protocol_out.write(line_out)
+            protocol_out.flush()
+
     print("[wrc-mcp] wrc-demo MCP server on stdio", file=sys.stderr)
     if os.environ.get("WRC_PREWARM", "1") != "0":
         server.prewarm_async()
@@ -403,11 +432,37 @@ def main() -> int:
             except json.JSONDecodeError:
                 print(f"[wrc-mcp] bad JSON frame: {line[:120]}", file=sys.stderr)
                 continue
-            resp = handle_message(server, msg)
-            if resp is not None:
-                protocol_out.write(json.dumps(resp) + "\n")
-                protocol_out.flush()
+            method = msg.get("method")
+            tool_name = (msg.get("params") or {}).get("name", "") if method == "tools/call" else ""
+            if method == "tools/call" and tool_name not in _BYPASS_TOOLS:
+                if not motion_lock.acquire(blocking=False):
+                    _emit(_response(
+                        msg.get("id"),
+                        _text_result(
+                            {"ok": False,
+                             "error": "arm is busy executing another tool; "
+                                      "call emergency_stop to abort"},
+                            is_error=True,
+                        ),
+                    ))
+                    continue
+
+                def _run_motion(m=msg):
+                    try:
+                        _emit(handle_message(server, m))
+                    finally:
+                        motion_lock.release()
+
+                t = threading.Thread(target=_run_motion, daemon=True, name=f"mcp-{tool_name}")
+                workers = [w for w in workers if w.is_alive()]
+                workers.append(t)
+                t.start()
+            else:
+                _emit(handle_message(server, msg))
     finally:
+        # Wait briefly for any in-flight motion tool before orderly shutdown.
+        for w in workers:
+            w.join(timeout=2.0)
         server.shutdown()
     return 0
 

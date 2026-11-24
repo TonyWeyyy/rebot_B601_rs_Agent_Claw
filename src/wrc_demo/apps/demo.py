@@ -83,11 +83,22 @@ def build_runtime(
         ee_frame=str(cfg.arm.get("ee_frame", "gripper_end")),
         arm_joint_count=int(cfg.arm.get("n_joints", 6)),
     )
-    # ``make_arm`` returns the right arm type (MockArm / SafeArm
-    # wrapping the vendored SDK) and connects it. For real arms this
-    # powers the motors immediately; the ``lazy_arm`` flag is now a
-    # no-op (kept in the signature for back-compat with the MCP server).
-    arm = make_arm(cfg, kinematics=kin)
+    # When lazy_arm=True on a real arm (e.g. MCP server startup), defer
+    # CAN connection and motor power-up until the first motion command while
+    # keeping a live SafetyHarness for WorldWatcher heartbeats and e-stop.
+    if lazy_arm and str(cfg.arm.get("type", "mock")) != "mock":
+        from ..control.lazy_arm import LazySafeArm
+
+        shared_harness = SafetyHarness(
+            SafetyLimits.from_config(cfg.safety), kinematics=kin,
+        )
+        arm = LazySafeArm(
+            factory=lambda: make_arm(cfg, kinematics=kin, harness=shared_harness),
+            harness=shared_harness,
+            n_joints=int(cfg.arm.get("n_joints", 6)),
+        )
+    else:
+        arm = make_arm(cfg, kinematics=kin)
 
     # ── the camera rig: N continuous streams, first = manipulation ──────
     cam_cfgs = _camera_cfgs(cfg)
@@ -167,7 +178,7 @@ def build_runtime(
     if bool(pcfg.get("enabled", True)):
         watcher = WorldWatcher(
             watched, detector, beliefs,
-            classes=list(cfg.get("detect_classes", [])) or ["cup", "bottle", "box"],
+            classes=list(cfg.camera.get("detect_classes") or cfg.get("detect_classes", [])) or ["cup", "bottle", "box"],
             rate_hz=float(pcfg.get("rate_hz", 3.0)),
             harness=arm.harness,  # MockArm / SafeArm both expose .harness
         )
@@ -325,18 +336,28 @@ def main(argv: list[str] | None = None) -> int:
         cfg=cfg, fallback_chain=fallback_chain,
     )
 
+    import threading
+
+    _task_lock = threading.Lock()
+
     def _run(task: str):
-        runtime.current_task = task
-        try:
-            return agent.run_task(task)
-        finally:
-            runtime.current_task = None
+        with _task_lock:
+            runtime.current_task = task
+            try:
+                return agent.run_task(task)
+            finally:
+                runtime.current_task = None
 
     # Wire the dashboard "send"/"stop" buttons to the live agent so you can
     # drive the robot from the browser (http://<ip>:8090) as well as the REPL.
     _srv = getattr(runtime, "stream_server", None)
     if _srv is not None:
-        _srv.set_task_fn(lambda t: _print_report(_run(t)))
+        def _web_task(t: str):
+            if hasattr(runtime, "arm") and hasattr(runtime.arm, "harness"):
+                runtime.arm.harness.reset_estop()
+            _print_report(_run(t))
+
+        _srv.set_task_fn(_web_task)
         _srv.set_cancel_fn(runtime.arm.stop)
 
     try:
@@ -349,10 +370,12 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 if not task:
                     break
-                # Clear e-stop before each task so a previous Ctrl+C
-                # does not permanently block motion.
+                # Clear e-stop and re-arm the soft-stop SIGINT handler before
+                # each task so Ctrl+C always freezes the arm cleanly (never
+                # abruptly kills Python while holding a payload).
                 if hasattr(runtime, "arm") and hasattr(runtime.arm, "harness"):
                     runtime.arm.harness.reset_estop()
+                signal.signal(signal.SIGINT, _sigint)
                 _print_report(_run(task))
         else:
             task = args.task or "look at the table and report what objects you see"

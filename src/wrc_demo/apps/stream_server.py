@@ -86,6 +86,7 @@ _INDEX_HTML = """<!doctype html>
  </aside>
 </main>
 <script>
+ const ESC = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
  const CSS = {{observation:'obs', action:'act', outcome:'out', note:'note'}};
  const SWATCH = {{red:'#e5484d', orange:'#f76b15', yellow:'#ffe629', green:'#46a758',
    cyan:'#00a2c7', blue:'#0090ff', purple:'#8e4ec6', pink:'#f76190',
@@ -127,9 +128,9 @@ _INDEX_HTML = """<!doctype html>
      }}).join('');
      if (stick) feed.scrollTop = feed.scrollHeight;
      document.getElementById('objs').innerHTML = (s.objects || []).map(o =>
-       `<tr class="${{o.state}}"><td>${{o.label}}</td>` +
-       `<td><span class="chip" style="background:${{SWATCH[o.color] || '#333'}}"></span>${{o.color || '?'}}</td>` +
-       `<td>[${{o.position.join(', ')}}]</td><td>${{o.state}} (${{o.age_s}}s)</td></tr>`
+       `<tr class="${{ESC(o.state)}}"><td>${{ESC(o.label)}}</td>` +
+       `<td><span class="chip" style="background:${{SWATCH[o.color] || '#333'}}"></span>${{ESC(o.color || '?')}}</td>` +
+       `<td>[${{(o.position || []).map(Number).join(', ')}}]</td><td>${{ESC(o.state)}} (${{ESC(o.age_s)}}s)</td></tr>`
      ).join('');
    }} catch (e) {{}}
    setTimeout(tick, 500);
@@ -225,7 +226,11 @@ class StreamServer:
         if frame is None:
             return None
         dets, status = stream.overlay()
-        key = (frame.frame_id, len(dets), status)
+        det_sig = tuple(
+            (getattr(d, "label", ""), tuple(int(v) for v in getattr(d, "bbox", ())[:4]))
+            for d in dets
+        )
+        key = (frame.frame_id, det_sig, status)
         with self._jpeg_lock:
             cached = self._jpeg_cache.get(name)
             if cached is not None and cached[0] == key:
@@ -306,6 +311,11 @@ def _make_handler(server: StreamServer):
                                   code=501)
             try:
                 n = int(self.headers.get("Content-Length", 0))
+                if n <= 0 or n > 16384:
+                    return self._json(
+                        {"accepted": False, "error": "request body must be 1..16384 bytes"},
+                        code=413 if n > 16384 else 400,
+                    )
                 task = str(json.loads(self.rfile.read(n)).get("task", "")).strip()
             except (ValueError, json.JSONDecodeError):
                 return self._json({"accepted": False,
