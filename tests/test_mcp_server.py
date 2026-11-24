@@ -88,7 +88,8 @@ def test_initialize_and_tools_list_without_hardware(client):
     resp = client.request("tools/list")
     tools = {t["name"]: t for t in resp["result"]["tools"]}
     for expected in (
-        "list_objects", "grasp_object", "pick_and_place", "move_home",
+        "list_objects", "pick_and_place", "move_home", "wave",
+        "teach_record", "teach_replay",
         "camera_snapshot", "world_state", "live_view_url",
         "emergency_stop", "reset_stop",
     ):

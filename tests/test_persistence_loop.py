@@ -78,7 +78,7 @@ class _OkIK:
 
 
 class StubKin:
-    def ik(self, T, q0):
+    def ik(self, T, q0, retries=0):
         return _OkIK(np.asarray(q0) + 0.01)
 
 

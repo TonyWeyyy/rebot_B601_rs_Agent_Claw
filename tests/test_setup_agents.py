@@ -27,8 +27,11 @@ def test_codex_toml_block_shape():
     assert 'args = ["-m", "wrc_demo.apps.mcp_server"]' in block
     assert "[mcp_servers.wrc-demo.env]" in block
     assert 'WRC_CAMERAS = "l515"' in block
-    # tomllib must parse it
-    import tomllib
+    # tomllib (3.11+) / tomli (3.10) must parse it
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
 
     data = tomllib.loads(block)
     assert data["mcp_servers"]["wrc-demo"]["env"]["WRC_ARM"] == "mock"
@@ -51,7 +54,10 @@ def test_codex_upsert_preserves_and_replaces():
     assert merged2.count("[mcp_servers.wrc-demo]") == 1
     assert 'WRC_CAMERAS = "mock"' in merged2 and 'WRC_CAMERAS = "l515"' not in merged2
     assert "[mcp_servers.other]" in merged2
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
 
     data = tomllib.loads(merged2)
     assert set(data["mcp_servers"]) == {"other", "wrc-demo"}

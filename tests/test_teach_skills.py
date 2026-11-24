@@ -109,9 +109,9 @@ def test_teach_tool_specs_v2_description():
             assert "q" in spec["description"] or "Esc" in spec["description"]
 
 
-def test_tool_specs_total_6():
-    """TOOL_SPECS 总数 = 6 (4 原生 + 2 teach)。"""
-    assert len(TOOL_SPECS) == 6
+def test_tool_specs_total_7():
+    """TOOL_SPECS 总数 = 7 (list_objects, pick_and_place, move_home, wave, task_done, teach_record, teach_replay)."""
+    assert len(TOOL_SPECS) == 7
 
 
 # ── skill_teach_record rejects invalid slot ──────────────────────────────

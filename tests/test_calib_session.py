@@ -316,13 +316,12 @@ def test_auto_mode_construction(tmp_path):
     assert len(poses) >= 5, "auto-mode must cover at least 5 poses"
     for (xyz, rpy) in poses:
         assert len(xyz) == 3 and len(rpy) == 3
-        # Reachable workspace AABB around (0.30, -0.05, 0.28).
-        assert 0.20 < xyz[0] < 0.40, f"xyz[0] {xyz[0]} out of workspace"
-        assert -0.15 < xyz[1] < 0.10, f"xyz[1] {xyz[1]} out of workspace"
-        assert 0.15 < xyz[2] < 0.40, f"xyz[2] {xyz[2]} out of workspace"
-        # Pitch is bounded so the ArUco marker (Solution B, face-on)
-        # stays roughly horizontal to the top camera.
-        assert -0.5 < rpy[1] < 0.5, f"pitch {rpy[1]} out of range"
+        # Reachable workspace AABB inside safety.workspace ([0.10..0.50, -0.30..0.30, 0..0.55]).
+        assert 0.20 <= xyz[0] <= 0.40, f"xyz[0] {xyz[0]} out of workspace"
+        assert -0.25 <= xyz[1] <= 0.25, f"xyz[1] {xyz[1]} out of workspace"
+        assert 0.15 <= xyz[2] <= 0.40, f"xyz[2] {xyz[2]} out of workspace"
+        # Pitch is bounded so the ArUco marker stays visible to the top camera.
+        assert -1.1 <= rpy[1] <= 1.1, f"pitch {rpy[1]} out of range"
 
 
 def test_pose_to_T_round_trip():

@@ -8,9 +8,12 @@ def test_fk_ik_roundtrip():
     from wrc_demo.control.kinematics import Kinematics
 
     kin = Kinematics(str(URDF), "gripper_end", joint_signs=JOINT_SIGNS)
-    q_ref = np.array([0.3, 1.1, 1.3, 0.2, 0.5, -0.4])
+    # q_ref must lie inside the sign-flipped URDF joint limits so IK can reach it.
+    lo, hi = kin.joint_limits
+    q_ref = np.clip(np.array([0.3, -1.1, -1.3, 0.2, 0.5, -0.4]), lo + 0.1, hi - 0.1)
     T = kin.fk(q_ref)
-    res = kin.ik(T, q_init=np.array([0.0, 1.2, 1.2, 0.0, 0.75, 0.0]))
+    q_seed = np.clip(np.array([0.0, -1.2, -1.2, 0.0, 0.75, 0.0]), lo + 0.1, hi - 0.1)
+    res = kin.ik(T, q_init=q_seed)
     assert res.success, f"IK failed with error {res.error}"
     T2 = kin.fk(res.q)
     assert np.linalg.norm(T2[:3, 3] - T[:3, 3]) < 1e-3
