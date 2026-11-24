@@ -66,7 +66,7 @@ class AgentOrchestrator:
         self.advisor = advisor
         self.max_steps = max_steps
         self.decompose = decompose
-        self.attach_images = attach_images and llm.supports_vision
+        self.attach_images = attach_images and bool(getattr(llm, "supports_vision", False))
         self.fast_planner = fast_planner
         # ADR-0008: profile switching + fallback. `cfg` is the live
         # wrc_demo.config.Cfg (or any object with a writable `_data["llm"]`
@@ -76,18 +76,32 @@ class AgentOrchestrator:
         # backward-compatible.
         self.cfg = cfg
         self.fallback_chain = list(fallback_chain)
+        self._want_images = bool(attach_images)
 
     # ───────────────────────────────────────────────────────────────────
     # ADR-0008: profile switching + transient-error fallback
     # ───────────────────────────────────────────────────────────────────
 
-    def switch_llm(self, profile_name: str) -> "LLMClient":
-        """Swap the live LLM client for a new one built from `cfg`.
+    def _load_llm_profile_cfg(self, profile_name: str):
+        """Load the YAML profile for ``profile_name`` as a ``Cfg``."""
+        from ..config import Cfg, load_profile
+        try:
+            prof = load_profile("llm", profile_name)
+            data = prof.as_dict()
+            data.setdefault("profile", profile_name)
+            return Cfg(data)
+        except FileNotFoundError:
+            if self.cfg is None:
+                raise
+            sub = dict(self.cfg._data.get("llm", {}))
+            sub["profile"] = profile_name
+            return Cfg(sub)
 
-        `profile_name` overrides `cfg.llm["profile"]` (or sets it if
-        absent) before re-deriving the client. The new client becomes
-        `self.llm`; the next `chat()` uses it. An `llm_switch` event is
-        recorded in the trace.
+    def switch_llm(self, profile_name: str) -> "LLMClient":
+        """Swap the live LLM client for a new one loaded from ``configs/llm/<profile_name>.yaml``.
+
+        The new client becomes ``self.llm``; the next ``chat()`` uses it. An
+        ``llm_switch`` event is recorded in the trace.
         """
         from .llm import make_llm
         if self.cfg is None:
@@ -95,15 +109,46 @@ class AgentOrchestrator:
                 "switch_llm requires the orchestrator to be constructed "
                 "with a `cfg` argument (ADR-0008)."
             )
-        sub_cfg = dict(self.cfg._data["llm"])
-        sub_cfg["profile"] = profile_name
-        new_llm = make_llm(sub_cfg)
+        prof_cfg = self._load_llm_profile_cfg(profile_name)
+        new_llm = make_llm(prof_cfg)
+        self.cfg._data["llm"] = prof_cfg.as_dict()
         self.llm = new_llm
+        self.attach_images = self._want_images and bool(getattr(new_llm, "supports_vision", False))
         if getattr(self.runtime, "trace", None) is not None:
             self.runtime.trace.record_event(
                 "llm_switch", {"profile": profile_name}
             )
         return new_llm
+
+    @staticmethod
+    def _transient_llm_errors() -> tuple[type[BaseException], ...]:
+        """Collect transient network/API error classes from installed LLM SDKs."""
+        errs: list[type[BaseException]] = [ConnectionError, TimeoutError]
+        try:
+            import openai
+            errs.extend([
+                openai.APIConnectionError,
+                openai.APITimeoutError,
+                openai.RateLimitError,
+                openai.AuthenticationError,
+                openai.InternalServerError,
+                openai.BadRequestError,
+            ])
+        except ImportError:
+            pass
+        try:
+            import anthropic
+            errs.extend([
+                anthropic.APIConnectionError,
+                anthropic.APITimeoutError,
+                anthropic.RateLimitError,
+                anthropic.AuthenticationError,
+                anthropic.InternalServerError,
+                anthropic.BadRequestError,
+            ])
+        except ImportError:
+            pass
+        return tuple(errs)
 
     def _chat_with_fallback(
         self,
@@ -119,32 +164,35 @@ class AgentOrchestrator:
         should surface, not be silently masked by a fallback.
         """
         from .llm import LLMConfigError
-        import openai
-        transient = (
-            openai.APIConnectionError,
-            openai.APITimeoutError,
-            openai.RateLimitError,
-            openai.AuthenticationError,
-            openai.InternalServerError,
-            openai.BadRequestError,  # 4xx often means the model can't parse the request — recoverable
-        )
+        transient = self._transient_llm_errors()
         last_exc: Exception | None = None
-        chain: list[tuple[str, LLMClient]] = [("primary", self.llm)]
+        # Try primary FIRST; only construct fallback clients lazily if primary
+        # fails with a transient error (saves startup/per-turn overhead).
+        try:
+            return self.llm.chat(
+                system, messages, tools=tools, max_tokens=max_tokens
+            )
+        except transient as e:
+            last_exc = e
+            if getattr(self.runtime, "trace", None) is not None:
+                self.runtime.trace.record_event(
+                    "llm_fallback",
+                    {"from": "primary", "err": str(e)[:200]},
+                )
+
         for profile_name in self.fallback_chain:
             try:
-                chain.append((profile_name, self._client_for(profile_name)))
+                candidate = self._client_for(profile_name)
             except LLMConfigError:
                 # Misconfigured fallback profile — surface immediately
                 raise
             except Exception as e:
-                # Building the fallback itself failed; record and move on
                 if getattr(self.runtime, "trace", None) is not None:
                     self.runtime.trace.record_event(
                         "llm_fallback_build_failed",
                         {"profile": profile_name, "err": str(e)[:200]},
                     )
                 continue
-        for label, candidate in chain:
             try:
                 return candidate.chat(
                     system, messages, tools=tools, max_tokens=max_tokens
@@ -154,7 +202,7 @@ class AgentOrchestrator:
                 if getattr(self.runtime, "trace", None) is not None:
                     self.runtime.trace.record_event(
                         "llm_fallback",
-                        {"from": label, "err": str(e)[:200]},
+                        {"from": profile_name, "err": str(e)[:200]},
                     )
                 continue
         # Chain exhausted
@@ -169,9 +217,7 @@ class AgentOrchestrator:
                 "fallback_chain requires the orchestrator to be constructed "
                 "with a `cfg` argument (ADR-0008)."
             )
-        sub_cfg = dict(self.cfg._data["llm"])
-        sub_cfg["profile"] = profile_name
-        return make_llm(sub_cfg)
+        return make_llm(self._load_llm_profile_cfg(profile_name))
 
     def run_task(self, task: str) -> TaskReport:
         t_start = time.monotonic()
@@ -197,39 +243,24 @@ class AgentOrchestrator:
         messages.append({"role": "user", "content": intro})
 
         consecutive_failures = 0
-# 2026-08-13: track whether pick_and_place has succeeded in this task.
-        # If yes, the next call must be task_done (or move_home + task_done) —
-        # never another pick_and_place. The LLM is prone to "verify by re-placing"
-        # loops when list_objects still shows the object at its destination.
-        self._pick_and_place_succeeded_in_task = False
-        # 2026-09-03: same shape for failures. Small local LLMs (Qwen3-VL-2B
-        # AWQ-4bit) sometimes ignore the "if pick_and_place fails, call
-        # task_done" rule in prompts.py and re-issue the same failing call
-        # until max_steps (30) is hit (~2 min of wasted GPU). Cap consecutive
-        # pick_and_place failures and force task_done instead.
-        # Also: some small LLMs stop calling tools and just emit text
-        # ("I see a red cube...") over and over. Track consecutive text-only
-        # turns and force task_done.
+        # Track completed (object, destination) pick_and_place pairs so the
+        # agent cannot loop re-placing the SAME object, while still allowing
+        # legitimate multi-object tasks ("put the banana and cube in the box").
+        self._completed_pick_places: set[tuple[str, str]] = set()
         self._consecutive_pick_failures = 0
         self._consecutive_text_only = 0
         PICK_AND_PLACE_FAILURE_LIMIT = 3
-        # Bumped 2026-09-03: minimax-M3 cloud LLM does more reasoning per turn
-        # than local Qwen3-VL did; 3 turns was too tight — the LLM was on
-        # the verge of correctly calling task_done(success=false, "no wave
-        # tool") when the counter fired. 5 gives one more thinking turn
-        # of headroom without losing the runaway-loop protection.
         TEXT_ONLY_LIMIT = 5
+        # Allow per-profile max_tokens override (small 8 GB local models can
+        # pin 128-256 in configs/llm/*.yaml; cloud/reasoning models default to 512).
+        llm_cfg = (self.cfg._data.get("llm", {}) if self.cfg is not None and hasattr(self.cfg, "_data") else {})
+        step_max_tokens = int(llm_cfg.get("max_tokens", 512))
         for step in range(1, self.max_steps + 1):
             resp = self._chat_with_fallback(
                 system=SYSTEM_PROMPT,
                 messages=self._prune_images(messages),
                 tools=TOOL_SPECS,
-                # Tool calls are structured JSON; ~128 tokens is plenty
-                # (largest spec is `pick_and_place` at ~80 tokens). 256 was
-                # the historical value but it leaves no headroom on 8 GB
-                # VRAM RTX 5070 (model_len=2048, system prompt ~1.8 k tokens
-                # after a few turns).
-                max_tokens=128,
+                max_tokens=step_max_tokens,
             )
             if not resp.tool_calls:
                 # 2026-09-03: small local LLMs sometimes forget to emit
@@ -270,7 +301,7 @@ class AgentOrchestrator:
                     })
                     return TaskReport(
                         task, False, forced_call.arguments["summary"],
-                        str(step), milestones, tool_log,
+                        step, milestones, tool_log,
                         duration_s=round(time.monotonic() - t_start, 2),
                     )
                 messages.append({"role": "assistant", "content": resp.text or "(no text)"})
@@ -289,28 +320,33 @@ class AgentOrchestrator:
             # tool_call in the assistant message lacks a matching result.
             call = resp.tool_calls[0]
 
-            # 2026-08-13: guard against "verify by re-placing" loops. After a
-            # successful pick_and_place, the object is already at its
-            # destination. Re-running pick_and_place just re-grabs and
-            # re-places the same object. Force task_done.
-            if (
-                self._pick_and_place_succeeded_in_task
-                and call.name == "pick_and_place"
-            ):
-                self.runtime.trace.record_event(
-                    "llm_force_task_done",
-                    {
-                        "reason": (
-                            "pick_and_place already succeeded in this task; "
-                            "calling it again would re-grab an object already "
-                            "at its destination"
-                        ),
-                        "original_call": {
-                            "name": call.name,
-                            "arguments": dict(call.arguments or {}),
-                        },
-                    },
+            # Guard against "verify by re-placing" loops on the SAME
+            # (object, destination) pair, while still permitting multi-object
+            # tasks to pick a different object next.
+            _pp_key = None
+            if call.name == "pick_and_place":
+                _args = call.arguments or {}
+                _pp_key = (
+                    str(_args.get("object", "")).strip().lower(),
+                    str(_args.get("destination", "") or "").strip().lower(),
                 )
+            if _pp_key is not None and _pp_key in self._completed_pick_places:
+                if self.runtime.trace is not None:
+                    self.runtime.trace.record_event(
+                        "llm_force_task_done",
+                        {
+                            "reason": (
+                                "pick_and_place already succeeded for this "
+                                "(object, destination) pair in this task; "
+                                "calling it again would re-grab an object already "
+                                "at its destination"
+                            ),
+                            "original_call": {
+                                "name": call.name,
+                                "arguments": dict(call.arguments or {}),
+                            },
+                        },
+                    )
                 call = ToolCall(
                     name="task_done",
                     arguments={
@@ -329,13 +365,12 @@ class AgentOrchestrator:
             result = self.runtime.execute(call.name, call.arguments)
             tool_log.append({"step": step, "tool": call.name, "args": call.arguments, "result": result})
 
-            # 2026-08-13: flag successful pick_and_place so the guard above can
-            # intercept any subsequent pick_and_place calls.
             if (
                 call.name == "pick_and_place"
                 and bool(result.get("ok"))
             ):
-                self._pick_and_place_succeeded_in_task = True
+                if _pp_key is not None:
+                    self._completed_pick_places.add(_pp_key)
                 self._consecutive_pick_failures = 0
             elif call.name == "pick_and_place" and not bool(result.get("ok")):
                 self._consecutive_pick_failures += 1
@@ -380,7 +415,7 @@ class AgentOrchestrator:
                     if forced_result.get("task_complete"):
                         return TaskReport(
                             task, False, forced_call.arguments["summary"],
-                            str(step), milestones, tool_log,
+                            step, milestones, tool_log,
                             duration_s=round(time.monotonic() - t_start, 2),
                         )
                     # If task_done itself errored, fall through to next step
@@ -409,14 +444,6 @@ class AgentOrchestrator:
             messages.append(
                 {"role": "tool", "tool_call_id": call.id or "call_0", "name": call.name, "content": content}
             )
-            # Sliding window: keep intro + last N to bound context growth
-            # (default N=8 ~= 4 assistant turns + 4 tool results). Each turn
-            # appends up to 3 entries (assistant w/ tool_calls, tool, extras);
-            # N=8 caps at ~3 turns of history which is plenty for short tasks.
-            _MAX_HISTORY = 8
-            if len(messages) > _MAX_HISTORY:
-                messages = messages[:1] + messages[-( _MAX_HISTORY - 1):]
-
             for extra in resp.tool_calls[1:]:
                 messages.append(
                     {
@@ -428,6 +455,11 @@ class AgentOrchestrator:
                         ),
                     }
                 )
+            # Sliding window: keep intro + newest tail, but NEVER orphan a
+            # role="tool" message from its preceding assistant(tool_calls)
+            # turn (OpenAI & Anthropic APIs reject orphaned tool messages
+            # with HTTP 400).
+            messages = self._trim_history(messages, max_history=8)
 
             # Failure escalation: one visual suggestion from the advisor.
             if not ok and self.advisor is not None and self.advisor.should_consult:
@@ -503,6 +535,17 @@ class AgentOrchestrator:
             ),
             None,
         )
+
+    @staticmethod
+    def _trim_history(messages: list[dict], max_history: int = 8) -> list[dict]:
+        """Keep intro + recent tail without ever starting the tail on an
+        orphaned role='tool' message (which breaks OpenAI/Anthropic APIs)."""
+        if len(messages) <= max_history:
+            return messages
+        start = len(messages) - (max_history - 1)
+        while start < len(messages) and messages[start].get("role") == "tool":
+            start += 1
+        return messages[:1] + messages[start:]
 
     @staticmethod
     def _prune_images(messages: list[dict]) -> list[dict]:

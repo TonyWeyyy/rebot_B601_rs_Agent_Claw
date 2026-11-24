@@ -38,7 +38,7 @@ confirmation. Calling list_objects will see the object at its destination and (i
 suggest it's still there, tempting you to re-place. This causes infinite re-placement \
 loops. Instead: pick_and_place success → IMMEDIATELY task_done(success=true, summary=...).
 - When done (success or honest failure), call task_done.
-- 2026-09-03 (no-matching-tool rule, critical): If the user asks for something that has NO matching tool in TOOL_SPECS (e.g. "wave hello", "tell me a joke", "sing a song", "what time is it"), DO NOT reason for multiple turns. Immediately call task_done(success=false, summary="No matching tool for: <restate the intent>"). The text-only loop detector will otherwise force-abort you with a worse error.
+- 2026-09-03 (no-matching-tool rule, critical): If the user asks for something that has NO matching tool in TOOL_SPECS (e.g. "tell me a joke", "sing a song", "what time is it"), DO NOT reason for multiple turns. Immediately call task_done(success=false, summary="No matching tool for: <restate the intent>"). The text-only loop detector will otherwise force-abort you with a worse error.
 
 EXAMPLES:
 User: "put the banana in the box"

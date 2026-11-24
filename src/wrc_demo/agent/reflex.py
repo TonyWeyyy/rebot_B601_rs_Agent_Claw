@@ -111,7 +111,13 @@ _RULES: list[tuple[re.Pattern, str]] = [
         re.compile(rf"^(?:point\s+(?:at|to)|show\s+me|senala|señala)\s+{_ART}(?P<obj>.+)$"),
         None,  # point_at deleted 2026-08-13
     ),
-(re.compile(r"^(?:wave|say\s+hi|say\s+hello|saluda)(?:\s+(?:at|to)\s+\S.*)?$"), None),  # wave re-implemented 2026-09-03 (see skill_wave in runtime.py)
+    (
+        re.compile(
+            r"^(?:wave(?:\s+hello|\s+hi)?|say\s+hi|say\s+hello|saluda)(?:\s+(?:at|to)\s+\S.*)?$"
+            r"|^(?:请)?(?:挥手|挥挥手|打招呼|打个招呼|招手|招招手)(?:吧)?[。.!]?$"
+        ),
+        "wave",
+    ),
     (
         # "go home" / "park the arm" / "回到 home" / "请到初始的原点位置" / "ve a casa"
         # — single move_home() call, never goes through LLM (cheap, deterministic).
@@ -289,12 +295,22 @@ _STOPWORDS = frozenset(
 
 def _embed(text: str, dim: int = 256) -> np.ndarray:
     """Deterministic hashed bag-of-words embedding over content words (no
-    model, no network); stopwords out so "hand me the X" == "hand me that X"."""
+    model, no network); stopwords out so "hand me the X" == "hand me that X".
+
+    Supports both Latin/alphanumeric words and CJK characters (unigrams +
+    bigrams) so Chinese instructions also match in Tier-2 ExperienceMemory.
+    """
     v = np.zeros(dim, dtype=np.float64)
-    for tok in re.findall(r"[a-z0-9]+", text.lower()):
-        if tok in _STOPWORDS:
-            continue
-        h = crc32(tok.encode())
+    low = text.lower()
+    tokens: list[str] = [
+        tok for tok in re.findall(r"[a-z0-9]+", low) if tok not in _STOPWORDS
+    ]
+    for run in re.findall(r"[\u4e00-\u9fff]+", low):
+        tokens.extend(run)
+        if len(run) >= 2:
+            tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
+    for tok in tokens:
+        h = crc32(tok.encode("utf-8"))
         v[h % dim] += 1.0 if (h >> 16) & 1 else -1.0
     n = float(np.linalg.norm(v))
     return v / n if n > 0 else v

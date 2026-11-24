@@ -31,3 +31,4 @@ model: ${repo}/models/qwen3-vl-2b-awq-4bit
 api_key: EMPTY
 supports_vision: false
 temperature: 0.2
+max_tokens: 128

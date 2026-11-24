@@ -107,6 +107,7 @@ class OpenAICompatClient(LLMClient):
         self._client = OpenAI(
             base_url=base_url, api_key=api_key, http_client=proxy_bypass_http
         )
+        self.api_key = api_key
         self.model = model
         self.supports_vision = supports_vision
         self.temperature = temperature
@@ -313,7 +314,9 @@ class MockLLM(LLMClient):
         return self._script.pop(0)
 
 
-def make_llm(cfg: Cfg) -> LLMClient:
+def make_llm(cfg: Cfg | dict) -> LLMClient:
+    if isinstance(cfg, dict):
+        cfg = Cfg(cfg)
     kind = cfg.type
     if kind == "mock":
         # Default wiring-check script: observe once, then finish honestly.

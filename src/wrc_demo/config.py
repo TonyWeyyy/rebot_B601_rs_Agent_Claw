@@ -114,5 +114,9 @@ def load_demo_config(
     main["camera"] = cams[0]
     main["cameras"] = cams
     main["arm"] = load_profile("arms", arm, cdir).as_dict()
-    main["llm"] = load_profile("llm", llm, cdir).as_dict()
+    base_llm = main.get("llm") if isinstance(main.get("llm"), dict) else {}
+    llm_prof = load_profile("llm", llm, cdir).as_dict()
+    if "fallback" in base_llm and "fallback" not in llm_prof:
+        llm_prof["fallback"] = base_llm["fallback"]
+    main["llm"] = llm_prof
     return Cfg(main)
