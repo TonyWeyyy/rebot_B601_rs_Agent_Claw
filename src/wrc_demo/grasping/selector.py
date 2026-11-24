@@ -21,6 +21,7 @@ def select_grasp(
     pregrasp_offset_m: float = 0.12,
     validate=None,
     ik_retries: int = 3,
+    preserve_order: bool = False,
 ) -> tuple[Grasp, np.ndarray, np.ndarray]:
     """-> (grasp, q_pregrasp, q_grasp) for the best executable candidate.
 
@@ -29,15 +30,13 @@ def select_grasp(
     candidate that would abort mid-descent must lose the ranking here, not
     kill the attempt later.
 
-    ik_retries (default 3) seeds the DLS solver with random restarts; the
-    first guess from ``q_current`` (typically ``home_q``) often lands in
-    a different basin than the candidate's true minimum, and a single
-    solve is enough to falsely mark an otherwise-reachable pose as
-    unreachable. The IK params (``Kinematics.ik``) take care of the
-    5e-3 / 2000-iter tuning; retries just add basin hops.
+    When ``preserve_order=True`` (e.g. candidates were already ranked by
+    ``GraspOutcomeMemory.rerank``), keep the caller's ordering instead of
+    re-sorting strictly by raw ``g.quality``.
     """
     reasons: list[str] = []
-    for g in sorted(grasps, key=lambda g: -g.quality):
+    ordered = list(grasps) if preserve_order else sorted(grasps, key=lambda g: -g.quality)
+    for g in ordered:
         if g.width_m > max_width_m:
             reasons.append(
                 f"{g.label}: required width {g.width_m * 1000:.0f}mm > gripper "

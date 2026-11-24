@@ -9,6 +9,9 @@ detector:
   type: mock
   label: "red cube"
 
+# Default vocabulary for the synthetic mock scene (keeps real-rig demo.yaml untouched)
+detect_classes: ["red cube", "box", "banana", "toy"]
+
 extrinsics:
   mode: eye_to_hand
   # Camera at (0.28, 0, 0.60) in base frame, optical axis straight down:

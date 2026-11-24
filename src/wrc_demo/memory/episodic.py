@@ -44,9 +44,13 @@ class EpisodicMemory:
         clock=time.monotonic,
     ):
         self.horizon_s = horizon_s
+        self._max_events = int(max_events)
+        self._embed_dim = embed_dim
+        self._embed_bits = embed_bits
         self._events: deque[MemoryEvent] = deque(maxlen=max_events)
         self._thumb_width = thumb_width
         self._index = QuantizedIndex(embed_dim, bits=embed_bits) if embed_dim else None
+        self._indexed_vecs: deque[tuple[np.ndarray, MemoryEvent]] = deque(maxlen=max_events)
         self._clock = clock
         self._lock = threading.RLock()
 
@@ -73,7 +77,9 @@ class EpisodicMemory:
         with self._lock:
             self._events.append(ev)
             if self._index is not None and embedding is not None:
-                self._index.add(embedding, meta=ev)
+                emb = np.asarray(embedding, dtype=np.float64).copy()
+                self._index.add(emb, meta=ev)
+                self._indexed_vecs.append((emb, ev))
             self.prune(now)
         return ev
 
@@ -82,6 +88,18 @@ class EpisodicMemory:
         with self._lock:
             while self._events and now - self._events[0].t > self.horizon_s:
                 self._events.popleft()
+            # Compact the vector index whenever stale entries exceed live events
+            # + 2x max_events so long-running sessions never leak memory.
+            if self._index is not None and len(self._index) > 2 * self._max_events:
+                live = {id(e) for e in self._events}
+                rebuilt = QuantizedIndex(self._embed_dim, bits=self._embed_bits)
+                kept: deque[tuple[np.ndarray, MemoryEvent]] = deque(maxlen=self._max_events)
+                for emb, ev in self._indexed_vecs:
+                    if id(ev) in live:
+                        rebuilt.add(emb, meta=ev)
+                        kept.append((emb, ev))
+                self._index = rebuilt
+                self._indexed_vecs = kept
 
     # ── recall ───────────────────────────────────────────────────────────
 

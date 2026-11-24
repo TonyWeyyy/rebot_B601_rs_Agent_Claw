@@ -152,17 +152,19 @@ def _residual_vec(
     param: np.ndarray,
     samples: Sequence[CalibrationSample],
     weights: np.ndarray,
-    delta: float,
 ) -> np.ndarray:
-    """Residual vector flattened for least_squares."""
+    """Weighted SE(3) residual vector flattened for ``scipy.optimize.least_squares``.
+
+    Huber robustness is applied via ``least_squares(..., loss='huber', f_scale=delta)``
+    so the objective is genuinely quadratic inside ``delta`` and linear outside
+    (passing ``huber_loss(r)`` directly into ``least_squares`` previously
+    squared it a second time into a poorly conditioned quartic ``r^4``).
+    """
     X, Y = _param_to_se3(param)
     out = np.empty(6 * len(samples))
     for i, s in enumerate(samples):
         r = se3_log_residual(s.T_gripper2base, s.T_marker2cam, X, Y)
-        # Huber on per-sample norm, scaled by inverse sample weight so
-        # outliers get pulled up (smaller weight = stronger pull).
-        r_loss = huber_loss(r, delta) * weights[i]
-        out[6 * i : 6 * i + 6] = r_loss
+        out[6 * i : 6 * i + 6] = r * weights[i]
     return out
 
 
@@ -172,13 +174,14 @@ def joint_solve(
     delta: float = 1.5e-3,  # 1.5 mm / rad
     robust: bool = True,
     outlier_iterations: int = 2,
+    p0_init: np.ndarray | None = None,
 ) -> JointSolveResult:
     """Joint SE(3) least-squares fit.
 
     ``samples`` must contain at least 4 inlier observations for an
-    identifiable solve (12 dof, 6 per rigid pair). The first robust
-    iteration runs with all weights = 1; subsequent iterations reweight
-    samples whose 6-vec residual norm is > 3 * MAD down by 10x.
+    identifiable solve (12 dof, 6 per rigid pair). Uses Trust Region
+    Reflective with Huber loss (``f_scale=delta``) and iteratively
+    reweights outliers whose residual norm exceeds ``med + 3 * MAD``.
     """
     if len(samples) < 4:
         raise ValueError(f"need >=4 samples for joint solve, got {len(samples)}")
@@ -191,69 +194,63 @@ def joint_solve(
         if not (is_se3(g) and is_se3(m)):
             raise ValueError("samples must contain SE(3) matrices")
 
-    # X_0 = G_0 M_0^{-1}, Y_0 = I -- identity for the marker-to-gripper
-    X0 = G[0] @ np.linalg.inv(M[0])
-    Y0 = np.eye(4)
-    p0 = _se3_to_param(X0, Y0)
+    if p0_init is not None:
+        p0 = np.asarray(p0_init, dtype=float).reshape(12).copy()
+    else:
+        # X_0 = G_0 M_0^{-1}, Y_0 = I -- identity for the marker-to-gripper
+        X0 = G[0] @ np.linalg.inv(M[0])
+        Y0 = np.eye(4)
+        p0 = _se3_to_param(X0, Y0)
 
     weights = np.ones(len(samples))
 
-    best: tuple[float, JointSolveResult] | None = None
     for outer in range(outlier_iterations + 1):
         res = least_squares(
             _residual_vec, p0,
-            args=(samples, weights, delta),
-            method="lm", max_nfev=400,
+            args=(samples, weights),
+            method="trf",
+            loss="huber" if robust else "linear",
+            f_scale=max(float(delta), 1e-6),
+            max_nfev=400,
         )
         p0 = res.x
         if not robust or outer == outlier_iterations:
             break
-        # Reweight by residual norm vs median absolute deviation.
+        # Reweight by residual norm vs median + 3 * MAD.
         with np.errstate(invalid="ignore"):
             norms = np.array([
                 float(np.linalg.norm(se3_log_residual(G[i], M[i], *_param_to_se3(p0))))
                 for i in range(len(samples))
             ])
         med = float(np.median(norms)) if len(norms) else 0.0
-        mad = float(np.median(np.abs(norms - med))) + 1e-9
-        thresh = 3.0 * mad
+        mad = float(np.median(np.abs(norms - med)))
+        thresh = med + max(3.0 * mad, 1e-6)
         weights = np.where(norms > thresh, 0.1, 1.0)
 
     X, Y = _param_to_se3(p0)
-    # Per-sample SE(3) log residual vector [tx, ty, tz, rx, ry, rz] (m, rad)
-    # -- used both for the outlier 3*MAD test (on the L2 norm) and for the
-    # per-axis metric computation.
     with np.errstate(invalid="ignore"):
         res_6d = np.array([
             se3_log_residual(G[i], M[i], X, Y) for i in range(len(samples))
         ])
     norms = np.linalg.norm(res_6d, axis=1)
     med = float(np.median(norms)) if len(norms) else 0.0
-    mad = float(np.median(np.abs(norms - med))) + 1e-9
-    thresh = 3.0 * mad
+    mad = float(np.median(np.abs(norms - med)))
+    thresh = med + max(3.0 * mad, 1e-6)
     inliers = tuple(int(i) for i, n in enumerate(norms) if n <= thresh)
     outliers = tuple(int(i) for i, n in enumerate(norms) if n > thresh)
 
-    # Aggregate metrics. ``res_6d[list(inliers)]`` keeps the per-axis
-    # split so we can report translation in mm and rotation in deg as
-    # independent quantities (the old combined SE(3) norm is preserved
-    # under the ``se3_log_norm_*`` keys for backward compatibility).
     inlier_res = res_6d[list(inliers)] if inliers else res_6d
     metrics = _metrics_from_norms(inlier_res, norms)
     metrics["lm_converged"] = bool(np.isfinite(res.fun).all())
     metrics["lm_iterations"] = int(getattr(res, "nfev", 0))
 
-    result = JointSolveResult(
+    return JointSolveResult(
         T_cam2base=X,
         T_marker2gripper=Y,
         inliers=inliers,
         outliers=outliers,
         metrics=metrics,
     )
-    if best is None or metrics["total_loss"] < best[0]:
-        best = (metrics["total_loss"], result)
-    assert best is not None
-    return best[1]
 
 
 def _metrics_from_norms(
@@ -341,21 +338,20 @@ def joint_solve_restart(
     n_restart: int = 8,
     seed: int = 0,
 ) -> JointSolveResult:
-    """Multi-start joint solve. Best loss wins.
+    """Multi-start joint solve on the REAL samples. Best median residual wins.
 
     Restart strategy:
-      k=0 -- vanilla ``joint_solve(samples)`` with X0 = G[0] @ inv(M[0]),
-             Y0 = I.
-      k>0 -- construct a fake dataset that has a known perfect solution
-             ``(X*, Y*) = (base @ perturb_R, perturb_t)`` so the optimizer
-             converges quickly, then **re-score the result on the real
-             samples**. We cannot trust ``r.metrics`` (computed on fake
-             data) for picking the winner -- only the per-sample SE(3)
-             log residuals on the real data are meaningful.
+      k=0 -- canonical seed ``X0 = G[0] @ inv(M[0]), Y0 = I``.
+      k>0 -- pick a sample anchor ``G[idx] @ inv(M[idx])`` + Gaussian SE(3)
+             perturbation as ``p0_init`` and run ``joint_solve`` directly on
+             the real samples, escaping local minima without ever fitting
+             synthetic fake data.
     """
+    if len(samples) < 4:
+        raise ValueError(f"need >=4 samples for joint solve, got {len(samples)}")
     rng = np.random.default_rng(seed)
 
-    def _score(fit):
+    def _score(fit: JointSolveResult) -> float:
         X = np.asarray(fit.T_cam2base, dtype=float)
         Y = np.asarray(fit.T_marker2gripper, dtype=float)
         norms = np.array([
@@ -366,45 +362,21 @@ def joint_solve_restart(
 
     best: JointSolveResult | None = None
     best_score = float("inf")
-    for k in range(n_restart):
-        try:
-            r = joint_solve(samples)
-        except Exception:
-            continue
-        score = _score(r)
-        if score < best_score:
-            best, best_score = r, score
-
+    for k in range(max(1, int(n_restart))):
         if k == 0:
-            continue  # k=0 already ran joint_solve on real samples above
-
-        # Perturb X0 = G[0] @ inv(M[0]) and re-fit on a fake dataset that
-        # admits a perfect solution near the perturbation. The fake
-        # solve's own metrics are meaningless -- only the score we
-        # compute above on the real samples counts.
-        perturb = rng.normal(scale=0.05, size=12)
-        from .calib_dataset import CalibrationSample as _CS
-
-        fake = []
-        G0 = samples[0].T_gripper2base
-        M0 = samples[0].T_marker2cam
-        base = G0 @ np.linalg.inv(M0)
-        for s in samples:
-            pX = _se3_to_param(base, np.eye(4))
-            pX = pX + perturb
-            X, Y = _param_to_se3(pX)
-            fake.append(_CS(
-                pose_label=s.pose_label,
-                T_gripper2base=X @ s.T_marker2cam @ np.linalg.inv(Y),
-                T_marker2cam=s.T_marker2cam,
-            ))
+            p0_init = None
+        else:
+            anchor = samples[k % len(samples)]
+            X_seed = anchor.T_gripper2base @ np.linalg.inv(anchor.T_marker2cam)
+            p0_base = _se3_to_param(X_seed, np.eye(4))
+            p0_init = p0_base + rng.normal(scale=0.05, size=12)
         try:
-            r_fake = joint_solve(fake)
+            fit = joint_solve(samples, p0_init=p0_init)
         except Exception:
             continue
-        score_fake = _score(r_fake)
-        if score_fake < best_score:
-            best, best_score = r_fake, score_fake
+        score = _score(fit)
+        if np.isfinite(score) and score < best_score:
+            best, best_score = fit, score
 
     if best is None:
         raise RuntimeError("joint_solve_restart: no fit converged")

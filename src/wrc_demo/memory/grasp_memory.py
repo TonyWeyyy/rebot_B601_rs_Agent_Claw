@@ -33,12 +33,28 @@ from pathlib import Path
 import numpy as np
 
 
+def _circular_pi_diff(a: float, b: float) -> float:
+    """Shortest angular difference on the π-periodic parallel-jaw yaw circle."""
+    d = abs((a - b) % math.pi)
+    return min(d, math.pi - d)
+
+
+def _circular_pi_ema(prev: float, cur: float, ema: float) -> float:
+    """EMA on the π-periodic circle using doubled-angle unit vectors."""
+    c = (1.0 - ema) * math.cos(2.0 * prev) + ema * math.cos(2.0 * cur)
+    s = (1.0 - ema) * math.sin(2.0 * prev) + ema * math.sin(2.0 * cur)
+    return (0.5 * math.atan2(s, c)) % math.pi
+
+
 def object_profile(label: str, extent) -> str:
     """A coarse, scene-independent key for an object.
 
     label + size bucket + height bucket. Buckets keep near-identical objects
     (a 5 cm cube here vs a 5.2 cm cube next run) on the SAME memory row while
     keeping a banana and a tall bottle apart. Absolute coords never enter.
+    OBB extents are eigenvalue-ordered (not axis-aligned), so we use sorted
+    extents (middle = footprint proxy, smallest = thickness/height proxy)
+    instead of indexing ``e[2]``.
     """
     e = np.asarray(extent, dtype=float)
     if e.size < 3 or not np.all(np.isfinite(e)):
@@ -46,8 +62,7 @@ def object_profile(label: str, extent) -> str:
     else:
         srt = np.sort(np.abs(e))
         footprint = float(srt[1])   # middle axis ~ horizontal footprint
-        height = float(srt[0]) if srt[0] < srt[2] else float(e[2])
-        height = abs(float(e[2])) if np.isfinite(e[2]) else height
+        height = float(srt[0])      # smallest principal extent
     fb = round(footprint / 0.03) * 3          # 3 cm buckets -> "3", "6", "9" cm
     hb = round(height / 0.03) * 3
     base = (label or "object").strip().lower().replace(" ", "_")
@@ -176,13 +191,32 @@ class GraspOutcomeMemory:
             for k, w in (("approach_vert", 1.0), ("yaw_rel", 0.5),
                          ("depth_frac", 0.8), ("width_norm", 0.4)):
                 if k in wf:
-                    d += w * (f[k] - wf[k]) ** 2
+                    diff = (
+                        _circular_pi_diff(f[k], wf[k])
+                        if k == "yaw_rel"
+                        else (f[k] - wf[k])
+                    )
+                    d += w * (diff ** 2)
             # blend with the model's own quality score (keep it in charge)
             base_q = float(getattr(g, "quality", 0.0))
             vert_bonus = prefer_vert * f["approach_vert"]
             return base_q + 0.5 * (-math.sqrt(d)) + 0.3 * vert_bonus
 
-        return sorted(grasps, key=_score, reverse=True)
+        ranked = sorted(grasps, key=_score, reverse=True)
+        # Update quality monotonically (preserving score order) so downstream
+        # selectors that sort by -g.quality honor the learned ranking too.
+        out = []
+        for g in ranked:
+            g_copy = g
+            if hasattr(g, "quality"):
+                try:
+                    import copy as _copy
+                    g_copy = _copy.copy(g)
+                    g_copy.quality = float(_score(g))
+                except Exception:
+                    pass
+            out.append(g_copy)
+        return out
 
     def grasp_z_nudge(self, label: str, fix) -> float:
         prior = self.prior(label, fix)
@@ -203,8 +237,13 @@ class GraspOutcomeMemory:
                 st.wins += 1
                 # EMA the winning features toward this success
                 for k, v in feats.items():
-                    st.win_features[k] = round(
-                        self._ema * v + (1 - self._ema) * st.win_features.get(k, v), 3)
+                    prev = st.win_features.get(k, v)
+                    if k == "yaw_rel":
+                        st.win_features[k] = round(_circular_pi_ema(prev, v, self._ema), 3)
+                    else:
+                        st.win_features[k] = round(
+                            self._ema * v + (1 - self._ema) * prev, 3
+                        )
                 # a success that used a z-nudge reinforces it; otherwise decay
                 cur = st.nudges.get("grasp_z_delta", 0.0)
                 st.nudges["grasp_z_delta"] = round(

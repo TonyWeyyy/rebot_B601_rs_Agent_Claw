@@ -113,13 +113,14 @@ class Extrinsics:
                 file=sys.stderr,
             )
         T = np.asarray(data["T_cam2base"], dtype=float)
-        T_marker = np.asarray(data["T_marker2gripper"], dtype=float)
-        # For eye_in_hand profiles, the JSON's T_cam2base is actually the
-        # static cam->gripper matrix (we don't yet produce eye_in_hand JSONs;
-        # keep the data dict for future use).
         if mode == "eye_in_hand":
+            # Prefer explicit T_cam2gripper if present in EIH JSONs; fall back
+            # to T_marker2gripper only for legacy schemas.
+            T_eih = np.asarray(
+                data.get("T_cam2gripper", data["T_marker2gripper"]), dtype=float
+            )
             return cls(
-                mode=mode, T=T_marker, fk_tcp2base=fk_tcp2base,
+                mode=mode, T=T_eih, fk_tcp2base=fk_tcp2base,
                 source=f"new-json:{jp.name}", frame_convention=fc,
                 schema_version=schema_version,
                 hand_eye_compensation_m=hand_eye_compensation_m,

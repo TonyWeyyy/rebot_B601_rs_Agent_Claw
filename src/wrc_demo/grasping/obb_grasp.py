@@ -152,16 +152,6 @@ def plan_grasps_from_fix(
         table_z + min_grasp_z_above_table,
     )
 
-    # Approach vector points down at the configured pitch; convert to a
-    # numpy array for the Grasp dataclass (it expects a 3-vector).
-    sp = np.sin(approach_pitch_rad)
-    cp = np.cos(approach_pitch_rad)
-    # Convention: down is -z when pitch=0, but we want the approach to
-    # point into the object — so we negate. Use yaw=0 as a placeholder;
-    # the actual yaw comes from the OBB axis below and gets folded into
-    # _approach_rotation.
-    approach_template = np.array([0.0, 0.0, -1.0])  # placeholder
-
     grasps: list[Grasp] = []
     for rank, (width, axis) in enumerate(horiz[:2]):
         yaw = float(np.arctan2(axis[1], axis[0]))

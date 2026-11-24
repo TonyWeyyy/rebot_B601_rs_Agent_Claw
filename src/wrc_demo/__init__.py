@@ -44,10 +44,11 @@ _orig_attempt_download_asset = None
 _ultralytics_patch_applied = False
 
 
-def _patch_ultralytics_text_encoder_pin():
+def _patch_ultralytics_text_encoder_pin(mod=None):
     """Monkey-patch ultralytics' asset downloader (lazy, idempotent).
 
-    Loads `ultralytics.utils.downloads` once, swaps in the CWD-independent
+    Loads `ultralytics.utils.downloads` once (or patches the passed module
+    object directly from the import hook), swaps in the CWD-independent
     resolver for the pinned text encoders, and never touches it again.
     Silently no-ops if ultralytics isn't installed (mock stack / unit
     tests where the detector is MockDetector anyway).
@@ -55,12 +56,15 @@ def _patch_ultralytics_text_encoder_pin():
     global _orig_attempt_download_asset, _ultralytics_patch_applied
     if _ultralytics_patch_applied:
         return True
+    if mod is None:
+        try:
+            from ultralytics.utils import downloads as mod
+        except ImportError:
+            return False  # ultralytics not installed; nothing to patch
+    if not hasattr(mod, "attempt_download_asset"):
+        return False
     _ultralytics_patch_applied = True
-    try:
-        from ultralytics.utils import downloads as _ultralytics_downloads
-    except ImportError:
-        return False  # ultralytics not installed; nothing to patch
-    _orig_attempt_download_asset = _ultralytics_downloads.attempt_download_asset
+    _orig_attempt_download_asset = mod.attempt_download_asset
 
     def _attempt_download_asset_pinned(file, *args, **kwargs):
         from pathlib import Path as _P
@@ -71,8 +75,55 @@ def _patch_ultralytics_text_encoder_pin():
                     return str(candidate)
         return _orig_attempt_download_asset(file, *args, **kwargs)
 
-    _ultralytics_downloads.attempt_download_asset = _attempt_download_asset_pinned
+    mod.attempt_download_asset = _attempt_download_asset_pinned
     return True
+
+
+def _install_ultralytics_import_hook() -> None:
+    """Install a lightweight sys.meta_path hook that applies the text-encoder
+    pin ONLY when ``ultralytics.utils.downloads`` is actually imported.
+
+    Zero overhead and zero torch/ultralytics imports on the mock stack;
+    automatic pinning on any path that imports ultralytics.
+    """
+    if "ultralytics.utils.downloads" in sys.modules:
+        _patch_ultralytics_text_encoder_pin(sys.modules["ultralytics.utils.downloads"])
+        return
+
+    import importlib.machinery
+
+    class _UltralyticsPinFinder:
+        _active = False
+
+        @classmethod
+        def find_spec(cls, fullname, path, target=None):
+            if fullname != "ultralytics.utils.downloads" or cls._active:
+                return None
+            cls._active = True
+            try:
+                spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+            finally:
+                cls._active = False
+            if spec is None or spec.loader is None:
+                return spec
+            orig_loader = spec.loader
+
+            class _PatchedLoader:
+                def create_module(self, s):
+                    return orig_loader.create_module(s) if hasattr(orig_loader, "create_module") else None
+
+                def exec_module(self, module):
+                    orig_loader.exec_module(module)
+                    _patch_ultralytics_text_encoder_pin(module)
+
+            spec.loader = _PatchedLoader()
+            return spec
+
+    if not any(getattr(f, "__name__", "") == "_UltralyticsPinFinder" for f in sys.meta_path):
+        sys.meta_path.insert(0, _UltralyticsPinFinder)
+
+
+_install_ultralytics_import_hook()
 
 
 def _attempt_download_asset_passthrough(file, *args, **kwargs):

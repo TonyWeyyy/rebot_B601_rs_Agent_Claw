@@ -71,9 +71,16 @@ class VLMGrounder:
         api_key: str = "EMPTY",
         timeout_s: float = 20.0,
     ):
+        import httpx
         from openai import OpenAI  # lazy heavy import
 
-        self._client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout_s)
+        # Bypass host HTTP/SOCKS proxy env vars (matching OpenAICompatClient).
+        self._client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout_s,
+            http_client=httpx.Client(trust_env=False, timeout=timeout_s),
+        )
         self._model = model
 
     def ground(self, frame, query: str) -> Detection | None:

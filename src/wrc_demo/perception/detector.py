@@ -33,12 +33,15 @@ class OpenVocabDetector(Detector):
         device: str = "cuda:0",
         conf: float = 0.25,
     ):
+        from .. import _patch_ultralytics_text_encoder_pin
+        _patch_ultralytics_text_encoder_pin()
         from ultralytics import YOLO  # lazy heavy import
 
         self._model = YOLO(model_path)
         self._device = device
         self._conf = conf
         self._classes: list[str] = []
+        self._pe_cache: dict[tuple[str, ...], object] = {}
         self._filter_only = False  # closed-set model: filter by label instead
         if classes:
             self.set_classes(classes)
@@ -47,11 +50,19 @@ class OpenVocabDetector(Detector):
         if list(classes) == self._classes:
             return
         # YOLOE needs text embeddings passed explicitly; YOLO-World does not.
-        # Closed-set models (yolo11n, ...) have no set_classes at all: fall
-        # back to post-filtering detections by label (self._filter_only).
+        # Cache CLIP text embeddings by class tuple so WorldWatcher (default
+        # vocabulary) and SkillRuntime._localize (single target) alternating
+        # never recompute text features repeatedly.
         self._filter_only = False
+        key = tuple(classes)
         try:
-            self._model.set_classes(classes, self._model.get_text_pe(classes))
+            pe = self._pe_cache.get(key)
+            if pe is None:
+                pe = self._model.get_text_pe(classes)
+                if len(self._pe_cache) >= 64:
+                    self._pe_cache.clear()
+                self._pe_cache[key] = pe
+            self._model.set_classes(classes, pe)
         except (AttributeError, TypeError):
             try:
                 self._model.set_classes(classes)
