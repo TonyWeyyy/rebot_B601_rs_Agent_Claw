@@ -42,7 +42,12 @@ __all__ = [
 ]
 
 
-def make_arm(cfg: Cfg, kinematics: Kinematics | None = None) -> Arm:
+def make_arm(
+    cfg: Cfg,
+    kinematics: Kinematics | None = None,
+    *,
+    harness: SafetyHarness | None = None,
+) -> Arm:
     """Build the arm requested by ``cfg.arm['type']``.
 
     For ``rebot_rs`` this assembles the full real-arm stack:
@@ -61,10 +66,6 @@ def make_arm(cfg: Cfg, kinematics: Kinematics | None = None) -> Arm:
 
     if arm_type == "mock":
         arm = MockArm(cfg.arm, kinematics=kinematics)
-        arm.connect()
-        arm.grasp_bridge = None
-        return arm
-
         arm.connect()
         arm.grasp_bridge = None
         return arm
@@ -119,10 +120,13 @@ def make_arm(cfg: Cfg, kinematics: Kinematics | None = None) -> Arm:
         gripper = WrcGripper(sdk_arm, sdk_ctrl)
         gripper.start()
 
-        harness = SafetyHarness(
-            SafetyLimits.from_config(cfg.safety), kinematics=kinematics
+        if harness is None:
+            harness = SafetyHarness(
+                SafetyLimits.from_config(cfg.safety), kinematics=kinematics
+            )
+        safe_arm = SafeArm(
+            sdk_arm, sdk_ctrl, harness, kinematics, cfg.arm, gripper=gripper,
         )
-        safe_arm = SafeArm(sdk_arm, sdk_ctrl, harness, kinematics, cfg.arm)
         safe_arm.grasp_bridge = RebotGraspBridge(
             sdk_ctrl, gripper, harness=harness,
         )

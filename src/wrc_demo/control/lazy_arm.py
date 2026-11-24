@@ -11,7 +11,100 @@ from __future__ import annotations
 
 import threading
 
+from ..types import SafetyViolation
 from .arm_base import ArmBase
+
+
+class LazySafeArm:
+    """Defer real-arm motor bring-up until the first motion command.
+
+    Holds a pre-built ``SafetyHarness`` so ``WorldWatcher`` can heartbeat it
+    at 3 Hz and ``emergency_stop`` can latch e-stop WITHOUT powering the CAN
+    bus or enabling motors. Once materialized, delegates all motion and
+    anti-drop shutdown (``SafeArm.disconnect``) to the underlying ``SafeArm``.
+    """
+
+    def __init__(self, factory, harness, n_joints: int = 6):
+        self._factory = factory
+        self._harness = harness
+        self._n_joints_default = int(n_joints)
+        self._arm = None
+        self._lock = threading.Lock()
+
+    def _ensure(self):
+        with self._lock:
+            if self._arm is None:
+                if self._harness is not None and self._harness.estopped:
+                    raise SafetyViolation("e-stopped")
+                self._arm = self._factory()
+            return self._arm
+
+    @property
+    def connected(self) -> bool:
+        return self._arm is not None
+
+    @property
+    def harness(self):
+        return self._arm.harness if self._arm is not None else self._harness
+
+    @property
+    def n_joints(self) -> int:
+        return self._arm.n_joints if self._arm is not None else self._n_joints_default
+
+    @property
+    def grasp_bridge(self):
+        return getattr(self._ensure(), "grasp_bridge", None)
+
+    def connect(self) -> None:
+        """Deliberate no-op: materialization happens on first motion."""
+
+    def disconnect(self) -> None:
+        with self._lock:
+            if self._arm is not None:
+                self._arm.disconnect()
+                self._arm = None
+
+    def stop(self) -> None:
+        """Latch e-stop without powering up a never-materialized arm."""
+        if self._harness is not None:
+            self._harness.estop(reason="lazy_safe_arm.stop()")
+        if self._arm is not None:
+            self._arm.stop()
+
+    def resume(self) -> None:
+        if self._harness is not None:
+            self._harness.reset_estop()
+        if self._arm is not None:
+            self._arm.resume()
+
+    def get_state(self):
+        return self._ensure().get_state()
+
+    def move_joints(self, *args, **kwargs) -> bool:
+        return self._ensure().move_joints(*args, **kwargs)
+
+    def move_joints_path(self, *args, **kwargs) -> bool:
+        return self._ensure().move_joints_path(*args, **kwargs)
+
+    def move_cartesian(self, *args, **kwargs) -> bool:
+        return self._ensure().move_cartesian(*args, **kwargs)
+
+    def home(self, *args, **kwargs) -> bool:
+        return self._ensure().home(*args, **kwargs)
+
+    def set_gripper(self, *args, **kwargs) -> None:
+        self._ensure().set_gripper(*args, **kwargs)
+
+    def open_gripper(self, *args, **kwargs) -> None:
+        self._ensure().open_gripper(*args, **kwargs)
+
+    def close_gripper_two_stage(self, *args, **kwargs):
+        return self._ensure().close_gripper_two_stage(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._ensure(), name)
 
 
 class LazyArm(ArmBase):

@@ -70,6 +70,9 @@ class Kinematics:
         self._data = self._model.createData()
         self._ee_frame_id = self._model.getFrameId(ee_frame)
         self._n_arm = int(arm_joint_count)
+        # Pinocchio's mutable Data workspace is not thread-safe; serialize
+        # fk/ik/link_positions across WorldWatcher, main thread, and _send_loop.
+        self._lock = threading.RLock()
 
         # Pull joint limits via SDK's helper (vendor-patched to use idx_q
         # so 2-finger gripper URDFs don't crash — see sdk/README.md).
@@ -90,9 +93,10 @@ class Kinematics:
 
     def fk(self, q: np.ndarray) -> np.ndarray:
         """4×4 SE3 of the end-effector in the asset frame."""
-        q = self._pad(q)
-        _, _, T = compute_fk(self._model, q)
-        return T
+        with self._lock:
+            q = self._pad(q)
+            _, _, T = compute_fk(self._model, q)
+            return T
 
     def ik(
         self,
@@ -147,18 +151,19 @@ class Kinematics:
             T_target[:3, 3], rot=T_target[:3, :3],
         )
         params = IKParams(max_iter=2000, tolerance=5e-3, step_size=0.5, damping=1e-6)
-        if retries > 0:
-            result = solve_ik_with_retry(
-                self._model, self._data, self._ee_frame_id,
-                T_se3, q_init, params, max_retries=retries,
-                controlled_joints=self._n_arm,
-            )
-        else:
-            result = solve_ik(
-                self._model, self._data, self._ee_frame_id,
-                T_se3, q_init, params,
-                controlled_joints=self._n_arm,
-            )
+        with self._lock:
+            if retries > 0:
+                result = solve_ik_with_retry(
+                    self._model, self._data, self._ee_frame_id,
+                    T_se3, q_init, params, max_retries=retries,
+                    controlled_joints=self._n_arm,
+                )
+            else:
+                result = solve_ik(
+                    self._model, self._data, self._ee_frame_id,
+                    T_se3, q_init, params,
+                    controlled_joints=self._n_arm,
+                )
         # Post-clamp to honour the limit_margin invariant. The SDK
         # solver can land q at the URDF edge; the harness's own 0.020
         # joint_margin then rejects the motion as "joint N out of
@@ -182,14 +187,15 @@ class Kinematics:
         safely above the table while link7 is already buried in it.
         """
         import pinocchio as pin
-        q = self._pad(q)
-        pin.forwardKinematics(self._model, self._data, q)
-        pin.updateFramePlacements(self._model, self._data)
-        # joints[1..n_arm] = arm joints; joints[n_arm+1..njoints-1] = gripper
-        # (we don't expose gripper finger origins to the harness).
-        return np.array(
-            [self._data.oMi[i].translation.copy() for i in range(1, 1 + self._n_arm)]
-        )
+        with self._lock:
+            q = self._pad(q)
+            pin.forwardKinematics(self._model, self._data, q)
+            pin.updateFramePlacements(self._model, self._data)
+            # joints[1..n_arm] = arm joints; joints[n_arm+1..njoints-1] = gripper
+            # (we don't expose gripper finger origins to the harness).
+            return np.array(
+                [self._data.oMi[i].translation.copy() for i in range(1, 1 + self._n_arm)]
+            )
 
     def _pad(self, q: np.ndarray) -> np.ndarray:
         """Pad short q vectors with zeros so Pinocchio gets ``model.nq``.
@@ -384,9 +390,10 @@ class SafetyHarness:
         q = np.asarray(q, dtype=np.float64).reshape(-1)
         # Static check: same as approve but without velocity + without
         # escape rules and using a fake q_prev=q_next so dq=0.
-        return self._check(q, q, dt=1.0, exempt_xy=exempt_xy,
-                           exempt_radius=exempt_radius,
-                           exempt_z_min=exempt_z_min)
+        with self._lock:
+            return self._check(q, q, dt=1.0, exempt_xy=exempt_xy,
+                               exempt_radius=exempt_radius,
+                               exempt_z_min=exempt_z_min)
 
     # ── internals ─────────────────────────────────────────────────────
 
@@ -400,7 +407,7 @@ class SafetyHarness:
         exempt_z_min=None,
     ) -> Optional[str]:
         limits = self.limits
-        n = self.kin.n_joints
+        n = int(getattr(self.kin, "n_joints", getattr(self.kin, "n", len(self.kin.joint_limits[0]))))
         q_prev = q_prev[:n]
         q_next = q_next[:n]
 
@@ -580,22 +587,24 @@ class SafeArm:
         harness: SafetyHarness,
         kinematics: Kinematics,
         cfg,
+        gripper=None,
     ):
         self._arm = sdk_arm
         self._ctrl = sdk_ctrl
         self._h = harness
         self._kin = kinematics
         self._cfg = cfg
+        self._gripper = gripper
         # SDK exposes _n (controlled arm joints = 6). Use it; ignore gripper.
         self._n = int(getattr(sdk_ctrl, "_n", 6))
         self._waypoint_hz = 50.0
         self._dt = 1.0 / self._waypoint_hz
         # cfg is the arm profile (full cfg.arm), so gripper keys live on cfg.
-        gripper = cfg.get("gripper", {}) if hasattr(cfg, "get") else {}
-        self._grip_open = float(gripper.get("open_pos", 0.0))
-        self._grip_closed = float(gripper.get("closed_pos", 1.0))
-        self._max_width = float(gripper.get("max_width_m", 0.09))
-        self._effort_default = float(gripper.get("effort_default", 0.6))
+        gripper_cfg = cfg.get("gripper", {}) if hasattr(cfg, "get") else {}
+        self._grip_open = float(gripper_cfg.get("open_pos", 0.0))
+        self._grip_closed = float(gripper_cfg.get("closed_pos", 1.0))
+        self._max_width = float(gripper_cfg.get("max_width_m", 0.09))
+        self._effort_default = float(gripper_cfg.get("effort_default", 0.6))
         self._last_violation: Optional[SafetyViolation] = None
 
     # ── properties ──────────────────────────────────────────────────
@@ -625,12 +634,13 @@ class SafeArm:
         needed = 1.875 * dq_max / (0.9 * self._h.limits.max_joint_vel)
         duration_s = max(duration_s, needed)
         waypoints = self._min_jerk(q_start, q_target, duration_s)
+        hook_dt = duration_s / max(len(waypoints), 1)
 
         self._last_violation = None
         self._h.begin_motion()
         try:
             if not self._ctrl.move_joints_traj(
-                waypoints, duration_s, waypoint_hook=self._make_hook(q_start)
+                waypoints, duration_s, waypoint_hook=self._make_hook(q_start, dt=hook_dt)
             ):
                 return False
             ok = self._ctrl.wait_motion_done(timeout=duration_s + 5.0)
@@ -660,12 +670,13 @@ class SafeArm:
             return False
         pts = [self._pad(np.asarray(w, dtype=np.float64))[: self._n] for w in waypoints]
         total = max(segment_duration_s * len(pts), 0.05)
+        hook_dt = total / max(len(pts), 1)
 
         self._last_violation = None
         self._h.begin_motion()
         try:
             if not self._ctrl.move_joints_traj(
-                pts, total, waypoint_hook=self._make_hook(pts[0])
+                pts, total, waypoint_hook=self._make_hook(pts[0], dt=hook_dt)
             ):
                 return False
             ok = self._ctrl.wait_motion_done(timeout=total + 5.0)
@@ -694,13 +705,15 @@ class SafeArm:
         # Default: let SDK's CLIK do it. Convert T_target → xyz+rpy.
         x, y, z = float(T_target[0, 3]), float(T_target[1, 3]), float(T_target[2, 3])
         roll, pitch, yaw = self._se3_to_rpy(T_target)
+        # SDK's move_to_traj plans CLIK waypoints at self._ctrl._dt (default 0.01s = 100 Hz).
+        hook_dt = float(getattr(self._ctrl, "_dt", self._dt))
 
         self._last_violation = None
         self._h.begin_motion()
         try:
             if not self._ctrl.move_to_traj(
                 x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw,
-                duration=duration_s, waypoint_hook=self._make_hook(None),
+                duration=duration_s, waypoint_hook=self._make_hook(None, dt=hook_dt),
             ):
                 return False
             ok = self._ctrl.wait_motion_done(timeout=duration_s + 5.0)
@@ -712,7 +725,12 @@ class SafeArm:
 
     def set_gripper(self, pos: float, effort: float = 0.0) -> None:
         """Set gripper position + per-cycle tau (forward-feed)."""
-        self._ctrl.set_gripper_target(pos, effort=effort)
+        if self._h.estopped:
+            raise SafetyViolation("e-stopped")
+        if self._gripper is not None:
+            self._gripper.set_position_target(float(pos))
+        else:
+            self._ctrl.set_gripper_target(pos, effort=effort)
 
     def open_gripper(self, distance_m: float | None = None,
                      effort: float = 0.0) -> None:
@@ -722,23 +740,25 @@ class SafeArm:
         "open to max width" (the SDK's default behaviour, kept for backward
         compatibility with callers that don't specify a width).
 
-        Skill callers (e.g. ``runtime.py:skill_grasp_object``) pass a
-        concrete ``distance_m`` derived from the object's grasp width; the
-        baseline's LazyArm API contract is preserved here so the skill code
-        doesn't need a per-call ``set_gripper(open_pos)`` workaround.
-
-        Mapping: ``distance_m / max_width_m`` fraction of the gripper's
-        joint travel (open_pos -> closed_pos) is forwarded to
-        ``set_gripper_target``. Grippers without a configured ``open_pos`` /
-        ``max_width_m`` silently fall back to the SDK default.
+        Mapping is sign-aware over ``(open_pos - closed_pos)`` so both
+        positive-open (RS: open=5.0, closed=0.0) and negative-open profiles
+        produce the right motor direction.
         """
+        if self._h.estopped:
+            raise SafetyViolation("e-stopped")
         if not getattr(self._arm, "has_gripper", False):
+            return
+        if self._gripper is not None:
+            if distance_m is None:
+                self._gripper.open_gripper()
+            else:
+                self._gripper.open_gripper(distance_m=float(distance_m))
             return
         if distance_m is None:
             self._ctrl.open_gripper()
             return
-        span = abs(self._grip_open - self._grip_closed)
-        if span <= 0.0 or self._max_width <= 0.0:
+        span = self._grip_open - self._grip_closed
+        if abs(span) <= 1e-9 or self._max_width <= 0.0:
             self._ctrl.open_gripper()
             return
         frac = float(np.clip(distance_m / self._max_width, 0.0, 1.0))
@@ -757,17 +777,11 @@ class SafeArm:
         detection. SDK doesn't have this; wrc_demo owns it.
 
         ``width_pos_stage1/2`` are fractions of full close travel in
-        [0..1] (0 = open, 1 = closed). They are typically computed
-        width-aware by ``grasping.force.compute_close_target`` so the
-        stage 2 seat lands at ``grasp.width_m * profile.object_close_frac``
-        instead of a fixed 0.85 (= 90% of the rebot_rs travel, ~8 mm
-        opening — that crushed 3D-printed bananas).
-
-        Returns the final gripper width fraction (0=closed, 1=open) or
-        None on stall timeout. Polls ``get_velocities()`` for the gripper
-        joint; two consecutive samples below ``stall_vel`` → object
-        grasped.
+        [0..1] (0 = open, 1 = closed). Returns the final gripper width
+        fraction (0=closed, 1=open) or None on stall timeout.
         """
+        if self._h.estopped:
+            raise SafetyViolation("e-stopped")
         if not getattr(self._arm, "has_gripper", False):
             return None
 
@@ -777,13 +791,23 @@ class SafeArm:
         # stage 1: scout
         self.set_gripper(pos1, effort=effort * 0.7)
         time.sleep(0.3)
+        if self._h.estopped:
+            raise SafetyViolation("e-stopped")
         # stage 2: seat
         self.set_gripper(pos2, effort=effort)
 
         deadline = time.monotonic() + timeout_s
         slow_samples = 0
         while time.monotonic() < deadline:
-            vel = float(self._arm.get_velocities()[-1])
+            if self._h.estopped:
+                raise SafetyViolation("e-stopped")
+            if self._gripper is not None:
+                try:
+                    _, vel, _ = self._gripper.get_gripper_state()
+                except Exception:
+                    vel = float(self._arm.get_velocities()[-1])
+            else:
+                vel = float(self._arm.get_velocities()[-1])
             if abs(vel) < stall_vel:
                 slow_samples += 1
                 if slow_samples >= 2:
@@ -797,9 +821,24 @@ class SafeArm:
 
     def get_state(self) -> RobotState:
         q, qd, _ = self._arm.get_state()
+        q_arr = np.asarray(q, dtype=np.float64)
+        qd_arr = np.asarray(qd, dtype=np.float64)
+        gripper_pos = 0.0
+        gripper_valid = False
+        if self._gripper is not None:
+            try:
+                gripper_pos = float(self._gripper.get_gripper_state()[0])
+                gripper_valid = True
+            except Exception:
+                gripper_valid = False
+        elif getattr(self._arm, "has_gripper", False) and q_arr.size > self._n:
+            gripper_pos = float(q_arr[-1])
+            gripper_valid = True
         return RobotState(
-            q=np.asarray(q[: self._n], dtype=np.float64),
-            dq=np.asarray(qd[: self._n], dtype=np.float64),
+            q=q_arr[: self._n],
+            dq=qd_arr[: self._n],
+            gripper_pos=gripper_pos,
+            gripper_valid=gripper_valid,
             t=time.monotonic(),
         )
 
@@ -809,11 +848,14 @@ class SafeArm:
         """Soft stop: pause the SDK's send thread, latch harness e-stop.
 
         Crucially does NOT call ``RebotArm.estop()`` (which is
-        ``disable_all`` → torque off → free-fall under gravity).
+        ``disable_all`` → torque off → free-fall under gravity). The 500 Hz
+        MIT + gravity feed-forward loop keeps holding ``_q_target`` in place.
         """
         self._h.estop(reason="safe_arm.stop()")
         try:
             self._ctrl._stop_send.set()
+            if hasattr(self._ctrl, "_qd_target"):
+                self._ctrl._qd_target[:] = 0.0
         except Exception:
             pass
 
@@ -826,15 +868,44 @@ class SafeArm:
             pass
 
     def disconnect(self) -> None:
-        """Stop the SDK control loop + disconnect the bus.
+        """Stop trajectory streaming, fold safely to mechanical zero, then
+        disconnect the bus (anti-drop shutdown).
 
-        Idempotent. Safe to call from ``shutdown_runtime`` whether the
-        arm is still streaming or already idle.
+        CRITICAL ANTI-DROP INVARIANT:
+        1. Stop & join ``_send_thread`` first while the 500 Hz MIT + gravity FF
+           loop is STILL holding the arm, so ``safe_home()`` never races with
+           an active trajectory.
+        2. Call ``self._ctrl.end()`` which smoothly ramps the arm to mechanical
+           zero (``safe_home()``) BEFORE calling ``rebotarm.disconnect()``.
+        3. Never torque-off directly if the control loop was running and
+           ``end()`` raised before finishing ``safe_home()``.
         """
+        # 1. Halt any in-flight trajectory thread while keeping 500 Hz hold alive.
         try:
-            self._ctrl.end()
+            self._ctrl._stop_send.set()
+            if hasattr(self._ctrl, "_qd_target"):
+                self._ctrl._qd_target[:] = 0.0
+            send_t = getattr(self._ctrl, "_send_thread", None)
+            if send_t is not None and send_t.is_alive():
+                send_t.join(timeout=2.0)
         except Exception:
             pass
+
+        # 2. Controlled fold-to-zero + disconnect via SDK controller.
+        was_running = bool(getattr(self._ctrl, "_running", False))
+        if was_running:
+            try:
+                self._ctrl.end()
+                return
+            except Exception as e:
+                import sys
+                print(
+                    f"[SafeArm] WARNING: safe_home/end() failed ({e}); "
+                    "NOT calling raw disconnect() while motors may be supporting load",
+                    file=sys.stderr,
+                )
+                return
+        # 3. Control loop was never running (or already ended cleanly).
         try:
             self._arm.disconnect()
         except Exception:
@@ -848,7 +919,7 @@ class SafeArm:
 
     # ── internals ───────────────────────────────────────────────────
 
-    def _make_hook(self, q_first: Optional[np.ndarray]):
+    def _make_hook(self, q_first: Optional[np.ndarray], dt: Optional[float] = None):
         """Build the per-waypoint safety hook for the SDK's _send_loop.
 
         ``q_first`` is the very first waypoint (the current arm pose — the
@@ -862,7 +933,7 @@ class SafeArm:
         """
         h = self._h
         sa = self
-        dt = sa._dt
+        step_dt = float(dt) if dt is not None and dt > 0 else sa._dt
         prev = [None if q_first is None else q_first.copy()]
         first_seen = [False]
 
@@ -877,9 +948,12 @@ class SafeArm:
                 first_seen[0] = True
                 return True
             qp = prev[0]
-            if not h.approve(qp, q_i, dt=dt):
+            if not h.approve(qp, q_i, dt=step_dt):
                 # Harness vetoed: latch estop, stash the reason so the
                 # main-thread caller can re-raise after wait_motion_done.
+                # Note: returning False halts _send_loop immediately while
+                # the 500 Hz MIT + gravity-FF loop keeps holding the last
+                # safe _q_target (zero free-fall).
                 reason = h.violations[-1] if h.violations else "harness veto"
                 sa._last_violation = SafetyViolation(reason)
                 h.estop(reason=reason)
@@ -911,14 +985,22 @@ class SafeArm:
 
     def _gripper_width_frac(self) -> float:
         """0=closed, 1=open from current gripper joint angle."""
-        q, _, _ = self._arm.get_state()
         if not getattr(self._arm, "has_gripper", False):
             return 0.0
         span = self._grip_closed - self._grip_open
         if abs(span) < 1e-9:
             return 0.0
-        frac = (float(q[-1]) - self._grip_open) / span
-        return float(np.clip(frac, 0.0, 1.0))
+        if self._gripper is not None:
+            try:
+                gpos = float(self._gripper.get_gripper_state()[0])
+            except Exception:
+                q, _, _ = self._arm.get_state()
+                gpos = float(q[-1])
+        else:
+            q, _, _ = self._arm.get_state()
+            gpos = float(q[-1])
+        closed_frac = (gpos - self._grip_open) / span  # 1 at closed, 0 at open
+        return float(np.clip(1.0 - closed_frac, 0.0, 1.0))
 
     @staticmethod
     def _se3_to_rpy(T: np.ndarray) -> tuple[float, float, float]:

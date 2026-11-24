@@ -233,10 +233,33 @@ class WrcGripper:
             tau=np.array([tau_cmd], dtype=np.float64),
         )
 
-    def _prime_arm_target(self) -> None:
-        # Sync controller's q_target to current joint positions so the
-        # first trajectory doesn't jerk.
+    def _prime_arm_target(self, timeout: float = 1.0) -> None:
+        """Sync controller's q_target to live joint positions before starting
+        the 500 Hz MIT loop so the arm cannot snap/drop to zeros on boot.
+
+        When real motor handles are exposed on ``_arm_group._mm``, wait up to
+        ``timeout`` seconds for ALL arm motors to report non-None feedback;
+        refuse to start the control loop if any joint feedback is missing.
+        """
         n = self._arm_group.num_joints
+        mm = getattr(self._arm_group, "_mm", None)
+        jnames = getattr(self._arm_group, "joint_names", None)
+        check_motors = isinstance(mm, dict) and isinstance(jnames, (list, tuple)) and len(jnames) >= n
+        if check_motors:
+            deadline = time.monotonic() + timeout
+            while True:
+                q_now = self._arm.get_state()[0][:n]
+                missing = [name for name in jnames[:n] if mm.get(name) is None or mm[name].get_state() is None]
+                if not missing:
+                    self._controller._q_target[:] = q_now
+                    self._controller._qd_target[:] = 0.0
+                    return
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Arm motor feedback not ready for {missing}; refusing "
+                        "to start MIT control loop with unprimed target"
+                    )
+                time.sleep(0.02)
         q_now = self._arm.get_state()[0][:n]
         self._controller._q_target[:] = q_now
         self._controller._qd_target[:] = 0.0

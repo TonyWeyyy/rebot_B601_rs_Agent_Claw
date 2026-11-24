@@ -33,8 +33,11 @@ For ``place``:
 
 from __future__ import annotations
 
+import inspect
 import threading
 from typing import TYPE_CHECKING, Optional
+
+from ..types import SafetyViolation
 
 if TYPE_CHECKING:
     from reBotArm_control_py.controllers import RebotArmEndPose
@@ -79,6 +82,50 @@ class RebotGraspBridge:
 
     # ──────────────────────────── motion ────────────────────────────
 
+    def _controller_accepts_waypoint_hook(self) -> bool:
+        """True when controller.move_to_traj explicitly accepts waypoint_hook."""
+        fn = getattr(self._controller, "move_to_traj", None)
+        if fn is None:
+            return False
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        return "waypoint_hook" in sig.parameters
+
+    def _make_waypoint_hook(self, violation_box: list):
+        """Build a per-waypoint SafetyHarness hook for SDK move_to_traj.
+
+        Returning False halts SDK ``_send_loop`` immediately while the 500 Hz
+        MIT + gravity feed-forward loop keeps holding the last safe
+        ``_q_target`` — the arm freezes in place and never drops.
+        """
+        h = self._harness
+        step_dt = float(getattr(self._controller, "_dt", 0.01))
+        prev = [None]
+        first_seen = [False]
+
+        def hook(q_i) -> bool:
+            if getattr(h, "estopped", False):
+                return False
+            if not first_seen[0]:
+                prev[0] = q_i.copy()
+                first_seen[0] = True
+                return True
+            if not h.approve(prev[0], q_i, dt=step_dt):
+                reason = h.violations[-1] if getattr(h, "violations", None) else "harness veto"
+                violation_box.append(SafetyViolation(reason))
+                h.estop(reason=reason)
+                return False
+            prev[0] = q_i.copy()
+            return True
+
+        return hook
+
+    def _check_not_estopped(self) -> None:
+        if self._harness is not None and getattr(self._harness, "estopped", False):
+            raise SafetyViolation("e-stopped")
+
     def move_to_traj(
         self,
         x: float,
@@ -93,31 +140,42 @@ class RebotGraspBridge:
 
         Blocks until the motion thread completes (or times out), matching
         ``rebot_grasp/scripts/main.py``'s ``_wait_motion`` pattern.
-        Without this wait, consecutive calls (pregrasp → grasp) would
-        override each other — the arm never reaches pregrasp before being
-        redirected to the grasp target, causing table collisions and
-        empty grasps.
 
-        Returns ``True`` if motion succeeded, ``False`` if IK failed or
-        the motion timed out. The caller (``skill_grasp_object`` /
-        ``skill_pick_and_place``) raises :class:`SkillError` on
-        ``False`` for pregrasp and grasp; place ignores ``False`` (no
-        second chance to reposition a held object).
-
-        With ``harness`` set, calls ``begin_motion()`` first (e-stop +
-        watchdog check) and ``end_motion()`` after; ``SafetyViolation`` from
-        ``begin_motion`` propagates without invoking the controller.
+        With ``harness`` set:
+        - Calls ``begin_motion()`` first (e-stop + watchdog check) and
+          ``end_motion()`` in ``finally``.
+        - When the harness exposes ``approve()`` and the controller accepts
+          ``waypoint_hook``, vets EVERY intermediate CLIK waypoint; a veto
+          freezes ``_q_target`` (500 Hz MIT + gravity FF keeps holding, no
+          free-fall) and re-raises ``SafetyViolation``.
         """
         if self._harness is not None:
             self._harness.begin_motion()
+        violation_box: list[SafetyViolation] = []
         try:
-            ok = bool(
-                self._controller.move_to_traj(
-                    x, y, z, roll, pitch, yaw, duration=duration,
-                )
+            use_hook = (
+                self._harness is not None
+                and hasattr(self._harness, "approve")
+                and self._controller_accepts_waypoint_hook()
             )
+            if use_hook:
+                ok = bool(
+                    self._controller.move_to_traj(
+                        x, y, z, roll, pitch, yaw,
+                        duration=duration,
+                        waypoint_hook=self._make_waypoint_hook(violation_box),
+                    )
+                )
+            else:
+                ok = bool(
+                    self._controller.move_to_traj(
+                        x, y, z, roll, pitch, yaw, duration=duration,
+                    )
+                )
             if ok:
                 self._wait_motion(duration)
+            if violation_box:
+                raise violation_box[0]
         finally:
             if self._harness is not None:
                 self._harness.end_motion()
@@ -155,8 +213,9 @@ class RebotGraspBridge:
         own default (``3.0 s``) is used otherwise. ``set.py`` calls with
         ``timeout=0.5`` on place release; pregrasp uses the default.
 
-        With ``harness`` set, refreshes the perception watchdog first.
+        With ``harness`` set, checks e-stop and refreshes the watchdog first.
         """
+        self._check_not_estopped()
         if self._harness is not None:
             self._harness.heartbeat()
         if timeout is not None:
@@ -172,8 +231,9 @@ class RebotGraspBridge:
         magnitude; ``set.py`` uses default ``0.30``, we override with
         ``1.0`` to match wrc_demo v5's ``effort=1.00``.
 
-        With ``harness`` set, refreshes the perception watchdog first.
+        With ``harness`` set, checks e-stop and refreshes the watchdog first.
         """
+        self._check_not_estopped()
         if self._harness is not None:
             self._harness.heartbeat()
         if force is not None:
@@ -183,8 +243,9 @@ class RebotGraspBridge:
     def release_gripper(self) -> None:
         """Open + return to closed rest synchronously (used at demo exit).
 
-        With ``harness`` set, refreshes the perception watchdog first.
+        With ``harness`` set, checks e-stop and refreshes the watchdog first.
         """
+        self._check_not_estopped()
         if self._harness is not None:
             self._harness.heartbeat()
         self._grasp_driver.release_gripper()
@@ -200,26 +261,21 @@ class RebotGraspBridge:
         fingers before the close starts, so it doesn't snag. The caller
         must ``.join()`` the returned thread after the next ``move_to_traj``
         so the close completes before the next skill's grasp.
-
-        Note: as of ADR-0005 ``set_position_target`` is a **public**
-        method on ``WrcGripper`` (was ``_set_position_target`` on the
-        upstream ``GraspDriver``). The try/except remains so a future
-        rename degrades silently — but it's defensive only, since we
-        own both sides of the API now.
         """
+        self._check_not_estopped()
         self._grasp_driver.open_gripper(timeout=timeout)
 
         driver = self._grasp_driver
+        harness = self._harness
 
         def _close_after_delay():
             import time
             time.sleep(delay_s)
+            if harness is not None and getattr(harness, "estopped", False):
+                return
             try:
                 driver.set_position_target(0.0)
             except AttributeError:
-                # Defensive: rename-safe. The gripper stays at the
-                # last commanded position (post-open); the next grasp
-                # or open call will reset the state machine.
                 pass
 
         thread = threading.Thread(target=_close_after_delay, daemon=True)
