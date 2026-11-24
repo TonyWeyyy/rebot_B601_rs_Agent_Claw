@@ -94,7 +94,7 @@ def load_slot(slot: int, recordings_dir: Path) -> dict:
     computed = compute_checksum(data["frames"])
     if recorded != computed:
         raise ValueError(
-            f"slot{slot}.json checksum 不匹配:\:\n"
+            f"slot{slot}.json checksum 不匹配:\n"
             f"  recorded: {recorded}\n  computed: {computed}"
         )
     return data
@@ -170,7 +170,9 @@ class KeyboardState:
             ch = key.char.lower()
             if ch in cls.SLOT_KEYS:
                 cls.ENTER = True
-                return False  # 第一次按键触发后停止监听（简化版）
+                # Keep listener alive so a second press of 'q' stops recording
+                # (returning False here previously killed the listener on start!).
+                return None
         except AttributeError:
             pass
         return None
@@ -242,22 +244,34 @@ def _fmt_q(arr) -> list:
     return [round(float(x), 3) for x in arr]
 
 
-# ── 实机录制（T3.3，最小可用版本）────────────────────────────────────────
+# ── 实机录制（T3.3）────────────────────────────────────────────────────────
+# Per-step angular clamp when writing into an active 500 Hz MIT controller
+# target during teleop (prevents violent snaps if master jumps on startup).
+_TELEOP_MAX_STEP_RAD = 0.08  # ~2.4 rad/s @ 30 Hz
+
+
 def record_real(
     master,
     slave,
     slot: int,
     recordings_dir: Path,
     keyboard_listener_factory: Optional[Callable] = None,
+    controller=None,
+    gripper=None,
+    mapper: Optional[Callable[[Dict[str, float]], np.ndarray]] = None,
 ) -> dict:
     """实机主从臂录制（Q-α: pynput q 触发当前 slot 录/停 + Esc 退出）。
 
     Args:
         master: PiPERMateArm (已 open）
-        slave: RebotArm (已 connect + mode_pos_vel + enable)
+        slave: RebotArm (已 connect)
         slot: 1-5，q 按键触发当前 slot 录/停
         recordings_dir: slot json 目录
         keyboard_listener_factory: 测试注入（默认 None 用 pynput）
+        controller: 可选运行中的 RebotArmEndPose（若存在且 _running=True，
+            通过更新其 _q_target 跟随，避免与 500 Hz MIT 控制环在 CAN 上打架）
+        gripper: 可选运行中的 WrcGripper（与 controller 同用）
+        mapper: 可选主→从映射函数（默认 wrc_demo.skills.master_arm.master_to_slave）
 
     Returns:
         {"ok": True, "slot": int, "frame_count": int, "duration_s": float}
@@ -265,6 +279,9 @@ def record_real(
     """
     if not isinstance(slot, int) or slot < 1 or slot > NUM_SLOTS:
         return {"ok": False, "error": f"slot must be int 1-{NUM_SLOTS}, got {slot!r}"}
+
+    if mapper is None:
+        from .master_arm import master_to_slave as mapper
 
     # 启 pynput 监听
     KeyboardState.reset()
@@ -276,18 +293,34 @@ def record_real(
     listener.start()
 
     try:
-        return _teleop_record(master, slave, slot, recordings_dir)
+        return _teleop_record(
+            master, slave, slot, recordings_dir,
+            controller=controller, gripper=gripper, mapper=mapper,
+        )
     finally:
         listener.stop()
 
 
-def _teleop_record(master, slave, slot: int, recordings_dir: Path) -> dict:
+def _teleop_record(
+    master,
+    slave,
+    slot: int,
+    recordings_dir: Path,
+    controller=None,
+    gripper=None,
+    mapper: Optional[Callable[[Dict[str, float]], np.ndarray]] = None,
+) -> dict:
     """主从臂循环 + 30Hz 录制（直到 q 按键停止 或 Esc 退出）。"""
+    if mapper is None:
+        from .master_arm import master_to_slave as mapper
+
     frames: List[dict] = []
     recording = False
     record_start_time: Optional[float] = None
     last_recorded_q: Optional[np.ndarray] = None
     last_recorded_t: float = 0.0
+    use_active_ctrl = controller is not None and bool(getattr(controller, "_running", False))
+    n_arm = int(getattr(controller, "_n", getattr(slave.arm, "num_joints", 6)))
 
     print(f"[teach_record] slot={slot}: 按 q 开始/停止录制, Esc 退出 (不保存)")
 
@@ -300,12 +333,24 @@ def _teleop_record(master, slave, slot: int, recordings_dir: Path) -> dict:
             master_q_rad = np.deg2rad(
                 np.array([master_q_deg[n] for n in master.joint_names], dtype=np.float64)
             )
-            slave_q_rad = master_to_slave(master_q_deg)
+            slave_q_rad = mapper(master_q_deg)
 
-            # 2. 发从臂（POS_VEL 模式）
-            slave.arm.send_pos_vel(slave_q_rad[:6], vlim=15.0)
-            if slave.has_gripper:
-                slave.gripper.send_pos_vel(slave_q_rad[6:])
+            # 2. 发从臂：若已有 500 Hz MIT+重力前馈控制环运行，只更新其目标槽
+            # 并做单步限速（绝不与 MIT 循环竞争 CAN 总线，也绝不掉电）
+            if use_active_ctrl:
+                q_cur = np.asarray(controller._q_target[:n_arm], dtype=np.float64)
+                delta = np.clip(
+                    slave_q_rad[:n_arm] - q_cur,
+                    -_TELEOP_MAX_STEP_RAD,
+                    _TELEOP_MAX_STEP_RAD,
+                )
+                controller._q_target[:n_arm] = q_cur + delta
+                if gripper is not None and len(slave_q_rad) > n_arm:
+                    gripper.set_position_target(float(slave_q_rad[n_arm]))
+            else:
+                slave.arm.send_pos_vel(slave_q_rad[:n_arm], vlim=15.0)
+                if slave.has_gripper and len(slave_q_rad) > n_arm:
+                    slave.gripper.send_pos_vel(slave_q_rad[n_arm:])
 
             # 3. 记录
             if recording:
@@ -372,9 +417,29 @@ def _teleop_record(master, slave, slot: int, recordings_dir: Path) -> dict:
     }
 
 
-# ── 实机复播（T3.4，最小可用版本）────────────────────────────────────────
-def replay_real(slave, slot: int, recordings_dir: Path) -> dict:
-    """实机复播（spec §5.7）: 读 slot → interpolation → send_pos_vel → safe_home。"""
+# ── 实机复播（T3.4）────────────────────────────────────────────────────────
+def replay_real(
+    slave,
+    slot: int,
+    recordings_dir: Path,
+    safe_arm=None,
+    controller=None,
+    gripper=None,
+) -> dict:
+    """实机复播（spec §5.7）: 读 slot → 平滑过渡到起点 → 回放轨迹 → 安全回位。
+
+    ANTI-DROP SAFETY:
+    - When called from SkillRuntime (``safe_arm`` / active ``controller``
+      already running the 500 Hz MIT + gravity FF loop), we NEVER spin up a
+      second ``RebotArmEndPose`` and NEVER call ``ctrl.end()``/``disconnect()``
+      (which would torque-off the arm or fight the active control loop).
+      Instead we stream through ``safe_arm`` (safety-harness gated) and return
+      to ``home_q`` while keeping 500 Hz gravity-FF holding continuously.
+    - When called standalone (e.g. ``examples/teach_replay.py`` without an
+      active controller), we construct ``RebotArmEndPose(..., arm_control_mode="posvel")``
+      (matching the SDK's exact mode string), prime ``_q_target`` to current
+      positions before ``start()``, play, and ``safe_home()`` before ``end()``.
+    """
     if not isinstance(slot, int) or slot < 1 or slot > NUM_SLOTS:
         return {"ok": False, "error": f"slot must be int 1-{NUM_SLOTS}, got {slot!r}"}
 
@@ -384,25 +449,60 @@ def replay_real(slave, slot: int, recordings_dir: Path) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     frames = data["frames"]
-    duration = data["duration_s"]
-    n_arm = slave.arm.num_joints
+    if not frames:
+        return {"ok": False, "error": f"slot{slot}.json contains no frames"}
+    duration = float(data["duration_s"])
+    n_arm = int(getattr(getattr(slave, "arm", None), "num_joints", 6))
     print(f"[teach_replay] slot={slot}: {len(frames)} 帧, duration={duration:.2f}s")
 
     q_waypoints = [
         np.asarray(f["slave_q"][:n_arm], dtype=np.float64) for f in frames
     ]
+    g_targets = [
+        float(f["slave_q"][n_arm]) if len(f["slave_q"]) > n_arm else None
+        for f in frames
+    ]
     play_duration = max(duration, 1.0)
 
-    # 用 RebotArmEndPose 播放（wrc_demo/__init__.py 已注入 vendored SDK 路径）
+    # Active SafeArm / running 500 Hz MIT controller path (no drop, no disconnect)
+    active_ctrl = controller if (controller is not None and getattr(controller, "_running", False)) else None
+    if safe_arm is not None and active_ctrl is not None:
+        # 1. Smooth safety-gated transition to trajectory start
+        if not safe_arm.move_joints(q_waypoints[0], duration_s=max(TRANSITION_TIME, 1.5)):
+            return {"ok": False, "error": "failed to move to replay start pose"}
+        # 2. Safety-gated path playback
+        seg_dt = max(play_duration / max(len(q_waypoints), 1), 0.02)
+        if not safe_arm.move_joints_path(q_waypoints, segment_duration_s=seg_dt):
+            return {"ok": False, "error": "move_joints_path playback failed"}
+        if gripper is not None and g_targets[-1] is not None:
+            gripper.set_position_target(g_targets[-1])
+        # 3. Return smoothly to parked home pose (motors remain enabled + holding)
+        safe_arm.home(duration_s=2.5)
+        return {
+            "ok": True,
+            "slot": slot,
+            "frame_count": len(frames),
+            "duration_s": duration,
+            "replayed_to_home": True,
+        }
+
+    # Standalone CLI path (no pre-existing 500 Hz control loop)
     from reBotArm_control_py.controllers import RebotArmEndPose
-    ctrl = RebotArmEndPose(slave, arm_control_mode="pos_vel", use_gravity_ff=False)
+    ctrl = RebotArmEndPose(slave, arm_control_mode="posvel", use_gravity_ff=False)
     try:
+        # Prime _q_target to live joint positions BEFORE enabling so the arm
+        # cannot snap to zeros on startup.
+        try:
+            q_now = slave.get_state()[0][:n_arm]
+            ctrl._q_target[:] = q_now
+        except Exception:
+            pass
         ctrl.start()
         if not ctrl.move_joints_traj(q_waypoints, duration=play_duration):
             return {"ok": False, "error": "move_joints_traj failed to start"}
         if not ctrl.wait_motion_done(timeout=play_duration * 2.0):
             return {"ok": False, "error": "playback timeout"}
-        ctrl.safe_home()  # 回电机机械零点
+        ctrl.safe_home()  # 回电机机械零点（在 disconnect 断电前完成）
         return {
             "ok": True,
             "slot": slot,
